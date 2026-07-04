@@ -35,7 +35,8 @@ pub fn allocateExecMemory(size: usize) ![]u8 {
 
 /// Free virtual memory pages with MEM_RELEASE.
 pub fn freeExecMemory(slice: []u8) void {
-    _ = VirtualFree(slice.ptr, 0, 0x8000); // MEM_RELEASE
+    const res = VirtualFree(slice.ptr, 0, 0x8000); // MEM_RELEASE
+    std.debug.assert(res != .FALSE);
 }
 
 // ── End-To-End JIT Execution Tests ──────────────────────────────────────────
@@ -67,13 +68,13 @@ test "exec_mem: end-to-end JIT execution on physical CPU" {
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
-    const v0_1 = ir.SSAVar{ .reg = 0, .version = 1 }; // x
-    const v1_1 = ir.SSAVar{ .reg = 1, .version = 1 }; // x + 100
+    const v1_0 = ir.SSAVar{ .reg = 1, .version = 0 }; // x (parameter, registers_size - ins_size + 0 = 2 - 1 = 1)
+    const v0_1 = ir.SSAVar{ .reg = 0, .version = 1 }; // x + 100
 
-    // add_lit v1_1 = v0_1 + 100
-    try block.instructions.append(a, .{ .add_lit = .{ .dest = v1_1, .src = v0_1, .lit = 100 } });
-    // ret v1_1
-    try block.instructions.append(a, .{ .ret = .{ .src = v1_1 } });
+    // add_lit v0_1 = v1_0 + 100
+    try block.instructions.append(a, .{ .add_lit = .{ .dest = v0_1, .src = v1_0, .lit = 100 } });
+    // ret v0_1
+    try block.instructions.append(a, .{ .ret = .{ .src = v0_1 } });
 
     try test_cfg.blocks.append(a, block);
 
@@ -82,7 +83,7 @@ test "exec_mem: end-to-end JIT execution on physical CPU" {
     defer prog.deinit();
 
     // 3. Allocate Registers
-    try regalloc.allocateRegisters(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, 2, 1);
 
     // 4. Emit Machine Code Bytes
     const code_bytes = try emitter.emitProgram(a, &prog);

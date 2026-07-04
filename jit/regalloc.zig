@@ -37,7 +37,22 @@ fn compareActive(context: void, a: *const LiveInterval, b: *const LiveInterval) 
     return a.end < b.end;
 }
 
-pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram) !void {
+pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram, registers_size: u16, ins_size: u16) !void {
+    // 0. Prepend parameter mov instructions to the entry block to load parameters from RCX, RDX, R8, R9.
+    if (ins_size > 0 and program.blocks.items.len > 0) {
+        const first_block = &program.blocks.items[0];
+        const arg_regs = [_]x86.PhysicalReg{ .rcx, .rdx, .r8, .r9 };
+        var i: u16 = 0;
+        while (i < ins_size and i < 4) : (i += 1) {
+            const param_reg = registers_size - ins_size + i;
+            const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
+            try first_block.instructions.insert(allocator, i, .{ .mov = .{
+                .dest = .{ .vreg = v },
+                .src = .{ .reg = arg_regs[i] },
+            } });
+        }
+    }
+
     // 1. Gather all virtual registers and compute their live intervals.
     // Map from ir.SSAVar -> LiveInterval.
     var interval_map = std.AutoHashMap(ir.SSAVar, LiveInterval).init(allocator);
@@ -702,7 +717,7 @@ test "regalloc: basic linear scan" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog);
+    try allocateRegisters(a, &prog, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -736,7 +751,7 @@ test "regalloc: float register allocation" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog);
+    try allocateRegisters(a, &prog, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     // Verify that the float variables are allocated to XMM registers!
@@ -779,7 +794,7 @@ test "regalloc: SIB array indexing rewrite" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog);
+    try allocateRegisters(a, &prog, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);

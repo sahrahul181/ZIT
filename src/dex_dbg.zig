@@ -10,6 +10,8 @@ const dessa = @import("dessa");
 const x86mod = @import("x86");
 const lower = @import("lower");
 const regalloc = @import("regalloc");
+const emitter = @import("emitter");
+const exec_mem = @import("exec_mem");
 const Io = std.Io;
 
 const c = @cImport({
@@ -180,6 +182,7 @@ fn usage(writer: anytype) !void {
         \\  dessa <class_name> <method_name>         Print SSA IR after Out-of-SSA translation (eliminatePhis + propagateCopies).
         \\  lower <class_name> <method_name>         Print virtual x86-64 assembly (full pipeline: SSA-opt → de-SSA → lower).
         \\  codegen <class_name> <method_name>       Print register-allocated physical x86-64 assembly.
+        \\  run <class_name> <method_name> [args...] Run JIT compiler on a method and execute it.
         \\  emit <class_name> <method_name> [f] Dumps method instructions to stdout or a file.
         \\  kotlin <class_name>                 Show Kotlin metadata declarations (decoded using C protobuf lib).
         \\
@@ -507,7 +510,7 @@ pub fn main(init: std.process.Init) !void {
                 try writer.writeByte('\n');
             }
         }
-    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen")) {
+    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
         if (args.len < 5) {
             try writer.print("Error: '{s}' command requires <class_name> and <method_name> arguments.\n", .{cmd});
             return;
@@ -596,22 +599,51 @@ pub fn main(init: std.process.Init) !void {
         try cfg.insertPhiFunctions(def_map);
         try cfg.renameVariables(method.registers_size);
 
-        if (std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen")) {
+        if (std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
             _ = try opt.optimize(arena, &cfg);
         }
 
-        if (std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen")) {
+        if (std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
             try dessa.eliminatePhis(arena, &cfg);
             while (try dessa.propagateCopies(arena, &cfg)) {}
-            try writer.print("SSA IR after de-SSA (eliminatePhis + propagateCopies) for method {s}:\n", .{method.name});
+            if (std.mem.eql(u8, cmd, "run")) {
+                // Do not print anything yet
+            } else {
+                try writer.print("SSA IR after de-SSA (eliminatePhis + propagateCopies) for method {s}:\n", .{method.name});
+            }
         } else {
             try writer.print("SSA IR for method {s}:\n", .{method.name});
         }
-        if (std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen")) {
+        if (std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
             var machine = try lower.lowerCFG(arena, &cfg);
             defer machine.deinit();
-            if (std.mem.eql(u8, cmd, "codegen")) {
-                try regalloc.allocateRegisters(arena, &machine);
+            if (std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
+                try regalloc.allocateRegisters(arena, &machine, method.registers_size, method.ins_size);
+                if (std.mem.eql(u8, cmd, "run")) {
+                    const code_bytes = try emitter.emitProgram(arena, &machine);
+                    defer arena.free(code_bytes);
+
+                    const exec_page = try exec_mem.allocateExecMemory(code_bytes.len);
+                    defer exec_mem.freeExecMemory(exec_page);
+
+                    @memcpy(exec_page, code_bytes);
+
+                    var arg0: i64 = 0;
+                    var arg1: i64 = 0;
+                    var arg2: i64 = 0;
+                    var arg3: i64 = 0;
+                    if (args.len >= 6) arg0 = std.fmt.parseInt(i64, args[5], 10) catch 0;
+                    if (args.len >= 7) arg1 = std.fmt.parseInt(i64, args[6], 10) catch 0;
+                    if (args.len >= 8) arg2 = std.fmt.parseInt(i64, args[7], 10) catch 0;
+                    if (args.len >= 9) arg3 = std.fmt.parseInt(i64, args[8], 10) catch 0;
+
+                    const JITFn = *const fn (i64, i64, i64, i64) callconv(.c) i64;
+                    const func = @as(JITFn, @ptrCast(exec_page.ptr));
+
+                    const result = func(arg0, arg1, arg2, arg3);
+                    try writer.print("JIT execution result: {d}\n", .{result});
+                    return;
+                }
                 try writer.print("Register-allocated x86-64 assembly for method {s}:\n", .{method.name});
             } else {
                 try writer.print("Virtual x86-64 assembly for method {s}:\n", .{method.name});

@@ -123,29 +123,73 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
             switch (inst) {
                 // ---- Data movement ----
                 .mov => |v| {
-                    if (v.dest == .reg and v.src == .imm) {
-                        // MOV r64, imm32/imm64
-                        const d = regCode(v.dest.reg);
-                        const rex = makeRex(true, 0, d);
-                        try code.append(rex);
-                        try code.append(0xB8 + @as(u8, @truncate(d)));
-                        // We support 64-bit constants here (imm64 or imm)
-                        const val: u64 = switch (v.src) {
-                            .imm => |imm| @as(u64, @bitCast(@as(i64, imm))),
-                            .imm64 => |imm| @as(u64, @bitCast(imm)),
-                            else => unreachable,
-                        };
-                        var bytes: [8]u8 = undefined;
-                        std.mem.writeInt(u64, &bytes, val, .little);
-                        try code.appendSlice(&bytes);
+                    if (v.dest == .reg and (v.src == .imm or v.src == .imm64)) {
+                        if (std.mem.startsWith(u8, v.dest.reg.name(), "xmm")) {
+                            // Can only load imm 0 to XMM using PXOR/XORPD
+                            const val: i64 = switch (v.src) {
+                                .imm => |imm| imm,
+                                .imm64 => |imm| @as(i64, @bitCast(imm)),
+                                else => return EmitterError.UnsupportedOperandCombination,
+                            };
+                            if (val == 0) {
+                                const d = regCode(v.dest.reg);
+                                const rex = makeRex(false, d, d);
+                                try code.append(0x66);
+                                if (rex != 0x40) try code.append(rex);
+                                try code.append(0x0F);
+                                try code.append(0x57); // XORPD
+                                try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(d))));
+                            } else {
+                                return EmitterError.UnsupportedOperandCombination;
+                            }
+                        } else {
+                            // MOV r64, imm32/imm64
+                            const d = regCode(v.dest.reg);
+                            const rex = makeRex(true, 0, d);
+                            try code.append(rex);
+                            try code.append(0xB8 + @as(u8, @truncate(d)));
+                            // We support 64-bit constants here (imm64 or imm)
+                            const val: u64 = switch (v.src) {
+                                .imm => |imm| @as(u64, @bitCast(@as(i64, imm))),
+                                .imm64 => |imm| @as(u64, @bitCast(imm)),
+                                else => unreachable,
+                            };
+                            var bytes: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &bytes, val, .little);
+                            try code.appendSlice(&bytes);
+                        }
                     } else if (v.dest == .reg and v.src == .reg) {
-                        // MOV r64, r64
-                        const d = regCode(v.dest.reg);
-                        const s = regCode(v.src.reg);
-                        const rex = makeRex(true, s, d);
-                        try code.append(rex);
-                        try code.append(0x89);
-                        try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                        const dest_xmm = std.mem.startsWith(u8, v.dest.reg.name(), "xmm");
+                        const src_xmm = std.mem.startsWith(u8, v.src.reg.name(), "xmm");
+                        if (dest_xmm and !src_xmm) {
+                            // movq xmm, r64
+                            const d = regCode(v.dest.reg);
+                            const s = regCode(v.src.reg);
+                            try code.append(0x66);
+                            const rex = makeRex(true, d, s);
+                            try code.append(rex);
+                            try code.append(0x0F);
+                            try code.append(0x6E);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                        } else if (!dest_xmm and src_xmm) {
+                            // movq r64, xmm
+                            const d = regCode(v.dest.reg);
+                            const s = regCode(v.src.reg);
+                            try code.append(0x66);
+                            const rex = makeRex(true, s, d);
+                            try code.append(rex);
+                            try code.append(0x0F);
+                            try code.append(0x7E);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                        } else {
+                            // MOV r64, r64
+                            const d = regCode(v.dest.reg);
+                            const s = regCode(v.src.reg);
+                            const rex = makeRex(true, s, d);
+                            try code.append(rex);
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                        }
                     } else if (v.dest == .reg and v.src == .stack) {
                         // MOV r64, [rbp - offset]
                         const d = regCode(v.dest.reg);

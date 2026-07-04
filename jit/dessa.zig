@@ -109,6 +109,22 @@ fn resolveParallelCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG, raw_mov
 pub fn propagateCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
     var changed = false;
     
+    var def_counts = std.AutoHashMap(ir.SSAVar, usize).init(allocator);
+    defer def_counts.deinit();
+
+    for (cfg.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst == .move) {
+                const dest = inst.move.dest;
+                const res = try def_counts.getOrPut(dest);
+                if (!res.found_existing) {
+                    res.value_ptr.* = 0;
+                }
+                res.value_ptr.* += 1;
+            }
+        }
+    }
+
     var replacements = std.AutoHashMap(ir.SSAVar, ir.SSAVar).init(allocator);
     defer replacements.deinit();
 
@@ -118,7 +134,9 @@ pub fn propagateCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                 const dest = inst.move.dest;
                 const src = inst.move.src;
                 if (dest.reg != src.reg or dest.version != src.version) {
-                    try replacements.put(dest, src);
+                    if (def_counts.get(dest) == 1) {
+                        try replacements.put(dest, src);
+                    }
                 }
             }
         }
