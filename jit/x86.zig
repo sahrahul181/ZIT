@@ -160,6 +160,7 @@ pub const Inst = union(enum) {
         method_idx: u32,
         is_static:  bool,
         arg_count:  usize,
+        is_self_call: bool = false,
     },
 
     // ---- Allocation stubs ----

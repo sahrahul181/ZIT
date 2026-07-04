@@ -6,6 +6,8 @@ const x86 = @import("x86");
 const lower = @import("lower");
 const regalloc = @import("regalloc");
 const emitter = @import("emitter");
+const translate = @import("translate");
+const instmod = @import("instruction");
 
 extern "kernel32" fn VirtualAlloc(
     lpAddress: ?windows.LPVOID,
@@ -488,8 +490,7 @@ test "JIT: shift by immediate and by register execute correctly" {
 
 test "JIT: if_ltz zero-comparison branch executes correctly" {
     const a = std.testing.allocator;
-    const translate = @import("translate");
-    const instmod = @import("instruction");
+
 
     // int f(int x) { if (x < 0) return 100; return 200; }
     const insns = [_]instmod.Instruction{
@@ -618,4 +619,85 @@ test "JIT: pass 5 parameters (stack parameter support)" {
 
     const result = func(10, 20, 30, 40, 50); // 10+20+30+40+50 = 150
     try std.testing.expectEqual(@as(i64, 150), result);
+}
+
+test "JIT: self-recursive static call (Fibonacci) executes correctly" {
+    const a = std.testing.allocator;
+
+    var invoke_1 = instmod.Invoke{
+        .kind = .static,
+        .dest = null,
+        .class_name = "Main",
+        .method_name = "fib",
+        .signature = "(I)I",
+        .args = &[_]u16{ 3 },
+        .is_self_call = true,
+    };
+    var invoke_2 = instmod.Invoke{
+        .kind = .static,
+        .dest = null,
+        .class_name = "Main",
+        .method_name = "fib",
+        .signature = "(I)I",
+        .args = &[_]u16{ 5 },
+        .is_self_call = true,
+    };
+
+    const insns = [_]instmod.Instruction{
+        .{ .const_ = .{ .dest = 2, .value = 2 } }, // 0: const v2, 2
+        .{ .if_ge = .{ .src1 = 7, .src2 = 2, .offset = 3 } }, // 1: if n >= 2 goto 4 (else_block)
+        // then_block
+        .{ .return_ = .{ .src = 7 } }, // 2: return n
+        .{ .const_ = .{ .dest = 2, .value = 2 } }, // 3: dummy to align block boundaries
+        // else_block (index 4)
+        .{ .add_int_lit8 = .{ .dest = 3, .src = 7, .lit = -1 } }, // 4: v3 = n - 1
+        .{ .invoke = &invoke_1 }, // 5: invoke-static {v3}, fib
+        .{ .move_result = .{ .dest = 4 } }, // 6: v4 = result of fib(n-1)
+        .{ .add_int_lit8 = .{ .dest = 5, .src = 7, .lit = -2 } }, // 7: v5 = n - 2
+        .{ .invoke = &invoke_2 }, // 8: invoke-static {v5}, fib
+        .{ .move_result = .{ .dest = 6 } }, // 9: v6 = result of fib(n-2)
+        .{ .add_int = .{ .dest = 0, .src1 = 4, .src2 = 6 } }, // 10: v0 = v4 + v6
+        .{ .return_ = .{ .src = 0 } }, // 11: return v0
+    };
+
+    var test_cfg = try cfg.buildCFG(a, &insns);
+    defer test_cfg.deinit();
+
+    try translate.translateCFG(a, &test_cfg, &insns);
+
+    var prog = try lower.lowerCFG(a, &test_cfg);
+    defer prog.deinit();
+
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 8, 1);
+    const code_bytes = try emitter.emitProgram(a, &prog);
+    defer a.free(code_bytes);
+
+    const exec_page = try allocateExecMemory(code_bytes.len);
+    defer freeExecMemory(exec_page);
+
+    @memcpy(exec_page, code_bytes);
+
+    const JITFibFn = *const fn (i64) callconv(.c) i64;
+    const func = @as(JITFibFn, @ptrCast(exec_page.ptr));
+
+    // fib(0) = 0
+    // fib(1) = 1
+    // fib(2) = 1
+    // fib(3) = 2
+    // fib(4) = 3
+    // fib(5) = 5
+    // fib(6) = 8
+    // fib(7) = 13
+    // fib(8) = 21
+    // fib(10) = 55
+    try std.testing.expectEqual(@as(i64, 0), func(0));
+    try std.testing.expectEqual(@as(i64, 1), func(1));
+    try std.testing.expectEqual(@as(i64, 1), func(2));
+    try std.testing.expectEqual(@as(i64, 2), func(3));
+    try std.testing.expectEqual(@as(i64, 3), func(4));
+    try std.testing.expectEqual(@as(i64, 5), func(5));
+    try std.testing.expectEqual(@as(i64, 8), func(6));
+    try std.testing.expectEqual(@as(i64, 13), func(7));
+    try std.testing.expectEqual(@as(i64, 21), func(8));
+    try std.testing.expectEqual(@as(i64, 55), func(10));
 }

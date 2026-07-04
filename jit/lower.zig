@@ -587,12 +587,28 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
 
                 // ── Method calls ─────────────────────────────────────────
                 .invoke => |v| {
+                    const arg_regs = [_]x86.PhysicalReg{ .rcx, .rdx, .r8, .r9 };
+                    for (v.args, 0..) |arg, i| {
+                        if (i < 4) {
+                            try mi.append(allocator, .{ .mov = .{
+                                .dest = .{ .reg = arg_regs[i] },
+                                .src = opReg(arg),
+                            } });
+                        } else {
+                            const offset = 16 + 8 * @as(i32, @intCast(i));
+                            try mi.append(allocator, .{ .mov = .{
+                                .dest = .{ .stack = -offset },
+                                .src = opReg(arg),
+                            } });
+                        }
+                    }
                     const dest_op: ?x86.Operand = if (v.dest) |d| opReg(d) else null;
                     try mi.append(allocator, .{ .call = .{
                         .dest       = dest_op,
                         .method_idx = v.method_idx,
                         .is_static  = v.is_static,
                         .arg_count  = v.args.len,
+                        .is_self_call = v.is_self_call,
                     } });
                 },
 
@@ -820,11 +836,12 @@ test "lowerCFG: invoke method call" {
     defer prog.deinit();
 
     const insts = prog.blocks.items[0].instructions.items;
-    try std.testing.expectEqual(@as(usize, 1), insts.len);
-    try std.testing.expect(insts[0] == .call);
-    try std.testing.expectEqual(@as(u32, 42), insts[0].call.method_idx);
-    try std.testing.expectEqual(@as(usize, 1), insts[0].call.arg_count);
-    try std.testing.expect(insts[0].call.dest != null);
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expect(insts[0] == .mov);
+    try std.testing.expect(insts[1] == .call);
+    try std.testing.expectEqual(@as(u32, 42), insts[1].call.method_idx);
+    try std.testing.expectEqual(@as(usize, 1), insts[1].call.arg_count);
+    try std.testing.expect(insts[1].call.dest != null);
 }
 
 // ── Optimization tests ────────────────────────────────────────────────────────

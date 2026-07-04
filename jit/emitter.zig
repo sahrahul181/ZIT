@@ -113,6 +113,7 @@ fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachinePro
                 .divsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .movsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .ret => |v| { if (v) |op| try checkOp(&used, op); },
+                .call => |v| { if (v.dest) |op| try checkOp(&used, op); },
                 .not => |v| { try checkOp(&used, v.dest); },
                 .negss => |v| { try checkOp(&used, v.dest); },
                 .negsd => |v| { try checkOp(&used, v.dest); },
@@ -1376,6 +1377,41 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                     // Restore RBP frame pointer
                     try code.append(0x5D); // pop rbp
                     try code.append(0xC3); // RET
+                },
+                .call => |v| {
+                    if (v.is_self_call) {
+                        try code.append(0xE8);
+                        const rel32 = -@as(i32, @intCast(code.items.len + 4));
+                        var disp_bytes: [4]u8 = undefined;
+                        std.mem.writeInt(i32, &disp_bytes, rel32, .little);
+                        try code.appendSlice(&disp_bytes);
+                    } else {
+                        return EmitterError.UnsupportedInstruction;
+                    }
+
+                    if (v.dest) |dest| {
+                        if (dest == .reg) {
+                            const d = regCode(dest.reg);
+                            if (d != 0) {
+                                try code.append(makeRex(true, 0, d));
+                                try code.append(0x89);
+                                try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                            }
+                        } else if (dest == .stack) {
+                            const offset = dest.stack;
+                            try code.append(makeRex(true, 0, 5));
+                            try code.append(0x89);
+                            if (offset >= -128 and offset <= 127) {
+                                try code.append(makeModRM(0b01, 0, 5));
+                                try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                            } else {
+                                try code.append(makeModRM(0b10, 0, 5));
+                                var offset_bytes: [4]u8 = undefined;
+                                std.mem.writeInt(i32, &offset_bytes, -offset, .little);
+                                try code.appendSlice(&offset_bytes);
+                            }
+                        }
+                    }
                 },
 
                 else => return EmitterError.UnsupportedInstruction,

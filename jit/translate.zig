@@ -185,6 +185,7 @@ pub fn translateCFG(
                             .method_idx = 0,
                             .is_static = (v.kind == .static),
                             .args = ir_args,
+                            .is_self_call = v.is_self_call,
                         },
                     };
                 },

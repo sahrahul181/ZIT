@@ -192,6 +192,7 @@ pub const IRInst = union(enum) {
         method_idx: u32,
         is_static: bool,
         args: []SSAVar,
+        is_self_call: bool = false,
     },
     ret: struct { src: ?SSAVar },
     throw_op: struct { src: SSAVar },
