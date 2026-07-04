@@ -95,6 +95,20 @@ pub fn build(b: *std.Build) void {
     const cfg_it_test = b.addTest(.{ .root_module = cfg_it_mod });
     test_step.dependOn(&b.addRunArtifact(cfg_it_test).step);
 
+    const opt_mod = b.addModule("opt", .{
+        .root_source_file = b.path("jit/opt.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "ir", .module = ir_mod },
+            .{ .name = "cfg", .module = cfg_mod },
+            .{ .name = "translate", .module = translate_mod },
+            .{ .name = "instruction", .module = inst_mod },
+        },
+    });
+    const opt_mod_test = b.addTest(.{ .root_module = opt_mod });
+    test_step.dependOn(&b.addRunArtifact(opt_mod_test).step);
+
     const dex_dbg = b.addExecutable(.{
         .name = "dex-dbg",
         .root_module = b.createModule(.{
@@ -108,6 +122,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "printer", .module = print_mod },
                 .{ .name = "translate", .module = translate_mod },
                 .{ .name = "ir", .module = ir_mod },
+                .{ .name = "opt", .module = opt_mod },
             },
         }),
     });

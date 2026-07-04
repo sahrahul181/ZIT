@@ -5,6 +5,7 @@ const instruction = @import("instruction");
 const printer = @import("printer");
 const translate = @import("translate");
 const ir = @import("ir");
+const opt = @import("opt");
 const Io = std.Io;
 
 const c = @cImport({
@@ -171,6 +172,7 @@ fn usage(writer: anytype) !void {
         \\  disasm <class_name> <method_name>   Disassemble a method with raw hex bytes.
         \\  cfg <class_name> <method_name> [--dom]   Print CFG; --dom adds predecessors + idom.
         \\  ssa <class_name> <method_name>           Print SSA IR for a method.
+        \\  ssa-opt <class_name> <method_name>       Print Optimized SSA IR (with Dead Code Elimination).
         \\  emit <class_name> <method_name> [f] Dumps method instructions to stdout or a file.
         \\  kotlin <class_name>                 Show Kotlin metadata declarations (decoded using C protobuf lib).
         \\
@@ -498,7 +500,7 @@ pub fn main(init: std.process.Init) !void {
                 try writer.writeByte('\n');
             }
         }
-    } else if (std.mem.eql(u8, cmd, "ssa")) {
+    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt")) {
         if (args.len < 5) {
             try writer.print("Error: 'ssa' command requires <class_name> and <method_name> arguments.\n", .{});
             return;
@@ -586,6 +588,10 @@ pub fn main(init: std.process.Init) !void {
 
         try cfg.insertPhiFunctions(def_map);
         try cfg.renameVariables(method.registers_size);
+
+        if (std.mem.eql(u8, cmd, "ssa-opt")) {
+            _ = try opt.optimize(arena, &cfg);
+        }
 
         try writer.print("SSA IR for method {s}:\n", .{method.name});
         for (cfg.blocks.items) |block| {
