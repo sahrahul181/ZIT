@@ -12,7 +12,15 @@ pub const LiveInterval = struct {
     stack_offset: ?i32 = null,
     hint_vreg: ?ir.SSAVar = null,
     class: RegClass = .gpr,
+    live_across_call: bool = false,
 };
+
+inline fn isCalleeSaved(reg: x86.PhysicalReg) bool {
+    return switch (reg) {
+        .rbx, .r12, .r13, .r14, .r15 => true,
+        else => false,
+    };
+}
 
 /// Comparator to sort intervals by start position.
 fn compareIntervals(context: void, a: LiveInterval, b: LiveInterval) bool {
@@ -34,6 +42,9 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
     // Map from ir.SSAVar -> LiveInterval.
     var interval_map = std.AutoHashMap(ir.SSAVar, LiveInterval).init(allocator);
     defer interval_map.deinit();
+
+    var call_indices = std.ArrayList(usize).empty;
+    defer call_indices.deinit(allocator);
 
     var global_inst_idx: usize = 0;
 
@@ -230,6 +241,7 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     if (v.dest) |d| {
                         try helper.process(&interval_map, d, global_inst_idx, true, .gpr); // Object references are GPR
                     }
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .alloc_obj => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
@@ -274,7 +286,14 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
 
     var val_it = interval_map.valueIterator();
     while (val_it.next()) |val| {
-        try intervals.append(allocator, val.*);
+        var interval = val.*;
+        for (call_indices.items) |call_idx| {
+            if (call_idx > interval.start and call_idx < interval.end) {
+                interval.live_across_call = true;
+                break;
+            }
+        }
+        try intervals.append(allocator, interval);
     }
     std.mem.sort(LiveInterval, intervals.items, {}, compareIntervals);
 
@@ -344,7 +363,22 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 }
             }
 
-            const reg = selected_reg orelse pool.pop();
+            const reg = selected_reg orelse blk: {
+                if (interval.class == .gpr) {
+                    var found_idx: ?usize = null;
+                    for (pool.items, 0..) |fr, fri| {
+                        const is_callee = isCalleeSaved(fr);
+                        if (interval.live_across_call == is_callee) {
+                            found_idx = fri;
+                            break;
+                        }
+                    }
+                    if (found_idx) |fi| {
+                        break :blk pool.orderedRemove(fi);
+                    }
+                }
+                break :blk pool.pop();
+            };
             interval.reg = reg;
             try active.append(allocator, interval);
             std.mem.sort(*LiveInterval, active.items, {}, compareActive);
