@@ -8,6 +8,7 @@ pub const LiveInterval = struct {
     end: usize,
     reg: ?x86.PhysicalReg = null,
     stack_offset: ?i32 = null,
+    hint_vreg: ?ir.SSAVar = null,
 };
 
 /// Comparator to sort intervals by start position.
@@ -66,6 +67,18 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 .mov => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true);
                     try helper.process(&interval_map, v.src, global_inst_idx, false);
+
+                    // Set hint if both are virtual registers to allow coalescing.
+                    if (v.dest == .vreg and v.src == .vreg) {
+                        const d = v.dest.vreg;
+                        const s = v.src.vreg;
+                        if (interval_map.getPtr(d)) |interval_d| {
+                            interval_d.hint_vreg = s;
+                        }
+                        if (interval_map.getPtr(s)) |interval_s| {
+                            interval_s.hint_vreg = d;
+                        }
+                    }
                 },
                 .add => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true);
@@ -224,8 +237,23 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
         }
 
         if (free_regs.items.len > 0) {
-            // Allocate register
-            const reg = free_regs.pop();
+            // Allocate register: check if we can reuse the hint register.
+            var selected_reg: ?x86.PhysicalReg = null;
+            if (interval.hint_vreg) |hint_v| {
+                if (allocation_results.get(hint_v)) |hint_res| {
+                    if (hint_res.reg) |hr| {
+                        // Check if the hinted register is actually currently free
+                        for (free_regs.items, 0..) |fr, fri| {
+                            if (fr == hr) {
+                                selected_reg = free_regs.orderedRemove(fri);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            const reg = selected_reg orelse free_regs.pop();
             interval.reg = reg;
             try active.append(allocator, interval);
             std.mem.sort(*LiveInterval, active.items, {}, compareActive);
@@ -409,6 +437,23 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     }
                 },
                 else => {},
+            }
+
+            // Physical dead self-move elimination post-register allocation
+            // e.g. MOV %rcx, %rcx -> skip it!
+            const is_physical_self_mov = switch (new_inst) {
+                .mov => |v| switch (v.dest) {
+                    .reg => |d| switch (v.src) {
+                        .reg => |s| d == s,
+                        else => false,
+                    },
+                    else => false,
+                },
+                else => false,
+            };
+
+            if (is_physical_self_mov) {
+                continue;
             }
 
             try rewritten_insts.append(allocator, new_inst);
