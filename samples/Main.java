@@ -3,9 +3,12 @@
 // arithmetic, an object (StringBuilder), and System.out invocation.
 public class Main {
     public static void main(String[] args) {
-        int n = args.length > 0 ? Integer.parseInt(args[0]) : 10;
-        System.out.println("fib(" + n + ") = " + fib(n));
-        System.out.println("sum(0.." + n + ") = " + sum(n));
+        int n = args.length > 0 ? Integer.parseInt(args[0]) : 30;
+        long start = System.nanoTime();
+        int result = fibRecursive(n);
+        long end = System.nanoTime();
+        System.out.printf("fibRecursive(%d) = %d\n", n, result);
+        System.out.printf("Execution time: %.3f ms\n", (end - start) / 1_000_000.0);
     }
 
     static long fib(int n) {
@@ -40,4 +43,11 @@ public class Main {
         float div = mul / b;
         return div;
     }
+
+    static int fibRecursive(int n) {
+        if (n <= 1) return n;
+        return fibRecursive(n - 1) + fibRecursive(n - 2);
+    }
+
+
 }
