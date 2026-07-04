@@ -152,6 +152,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ir", .module = ir_mod },
             .{ .name = "x86", .module = x86_mod },
+            .{ .name = "cfg", .module = cfg_mod },
         },
     });
     const regalloc_mod_test = b.addTest(.{ .root_module = regalloc_mod });

@@ -435,6 +435,10 @@ pub const CFG = struct {
                 .shl_int,
                 .shr_int,
                 .ushr_int,
+                .add_long,
+                .sub_long,
+                .mul_long,
+                .div_long,
                 .add_float,
                 .sub_float,
                 .mul_float,
@@ -1118,4 +1122,46 @@ test "insertPhiFunctions: diamond CFG" {
     // Block 1 and 2 should not have a phi function for v0
     try std.testing.expect(cfg.blocks.items[1].getPhiConst(0) == null);
     try std.testing.expect(cfg.blocks.items[2].getPhiConst(0) == null);
+}
+
+test "cfg: rename variables and SSA generation with long arithmetic ops" {
+    const a = std.testing.allocator;
+
+    var cfg = CFG{
+        .blocks = std.ArrayList(BasicBlock).empty,
+        .allocator = a,
+    };
+    defer cfg.deinit();
+
+    var block = BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 3,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .idom = null,
+        .phi_functions = std.ArrayList(PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+    try block.instructions.append(a, .{ .const_wide = .{ .dest = .{ .reg = 0, .version = 0 }, .val = 10 } });
+    try block.instructions.append(a, .{ .const_wide = .{ .dest = .{ .reg = 2, .version = 0 }, .val = 20 } });
+    try block.instructions.append(a, .{ .add_long = .{ .dest = .{ .reg = 4, .version = 0 }, .left = .{ .reg = 0, .version = 0 }, .right = .{ .reg = 2, .version = 0 } } });
+    try block.instructions.append(a, .{ .ret = .{ .src = .{ .reg = 4, .version = 0 } } });
+    try cfg.blocks.append(a, block);
+
+    try cfg.renameVariables(6);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 4), insts.len);
+    
+    // Check that we correctly rename long operations left and right operands
+    const add_inst = insts[2].add_long;
+    try std.testing.expectEqual(@as(u16, 0), add_inst.left.reg);
+    try std.testing.expect(add_inst.left.version > 0);
+    try std.testing.expectEqual(@as(u16, 2), add_inst.right.reg);
+    try std.testing.expect(add_inst.right.version > 0);
+    try std.testing.expectEqual(@as(u16, 4), add_inst.dest.reg);
+    try std.testing.expect(add_inst.dest.version > 0);
 }

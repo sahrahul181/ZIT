@@ -204,6 +204,42 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                         try mi.append(allocator, .{ .addss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
+                .add_long => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .sub_long => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .neg = .{ .dest = opReg(v.dest) } });
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .mul_long => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .div_long => |v| {
+                    const rem_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
+                    if (!eqVar(v.dest, v.left)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                },
                 .add_wide => |v| {
                     if (eqVar(v.dest, v.left)) {
                         try mi.append(allocator, .{ .addsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
@@ -815,6 +851,44 @@ test "opt: sub dest==right emits NEG+ADD instead of clobbering MOV" {
     try std.testing.expect(insts[0] == .neg); // NEG v1
     try std.testing.expect(insts[1] == .add); // ADD v1, v0
     try std.testing.expectEqual(v0.reg, insts[1].add.src.vreg.reg);
+}
+
+test "lowerCFG: long math operations" {
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v2 = ir.SSAVar{ .reg = 2, .version = 1 };
+
+    try block.instructions.append(a, .{ .add_long = .{ .dest = v2, .left = v0, .right = v1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    
+    // add_long lower should result in:
+    //   MOV dest, left
+    //   ADD dest, right
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expect(insts[0] == .mov);
+    try std.testing.expect(insts[1] == .add);
+    try std.testing.expectEqual(v2.reg, insts[0].mov.dest.vreg.reg);
+    try std.testing.expectEqual(v0.reg, insts[0].mov.src.vreg.reg);
+    try std.testing.expectEqual(v2.reg, insts[1].add.dest.vreg.reg);
+    try std.testing.expectEqual(v1.reg, insts[1].add.src.vreg.reg);
 }
 
 

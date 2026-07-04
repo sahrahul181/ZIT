@@ -562,6 +562,7 @@ pub fn main(init: std.process.Init) !void {
                     .const_class => |v| v.dest.reg,
                     .add_int, .sub_int, .mul_int, .div_int, .rem_int,
                     .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
+                    .add_long, .sub_long, .mul_long, .div_long,
                     .add_float, .sub_float, .mul_float, .div_float,
                     .add_wide, .sub_wide, .mul_wide, .div_wide,
                     => |v| v.dest.reg,
@@ -596,6 +597,49 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        // Propagate definers through the CFG to join points to ensure proper phi insertion
+        var reg_it = def_map.iterator();
+        while (reg_it.next()) |entry| {
+            const definers = entry.value_ptr;
+            var queue = std.ArrayList(usize).empty;
+            defer queue.deinit(arena);
+            var visited = try std.DynamicBitSet.initEmpty(arena, cfg.blocks.items.len);
+            defer visited.deinit();
+            
+            // Add initial definers to queue
+            for (definers.items) |d| {
+                try queue.append(arena, d);
+                visited.set(d);
+            }
+
+            var q_idx: usize = 0;
+            while (q_idx < queue.items.len) : (q_idx += 1) {
+                const curr_id = queue.items[q_idx];
+                const curr_block = cfg.blocks.items[curr_id];
+                
+                for (curr_block.successors.items) |succ_id| {
+                    const succ_block = cfg.blocks.items[succ_id];
+                    if (succ_block.predecessors.items.len >= 2) {
+                        // If we can reach a join point, the current block acts as a definer for this register
+                        var already_def = false;
+                        for (definers.items) |d| {
+                            if (d == curr_id) {
+                                already_def = true;
+                                break;
+                            }
+                        }
+                        if (!already_def) {
+                            try definers.append(arena, curr_id);
+                        }
+                    }
+                    if (!visited.isSet(succ_id)) {
+                        visited.set(succ_id);
+                        try queue.append(arena, succ_id);
+                    }
+                }
+            }
+        }
+
         try cfg.insertPhiFunctions(def_map);
         try cfg.renameVariables(method.registers_size);
 
@@ -618,10 +662,12 @@ pub fn main(init: std.process.Init) !void {
             var machine = try lower.lowerCFG(arena, &cfg);
             defer machine.deinit();
             if (std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
-                try regalloc.allocateRegisters(arena, &machine, method.registers_size, method.ins_size);
+                try regalloc.allocateRegisters(arena, &machine, &cfg, method.registers_size, method.ins_size);
                 if (std.mem.eql(u8, cmd, "run")) {
                     const code_bytes = try emitter.emitProgram(arena, &machine);
                     defer arena.free(code_bytes);
+
+
 
                     const exec_page = try exec_mem.allocateExecMemory(code_bytes.len);
                     defer exec_mem.freeExecMemory(exec_page);

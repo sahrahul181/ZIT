@@ -21,7 +21,7 @@ fn maxVersion(cfg: *cfgmod.CFG, reg: u16) u32 {
                 .const_wide => |v| v.dest,
                 .const_string => |v| v.dest,
                 .const_class => |v| v.dest,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
                 .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                 .new_instance => |v| v.dest,
                 .new_array => |v| v.dest,
@@ -176,7 +176,7 @@ pub fn propagateCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                         changed = true;
                     }
                 },
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
                     const rep_l = resolve(replacements, v.left);
                     const rep_r = resolve(replacements, v.right);
                     if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
@@ -572,6 +572,7 @@ test "eliminatePhis: parallel copy and swap cycle resolution" {
                 .const_class => |v| v.dest.reg,
                 .add_int, .sub_int, .mul_int, .div_int, .rem_int,
                 .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
+                .add_long, .sub_long, .mul_long, .div_long,
                 .add_float, .sub_float, .mul_float, .div_float,
                 .add_wide, .sub_wide, .mul_wide, .div_wide,
                 => |v| v.dest.reg,
@@ -802,6 +803,61 @@ test "propagateCopies: propagates through arithmetic operands" {
     for (insts) |inst| {
         if (inst == .add_lit) {
             if (inst.add_lit.src.reg == v0.reg and inst.add_lit.src.version == v0.version) {
+                add_uses_v0 = true;
+            }
+        }
+    }
+    try std.testing.expect(add_uses_v0);
+}
+
+test "propagateCopies: propagates through long arithmetic operands" {
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
+        .entry_block_id = 0,
+        .allocator = a,
+    };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 3,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v2 = ir.SSAVar{ .reg = 2, .version = 1 };
+    const v3 = ir.SSAVar{ .reg = 3, .version = 1 };
+
+    try block.instructions.append(a, .{ .const_wide = .{ .dest = v0, .val = 100 } });
+    try block.instructions.append(a, .{ .move = .{ .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .add_long = .{ .dest = v3, .left = v1, .right = v2 } });
+    try block.instructions.append(a, .{ .ret = .{ .src = v3 } });
+    try cfg.blocks.append(a, block);
+
+    const changed = try propagateCopies(a, &cfg);
+    try std.testing.expect(changed);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+    var has_move = false;
+    for (insts) |inst| {
+        if (inst == .move) has_move = true;
+    }
+    try std.testing.expect(!has_move);
+
+    var add_uses_v0 = false;
+    for (insts) |inst| {
+        if (inst == .add_long) {
+            if (inst.add_long.left.reg == v0.reg and inst.add_long.left.version == v0.version) {
                 add_uses_v0 = true;
             }
         }

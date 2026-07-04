@@ -88,6 +88,12 @@ pub const IRInst = union(enum) {
     shr_lit: BinOpLit,
     ushr_lit: BinOpLit,
 
+    // Long (64-bit integer) Math
+    add_long: BinOp,
+    sub_long: BinOp,
+    mul_long: BinOp,
+    div_long: BinOp,
+
     // Floating Point & Wide Math
     add_float: BinOp,
     sub_float: BinOp,
@@ -185,6 +191,10 @@ pub const IRInst = union(enum) {
             .shr_lit => |v| try writer.print("{f} = shr {f}, #{d}", .{ v.dest, v.src, v.lit }),
             .ushr_lit => |v| try writer.print("{f} = ushr {f}, #{d}", .{ v.dest, v.src, v.lit }),
 
+            .add_long => |v| try writer.print("{f} = add-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .sub_long => |v| try writer.print("{f} = sub-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .mul_long => |v| try writer.print("{f} = mul-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .div_long => |v| try writer.print("{f} = div-long {f}, {f}", .{ v.dest, v.left, v.right }),
             .add_float => |v| try writer.print("{f} = add {f}, {f}", .{ v.dest, v.left, v.right }),
             .sub_float => |v| try writer.print("{f} = sub {f}, {f}", .{ v.dest, v.left, v.right }),
             .mul_float => |v| try writer.print("{f} = mul {f}, {f}", .{ v.dest, v.left, v.right }),
@@ -296,4 +306,26 @@ test "ir formatting: phi and ret" {
     const inst_ret_void = IRInst{ .ret = .{ .src = null } };
     const s3 = try std.fmt.bufPrint(&buf, "{f}", .{inst_ret_void});
     try std.testing.expectEqualStrings("ret void", s3);
+}
+
+test "ir formatting: long operations" {
+    var buf: [128]u8 = undefined;
+
+    // Test add_long
+    const inst_add = IRInst{ .add_long = .{
+        .dest = .{ .reg = 2, .version = 0 },
+        .left = .{ .reg = 0, .version = 1 },
+        .right = .{ .reg = 1, .version = 2 },
+    } };
+    const s1 = try std.fmt.bufPrint(&buf, "{f}", .{inst_add});
+    try std.testing.expectEqualStrings("v2_0 = add-long v0_1, v1_2", s1);
+
+    // Test sub_long
+    const inst_sub = IRInst{ .sub_long = .{
+        .dest = .{ .reg = 3, .version = 0 },
+        .left = .{ .reg = 2, .version = 0 },
+        .right = .{ .reg = 1, .version = 2 },
+    } };
+    const s2 = try std.fmt.bufPrint(&buf, "{f}", .{inst_sub});
+    try std.testing.expectEqualStrings("v3_0 = sub-long v2_0, v1_2", s2);
 }

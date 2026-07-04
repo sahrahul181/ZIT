@@ -63,6 +63,68 @@ const Relocation = struct {
     jump_type: enum { jmp, jcc },
 };
 
+/// Helper to scan all instructions and determine which callee-saved registers are used.
+fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachineProgram) !std.ArrayList(x86.PhysicalReg) {
+    var used = std.AutoHashMap(x86.PhysicalReg, void).init(allocator);
+    defer used.deinit();
+    
+    for (program.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const checkOp = struct {
+                fn run(u: *std.AutoHashMap(x86.PhysicalReg, void), op: x86.Operand) !void {
+                    if (op == .reg) {
+                        const r = op.reg;
+                        const is_callee = switch (r) {
+                            .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15 => true,
+                            else => false,
+                        };
+                        if (is_callee) {
+                            try u.put(r, {});
+                        }
+                    }
+                }
+            }.run;
+
+            switch (inst) {
+                .mov => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .add => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .sub => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .imul => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .idiv => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.rem); try checkOp(&used, v.src); },
+                .irem => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.rem); try checkOp(&used, v.src); },
+                .neg => |v| { try checkOp(&used, v.dest); },
+                .and_op => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .or_op => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .xor_op => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .shl => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .shr => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .ushr => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cmp => |v| { try checkOp(&used, v.left); try checkOp(&used, v.right); },
+                .test_op => |v| { try checkOp(&used, v.left); try checkOp(&used, v.right); },
+                .addss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .subss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .mulss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .divss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .movss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .addsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .subsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .mulsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .divsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .movsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .ret => |v| { if (v) |op| try checkOp(&used, op); },
+                else => {},
+            }
+        }
+    }
+
+    var list = std.ArrayList(x86.PhysicalReg).empty;
+    var it = used.keyIterator();
+    while (it.next()) |r| {
+        try list.append(allocator, r.*);
+    }
+    return list;
+}
+
 pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) ![]u8 {
     var raw_code = std.ArrayList(u8).empty;
     errdefer raw_code.deinit(allocator);
@@ -105,6 +167,30 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
         }
     };
 
+    const emitPush = struct {
+        fn run(c: *CodeWriter, reg: x86.PhysicalReg) !void {
+            const code_num = regCode(reg);
+            if (code_num >= 8) {
+                try c.append(0x41); // REX.B
+                try c.append(0x50 + @as(u8, @truncate(code_num - 8)));
+            } else {
+                try c.append(0x50 + @as(u8, @truncate(code_num)));
+            }
+        }
+    }.run;
+
+    const emitPop = struct {
+        fn run(c: *CodeWriter, reg: x86.PhysicalReg) !void {
+            const code_num = regCode(reg);
+            if (code_num >= 8) {
+                try c.append(0x41); // REX.B
+                try c.append(0x58 + @as(u8, @truncate(code_num - 8)));
+            } else {
+                try c.append(0x58 + @as(u8, @truncate(code_num)));
+            }
+        }
+    }.run;
+
     var code = CodeWriter{ .buf = &raw_code, .alloc = allocator };
     code.updateItems();
 
@@ -114,6 +200,14 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
     // Map from block ID -> byte offset in final code buffer.
     var block_offsets = std.AutoHashMap(usize, usize).init(allocator);
     defer block_offsets.deinit();
+
+    var callee_saved = try getUsedCalleeSavedRegs(allocator, program);
+    defer callee_saved.deinit(allocator);
+
+    // Emit pushes at entry point
+    for (callee_saved.items) |r| {
+        try emitPush(&code, r);
+    }
 
     // Pass 1: Emit instructions and record label offsets and relocation sites.
     for (program.blocks.items) |block| {
@@ -147,7 +241,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             const d = regCode(v.dest.reg);
                             const rex = makeRex(true, 0, d);
                             try code.append(rex);
-                            try code.append(0xB8 + @as(u8, @truncate(d)));
+                            try code.append(0xB8 + @as(u8, @intCast(d & 7)));
                             // We support 64-bit constants here (imm64 or imm)
                             const val: u64 = switch (v.src) {
                                 .imm => |imm| @as(u64, @bitCast(@as(i64, imm))),
@@ -181,6 +275,16 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             try code.append(0x0F);
                             try code.append(0x7E);
                             try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                        } else if (dest_xmm and src_xmm) {
+                            // movsd xmm, xmm
+                            const d = regCode(v.dest.reg);
+                            const s = regCode(v.src.reg);
+                            try code.append(0xF2);
+                            const rex = makeRex(false, d, s);
+                            if (rex != 0x40) try code.append(rex);
+                            try code.append(0x0F);
+                            try code.append(0x10);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
                         } else {
                             // MOV r64, r64
                             const d = regCode(v.dest.reg);
@@ -557,6 +661,12 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 0));
                         }
                     }
+                    // Emit pops in reverse order!
+                    var idx_saved = callee_saved.items.len;
+                    while (idx_saved > 0) {
+                        idx_saved -= 1;
+                        try emitPop(&code, callee_saved.items[idx_saved]);
+                    }
                     try code.append(0xC3); // RET
                 },
 
@@ -617,8 +727,52 @@ test "emitter: basic arithmetic and moves to machine bytes" {
     // ADD RAX, RBX -> 48 01 D8
     // RET          -> C3
     const expected = [_]u8{
+        0x53, // push rbx
         0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x01, 0xD8,
+        0x5B, // pop rbx
+        0xC3,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "emitter: callee-saved registers and register-8 immediate load encoding" {
+    const a = std.testing.allocator;
+
+    var prog = x86.MachineProgram{
+        .blocks = std.ArrayList(x86.MachineBlock).empty,
+        .allocator = a,
+    };
+    defer prog.deinit();
+
+    var mblock = x86.MachineBlock{
+        .id = 0,
+        .instructions = std.ArrayList(x86.Inst).empty,
+    };
+
+    // MOV R8, 2
+    try mblock.instructions.append(a, .{ .mov = .{ .dest = .{ .reg = .r8 }, .src = .{ .imm = 2 } } });
+    // MOV R15, 10
+    try mblock.instructions.append(a, .{ .mov = .{ .dest = .{ .reg = .r15 }, .src = .{ .imm = 10 } } });
+    // RET
+    try mblock.instructions.append(a, .{ .ret = null });
+
+    try prog.blocks.append(a, mblock);
+
+    const bytes = try emitProgram(a, &prog);
+    defer a.free(bytes);
+
+    // Expected:
+    // push r15       -> 41 57
+    // mov r8, 2      -> 49 B8 02 00 00 00 00 00 00 00
+    // mov r15, 10    -> 49 BF 0A 00 00 00 00 00 00 00
+    // pop r15        -> 41 5F
+    // ret            -> C3
+    const expected = [_]u8{
+        0x41, 0x57,
+        0x49, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0xBF, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x41, 0x5F,
         0xC3,
     };
     try std.testing.expectEqualSlices(u8, &expected, bytes);

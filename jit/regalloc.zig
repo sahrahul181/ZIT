@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir");
 const x86 = @import("x86");
+const cfgmod = @import("cfg");
 
 pub const RegClass = enum { gpr, xmm };
 
@@ -17,7 +18,7 @@ pub const LiveInterval = struct {
 
 inline fn isCalleeSaved(reg: x86.PhysicalReg) bool {
     return switch (reg) {
-        .rbx, .r12, .r13, .r14, .r15 => true,
+        .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15 => true,
         else => false,
     };
 }
@@ -37,7 +38,7 @@ fn compareActive(context: void, a: *const LiveInterval, b: *const LiveInterval) 
     return a.end < b.end;
 }
 
-pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram, registers_size: u16, ins_size: u16) !void {
+pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram, cfg_opt: ?*cfgmod.CFG, registers_size: u16, ins_size: u16) !void {
     // 0. Prepend parameter mov instructions to the entry block to load parameters from RCX, RDX, R8, R9.
     if (ins_size > 0 and program.blocks.items.len > 0) {
         const first_block = &program.blocks.items[0];
@@ -292,6 +293,273 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 .jmp, .je, .jne, .jl, .jle, .jg, .jge, .jz, .jnz => {},
             }
             global_inst_idx += 1;
+        }
+    }
+
+    if (cfg_opt) |cfg| {
+        // Run backward liveness analysis to correctly extend intervals across loop boundaries.
+        var max_block_id: usize = 0;
+        for (cfg.blocks.items) |b| {
+            if (b.id > max_block_id) max_block_id = b.id;
+        }
+        
+        const BlockLiveness = struct {
+            def: std.AutoHashMap(ir.SSAVar, void),
+            use: std.AutoHashMap(ir.SSAVar, void),
+            live_in: std.AutoHashMap(ir.SSAVar, void),
+            live_out: std.AutoHashMap(ir.SSAVar, void),
+        };
+
+        const liveness_table = try allocator.alloc(BlockLiveness, max_block_id + 1);
+        defer allocator.free(liveness_table);
+        for (liveness_table) |*l| {
+            l.* = .{
+                .def = std.AutoHashMap(ir.SSAVar, void).init(allocator),
+                .use = std.AutoHashMap(ir.SSAVar, void).init(allocator),
+                .live_in = std.AutoHashMap(ir.SSAVar, void).init(allocator),
+                .live_out = std.AutoHashMap(ir.SSAVar, void).init(allocator),
+            };
+        }
+        defer {
+            for (liveness_table) |*l| {
+                l.def.deinit();
+                l.use.deinit();
+                l.live_in.deinit();
+                l.live_out.deinit();
+            }
+        }
+
+        const block_start_idx = try allocator.alloc(usize, max_block_id + 1);
+        const block_end_idx = try allocator.alloc(usize, max_block_id + 1);
+        defer allocator.free(block_start_idx);
+        defer allocator.free(block_end_idx);
+
+        var temp_idx: usize = 0;
+        for (program.blocks.items) |mblock| {
+            block_start_idx[mblock.id] = temp_idx;
+            const l = &liveness_table[mblock.id];
+
+            const collectDefsAndUses = struct {
+                fn run(bl: *BlockLiveness, op: x86.Operand, is_def: bool) !void {
+                    switch (op) {
+                        .vreg => |v| {
+                            if (is_def) {
+                                try bl.def.put(v, {});
+                            } else {
+                                if (!bl.def.contains(v)) {
+                                    try bl.use.put(v, {});
+                                }
+                            }
+                        },
+                        .mem => |m| {
+                            switch (m.base) {
+                                .vreg => |bv| try run(bl, .{ .vreg = bv }, false),
+                                else => {},
+                            }
+                            if (m.index) |idx| {
+                                switch (idx) {
+                                    .vreg => |iv| try run(bl, .{ .vreg = iv }, false),
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }.run;
+
+            for (mblock.instructions.items) |inst| {
+                switch (inst) {
+                    .mov => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .movss => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .movsd => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .add => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .sub => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .imul => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .and_op => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .or_op => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .xor_op => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .shl => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .shr => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .ushr => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .addss => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .subss => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .mulss => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .divss => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .addsd => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .subsd => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .mulsd => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .divsd => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .neg => |v| {
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .idiv => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                        try collectDefsAndUses(l, v.rem, true);
+                    },
+                    .irem => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                        try collectDefsAndUses(l, v.rem, true);
+                    },
+                    .cmp => |v| {
+                        try collectDefsAndUses(l, v.left, false);
+                        try collectDefsAndUses(l, v.right, false);
+                    },
+                    .test_op => |v| {
+                        try collectDefsAndUses(l, v.left, false);
+                        try collectDefsAndUses(l, v.right, false);
+                    },
+                    .ret => |v| {
+                        if (v) |op| try collectDefsAndUses(l, op, false);
+                    },
+                    else => {},
+                }
+                temp_idx += 1;
+            }
+            block_end_idx[mblock.id] = temp_idx - 1;
+        }
+
+        var liveness_changed = true;
+        while (liveness_changed) {
+            liveness_changed = false;
+            
+            var b_idx = cfg.blocks.items.len;
+            while (b_idx > 0) {
+                b_idx -= 1;
+                const b = cfg.blocks.items[b_idx];
+                const l = &liveness_table[b.id];
+                
+                for (b.successors.items) |succ_id| {
+                    const succ_l = &liveness_table[succ_id];
+                    var succ_it = succ_l.live_in.keyIterator();
+                    while (succ_it.next()) |var_ptr| {
+                        const variable = var_ptr.*;
+                        const res = try l.live_out.getOrPut(variable);
+                        if (!res.found_existing) {
+                            liveness_changed = true;
+                        }
+                    }
+                }
+                
+                var use_it = l.use.keyIterator();
+                while (use_it.next()) |var_ptr| {
+                    const variable = var_ptr.*;
+                    const res = try l.live_in.getOrPut(variable);
+                    if (!res.found_existing) {
+                        liveness_changed = true;
+                    }
+                }
+                var out_it = l.live_out.keyIterator();
+                while (out_it.next()) |var_ptr| {
+                    const variable = var_ptr.*;
+                    if (!l.def.contains(variable)) {
+                        const res = try l.live_in.getOrPut(variable);
+                        if (!res.found_existing) {
+                            liveness_changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Extend intervals based on live_in and live_out of blocks.
+        for (liveness_table, 0..) |l, b_id| {
+            var in_it = l.live_in.keyIterator();
+            while (in_it.next()) |var_ptr| {
+                const variable = var_ptr.*;
+                if (interval_map.getPtr(variable)) |interval| {
+                    interval.start = @min(interval.start, block_start_idx[b_id]);
+                }
+            }
+            var out_it = l.live_out.keyIterator();
+            while (out_it.next()) |var_ptr| {
+                const variable = var_ptr.*;
+                if (interval_map.getPtr(variable)) |interval| {
+                    interval.end = @max(interval.end, block_end_idx[b_id]);
+                }
+            }
         }
     }
 
@@ -717,7 +985,7 @@ test "regalloc: basic linear scan" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, 0, 0);
+    try allocateRegisters(a, &prog, null, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -751,7 +1019,7 @@ test "regalloc: float register allocation" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, 0, 0);
+    try allocateRegisters(a, &prog, null, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     // Verify that the float variables are allocated to XMM registers!
@@ -794,7 +1062,7 @@ test "regalloc: SIB array indexing rewrite" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, 0, 0);
+    try allocateRegisters(a, &prog, null, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -808,5 +1076,94 @@ test "regalloc: SIB array indexing rewrite" {
     // GPRs should not be XMM
     try std.testing.expect(!std.mem.startsWith(u8, rewritten_mem.base.reg.name(), "xmm"));
     try std.testing.expect(!std.mem.startsWith(u8, rewritten_mem.index.?.reg.name(), "xmm"));
+}
+
+test "regalloc: loop liveness analysis" {
+    const a = std.testing.allocator;
+
+    // Build a simple 2-block CFG with a loop:
+    // Block 0:
+    //   v0_1 = const 0 (defined)
+    // Block 1 (loop header/latch):
+    //   v0_2 = phi([bb0: v0_1], [bb1: v0_3])
+    //   v0_3 = add v0_2, 1
+    //   if v0_3 < 10 goto bb1
+    
+    var test_cfg = cfgmod.CFG{
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
+        .allocator = a,
+    };
+    defer test_cfg.deinit();
+
+    var b0 = cfgmod.BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .idom = null,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+    const v0_1 = ir.SSAVar{ .reg = 0, .version = 1 };
+    try b0.instructions.append(a, .{ .const_int = .{ .dest = v0_1, .val = 0 } });
+    try b0.successors.append(a, 1);
+    try test_cfg.blocks.append(a, b0);
+
+    var b1 = cfgmod.BasicBlock{
+        .id = 1,
+        .start_idx = 1,
+        .end_idx = 3,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .idom = null,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+    const v0_2 = ir.SSAVar{ .reg = 0, .version = 2 };
+    const v0_3 = ir.SSAVar{ .reg = 0, .version = 3 };
+
+    // phi
+    var phi_args = try a.alloc(ir.PhiArg, 2);
+    phi_args[0] = .{ .pred_block_id = 0, .val = v0_1 };
+    phi_args[1] = .{ .pred_block_id = 1, .val = v0_3 };
+    try b1.phi_functions.append(a, .{ .original_reg = 0, .ssa_version = 2, .incoming = phi_args });
+
+    try b1.instructions.append(a, .{ .add_lit = .{ .dest = v0_3, .src = v0_2, .lit = 1 } });
+    try b1.instructions.append(a, .{ .if_ltz = .{ .src = v0_3, .target_block_id = 1 } }); // branch back
+    try b1.successors.append(a, 1);
+    try b1.predecessors.append(a, 0);
+    try b1.predecessors.append(a, 1);
+    try test_cfg.blocks.append(a, b1);
+    
+    test_cfg.blocks.items[0].successors.items[0] = 1;
+
+    var prog = x86.MachineProgram{
+        .blocks = std.ArrayList(x86.MachineBlock).empty,
+        .allocator = a,
+    };
+    defer prog.deinit();
+
+    var mb0 = x86.MachineBlock{ .id = 0, .instructions = std.ArrayList(x86.Inst).empty };
+    try mb0.instructions.append(a, .{ .mov = .{ .dest = .{ .vreg = v0_1 }, .src = .{ .imm = 0 } } });
+    try prog.blocks.append(a, mb0);
+
+    var mb1 = x86.MachineBlock{ .id = 1, .instructions = std.ArrayList(x86.Inst).empty };
+    try mb1.instructions.append(a, .{ .mov = .{ .dest = .{ .vreg = v0_2 }, .src = .{ .vreg = v0_1 } } }); // simplified phi copy
+    try mb1.instructions.append(a, .{ .add = .{ .dest = .{ .vreg = v0_3 }, .src = .{ .imm = 1 } } });
+    try mb1.instructions.append(a, .{ .jl = 1 });
+    try prog.blocks.append(a, mb1);
+
+    // Test that variable v0_2 is live across the back-edge, so its interval doesn't terminate prematurely
+    try allocateRegisters(a, &prog, &test_cfg, 2, 0);
+
+    // Let's assert that the allocations succeeded and registers were assigned
+    const mb1_insts = prog.blocks.items[1].instructions.items;
+    try std.testing.expect(mb1_insts[0].mov.dest == .reg);
+    try std.testing.expect(mb1_insts[0].mov.src == .reg);
 }
 

@@ -204,12 +204,12 @@ pub fn translateCFG(
                 .shr_int => |v| .{ .shr_int = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .ushr_int => |v| .{ .ushr_int = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
 
-                .add_long => |v| .{ .add_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
-                .sub_long => |v| .{ .sub_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
-                .mul_long => |v| .{ .mul_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
-                .div_long => |v| .{ .div_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .add_long => |v| .{ .add_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .sub_long => |v| .{ .sub_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .mul_long => |v| .{ .mul_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .div_long => |v| .{ .div_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long => |v| .{
-                    .add_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) }
+                    .add_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) }
                 },
 
                 .add_float => |v| .{ .add_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
@@ -510,10 +510,40 @@ test "translateCFG: binary math register and literals" {
     try std.testing.expectEqual(@as(usize, 9), insts.len);
     try std.testing.expect(insts[0] == .rem_int);
     try std.testing.expect(insts[1] == .shl_int);
-    try std.testing.expect(insts[2] == .sub_wide);
-    try std.testing.expect(insts[3] == .add_wide);
+    try std.testing.expect(insts[2] == .sub_long);
+    try std.testing.expect(insts[3] == .add_long);
     try std.testing.expect(insts[4] == .mul_float);
     try std.testing.expect(insts[5] == .div_wide);
     try std.testing.expect(insts[6] == .sub_lit);
     try std.testing.expect(insts[7] == .xor_lit);
+}
+
+test "translateCFG: all long integer math opcodes" {
+    const a = std.testing.allocator;
+    const insns = [_]instmod.Instruction{
+        .{ .add_long = .{ .dest = 0, .src1 = 2, .src2 = 4 } },
+        .{ .sub_long = .{ .dest = 6, .src1 = 8, .src2 = 10 } },
+        .{ .mul_long = .{ .dest = 12, .src1 = 14, .src2 = 16 } },
+        .{ .div_long = .{ .dest = 18, .src1 = 20, .src2 = 22 } },
+        // 2addr behavior: destination matches src1
+        .{ .add_long = .{ .dest = 24, .src1 = 24, .src2 = 26 } },
+        .{ .sub_long = .{ .dest = 28, .src1 = 28, .src2 = 30 } },
+        .{ .mul_long = .{ .dest = 32, .src1 = 32, .src2 = 34 } },
+        .{ .div_long = .{ .dest = 36, .src1 = 36, .src2 = 38 } },
+        .return_void,
+    };
+    var cfg = try cfgmod.buildCFG(a, &insns);
+    defer cfg.deinit();
+    try translateCFG(a, &cfg, &insns);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 9), insts.len);
+    try std.testing.expect(insts[0] == .add_long);
+    try std.testing.expect(insts[1] == .sub_long);
+    try std.testing.expect(insts[2] == .mul_long);
+    try std.testing.expect(insts[3] == .div_long);
+    try std.testing.expect(insts[4] == .add_long);
+    try std.testing.expect(insts[5] == .sub_long);
+    try std.testing.expect(insts[6] == .mul_long);
+    try std.testing.expect(insts[7] == .div_long);
 }
