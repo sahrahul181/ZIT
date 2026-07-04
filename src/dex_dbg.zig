@@ -381,7 +381,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
 
-        // Optional: compute predecessors + dominators when --dom flag passed
+        // Optional: compute predecessors + dominators + dominance frontiers when --dom flag passed
         const show_dom = args.len >= 6 and std.mem.eql(u8, args[5], "--dom");
         if (show_dom) {
             cfg.computePredecessors() catch |err| {
@@ -390,6 +390,10 @@ pub fn main(init: std.process.Init) !void {
             };
             cfg.computeDominators() catch |err| {
                 try writer.print("Error computing dominators: {s}\n", .{@errorName(err)});
+                return;
+            };
+            cfg.computeDominanceFrontiers() catch |err| {
+                try writer.print("Error computing dominance frontiers: {s}\n", .{@errorName(err)});
                 return;
             };
         }
@@ -426,6 +430,17 @@ pub fn main(init: std.process.Init) !void {
                 } else {
                     try writer.print("    IDom: (entry)\n", .{});
                 }
+                // Dominance frontier
+                try writer.print("    Dom Frontier: ", .{});
+                if (block.dominance_frontier.items.len == 0) {
+                    try writer.print("None", .{});
+                } else {
+                    for (block.dominance_frontier.items, 0..) |df_id, i| {
+                        if (i > 0) try writer.print(", ", .{});
+                        try writer.print("{d}", .{df_id});
+                    }
+                }
+                try writer.print("\n", .{});
             }
             var idx = block.start_idx;
             while (idx <= block.end_idx) : (idx += 1) {

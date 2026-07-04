@@ -16,6 +16,8 @@ pub const BasicBlock = struct {
     predecessors: std.ArrayList(usize),
     /// The ID of the block that immediately dominates this one
     idom: ?usize,
+    /// The set of block IDs where this block's dominance ends
+    dominance_frontier: std.ArrayList(usize),
 };
 
 pub const CFG = struct {
@@ -28,6 +30,7 @@ pub const CFG = struct {
         for (self.blocks.items) |*block| {
             block.successors.deinit(self.allocator);
             block.predecessors.deinit(self.allocator);
+            block.dominance_frontier.deinit(self.allocator);
         }
         self.blocks.deinit(self.allocator);
     }
@@ -140,6 +143,50 @@ pub const CFG = struct {
             self.blocks.items[i].idom = idom_candidate;
         }
     }
+    /// Step 3: Calculate the Dominance Frontier for every block.
+    /// A block's dominance frontier is the set of nodes where its dominance ends.
+    pub fn computeDominanceFrontiers(self: *CFG) !void {
+        // Clear previous runs
+        for (self.blocks.items) |*b| {
+            b.dominance_frontier.clearRetainingCapacity();
+        }
+
+        // We care about "join points" — blocks with multiple predecessors
+        // or the entry block if it has a back-edge.
+        for (self.blocks.items) |*b| {
+            const preds = b.predecessors.items;
+            const is_join = preds.len >= 2 or (b.id == self.entry_block_id and preds.len >= 1);
+            if (is_join) {
+                const b_idom = b.idom;
+
+                // For each predecessor, walk up the dominator tree until we hit b's IDom or b itself
+                for (preds) |pred_id| {
+                    var runner: ?usize = pred_id;
+
+                    while (runner != null and runner.? != b_idom and runner.? != b.id) {
+                        const runner_id = runner.?;
+
+                        // Add 'b' to the runner's dominance frontier
+                        // (Checking for duplicates first, as multiple preds might share a dominator path)
+                        var already_exists = false;
+                        for (self.blocks.items[runner_id].dominance_frontier.items) |existing| {
+                            if (existing == b.id) {
+                                already_exists = true;
+                                break;
+                            }
+                        }
+
+                        if (!already_exists) {
+                            try self.blocks.items[runner_id].dominance_frontier.append(self.allocator, b.id);
+                        }
+
+                        // Move up the tree
+                        runner = self.blocks.items[runner_id].idom;
+                    }
+                }
+            }
+        }
+    }
 };
 
 pub const CfgError = error{
@@ -227,6 +274,7 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
             .successors = std.ArrayList(usize).empty,
             .predecessors = std.ArrayList(usize).empty,
             .idom = null,
+            .dominance_frontier = std.ArrayListUnmanaged(usize).empty,
         });
     }
 
@@ -395,8 +443,8 @@ test "computePredecessors: loop back-edge" {
     const a = std.testing.allocator;
     const insns = [_]Instruction{
         .{ .if_eqz = .{ .src = 0, .offset = 2 } }, // idx 0
-        .{ .goto_ = .{ .offset = -1 } },             // idx 1: back to idx 0
-        .return_void,                                 // idx 2: exit
+        .{ .goto_ = .{ .offset = -1 } }, // idx 1: back to idx 0
+        .return_void, // idx 2: exit
     };
     var cfg = try buildCFG(a, &insns);
     defer cfg.deinit();
@@ -511,9 +559,9 @@ test "computeDominators: diamond CFG" {
     const a = std.testing.allocator;
     const insns = [_]Instruction{
         .{ .if_eqz = .{ .src = 0, .offset = 2 } }, // idx 0
-        .{ .goto_ = .{ .offset = 2 } },              // idx 1: jump to idx 3
-        .{ .nop = {} },                               // idx 2
-        .return_void,                                 // idx 3
+        .{ .goto_ = .{ .offset = 2 } }, // idx 1: jump to idx 3
+        .{ .nop = {} }, // idx 2
+        .return_void, // idx 3
     };
     var cfg = try buildCFG(a, &insns);
     defer cfg.deinit();
@@ -551,6 +599,89 @@ test "computeDominators: loop — back edge does not break dominator calc" {
 
     try std.testing.expectEqual(@as(usize, 3), cfg.blocks.items.len);
     try std.testing.expectEqual(@as(?usize, null), cfg.blocks.items[0].idom); // entry
-    try std.testing.expectEqual(@as(?usize, 0), cfg.blocks.items[1].idom);    // loop body
-    try std.testing.expectEqual(@as(?usize, 0), cfg.blocks.items[2].idom);    // exit
+    try std.testing.expectEqual(@as(?usize, 0), cfg.blocks.items[1].idom); // loop body
+    try std.testing.expectEqual(@as(?usize, 0), cfg.blocks.items[2].idom); // exit
+}
+
+test "computeDominanceFrontiers: diamond CFG" {
+    // Diamond pattern:
+    //   0: if_eqz v0, +2  → block1(fallthrough) or block2(branch)
+    //   1: goto +2         → block3(idx3)
+    //   2: nop             → block3(idx3)
+    //   3: return_void
+    //
+    // Dominance:
+    //   0 dominates {0, 1, 2, 3}
+    //   1 dominates {1}
+    //   2 dominates {2}
+    //   3 dominates {3}
+    //
+    // Dominance Frontiers:
+    //   DF(0) = {} (dominates everything)
+    //   DF(1) = {3}
+    //   DF(2) = {3}
+    //   DF(3) = {}
+    const a = std.testing.allocator;
+    const insns = [_]Instruction{
+        .{ .if_eqz = .{ .src = 0, .offset = 2 } }, // idx 0
+        .{ .goto_ = .{ .offset = 2 } }, // idx 1
+        .{ .nop = {} }, // idx 2
+        .return_void, // idx 3
+    };
+    var cfg = try buildCFG(a, &insns);
+    defer cfg.deinit();
+    try cfg.computePredecessors();
+    try cfg.computeDominators();
+    try cfg.computeDominanceFrontiers();
+
+    // Check block 1's DF
+    const df1 = cfg.blocks.items[1].dominance_frontier.items;
+    try std.testing.expectEqual(@as(usize, 1), df1.len);
+    try std.testing.expectEqual(@as(usize, 3), df1[0]);
+
+    // Check block 2's DF
+    const df2 = cfg.blocks.items[2].dominance_frontier.items;
+    try std.testing.expectEqual(@as(usize, 1), df2.len);
+    try std.testing.expectEqual(@as(usize, 3), df2[0]);
+
+    // Check block 0 and 3's DF (should be empty)
+    try std.testing.expectEqual(@as(usize, 0), cfg.blocks.items[0].dominance_frontier.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.blocks.items[3].dominance_frontier.items.len);
+}
+
+test "computeDominanceFrontiers: loop CFG" {
+    // A conditional loop:
+    //   0: if_eqz v0, +2  → block1(fallthrough, loop body) or block2(branch, exit)
+    //   1: goto -1         → back to block0
+    //   2: return_void
+    //
+    // Dominance:
+    //   0 dominates {0, 1, 2}
+    //   1 dominates {1}
+    //   2 dominates {2}
+    //
+    // Dominance Frontiers:
+    //   DF(0) = {}
+    //   DF(1) = {0}
+    //   DF(2) = {}
+    const a = std.testing.allocator;
+    const insns = [_]Instruction{
+        .{ .if_eqz = .{ .src = 0, .offset = 2 } },
+        .{ .goto_ = .{ .offset = -1 } },
+        .return_void,
+    };
+    var cfg = try buildCFG(a, &insns);
+    defer cfg.deinit();
+    try cfg.computePredecessors();
+    try cfg.computeDominators();
+    try cfg.computeDominanceFrontiers();
+
+    // Check block 1's DF (should contain block 0)
+    const df1 = cfg.blocks.items[1].dominance_frontier.items;
+    try std.testing.expectEqual(@as(usize, 1), df1.len);
+    try std.testing.expectEqual(@as(usize, 0), df1[0]);
+
+    // Check block 0 and 2's DF (should be empty)
+    try std.testing.expectEqual(@as(usize, 0), cfg.blocks.items[0].dominance_frontier.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.blocks.items[2].dominance_frontier.items.len);
 }
