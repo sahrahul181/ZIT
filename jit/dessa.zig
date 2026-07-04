@@ -106,8 +106,199 @@ fn resolveParallelCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG, raw_mov
     return emitted.toOwnedSlice(allocator);
 }
 
-/// Phase 1 of the Back-End: Out-of-SSA Translation.
-/// Replaces all Phi nodes with explicit `move` instructions in the predecessor blocks.
+pub fn propagateCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
+    var changed = false;
+    
+    var replacements = std.AutoHashMap(ir.SSAVar, ir.SSAVar).init(allocator);
+    defer replacements.deinit();
+
+    for (cfg.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst == .move) {
+                const dest = inst.move.dest;
+                const src = inst.move.src;
+                if (dest.reg != src.reg or dest.version != src.version) {
+                    try replacements.put(dest, src);
+                }
+            }
+        }
+    }
+
+    if (replacements.count() == 0) return false;
+
+    const resolve = struct {
+        fn f(map: std.AutoHashMap(ir.SSAVar, ir.SSAVar), variable: ir.SSAVar) ir.SSAVar {
+            var curr = variable;
+            while (map.get(curr)) |next| {
+                curr = next;
+            }
+            return curr;
+        }
+    }.f;
+
+    for (cfg.blocks.items) |*block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = &block.instructions.items[i];
+            
+            if (inst.* == .move) {
+                const dest = inst.move.dest;
+                if (replacements.contains(dest)) {
+                    _ = block.instructions.orderedRemove(i);
+                    changed = true;
+                    continue;
+                }
+            }
+
+            switch (inst.*) {
+                .move => |*v| {
+                    const rep = resolve(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                    const rep_l = resolve(replacements, v.left);
+                    const rep_r = resolve(replacements, v.right);
+                    if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
+                        v.left = rep_l;
+                        changed = true;
+                    }
+                    if (rep_r.reg != v.right.reg or rep_r.version != v.right.version) {
+                        v.right = rep_r;
+                        changed = true;
+                    }
+                },
+                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |*v| {
+                    const rep = resolve(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .new_array => |*v| {
+                    const rep = resolve(replacements, v.size);
+                    if (rep.reg != v.size.reg or rep.version != v.size.version) {
+                        v.size = rep;
+                        changed = true;
+                    }
+                },
+                .iget => |*v| {
+                    const rep = resolve(replacements, v.obj);
+                    if (rep.reg != v.obj.reg or rep.version != v.obj.version) {
+                        v.obj = rep;
+                        changed = true;
+                    }
+                },
+                .iput => |*v| {
+                    const rep_d = resolve(replacements, v.dest_or_src);
+                    const rep_o = resolve(replacements, v.obj);
+                    if (rep_d.reg != v.dest_or_src.reg or rep_d.version != v.dest_or_src.version) {
+                        v.dest_or_src = rep_d;
+                        changed = true;
+                    }
+                    if (rep_o.reg != v.obj.reg or rep_o.version != v.obj.version) {
+                        v.obj = rep_o;
+                        changed = true;
+                    }
+                },
+                .sput => |*v| {
+                    const rep = resolve(replacements, v.dest_or_src);
+                    if (rep.reg != v.dest_or_src.reg or rep.version != v.dest_or_src.version) {
+                        v.dest_or_src = rep;
+                        changed = true;
+                    }
+                },
+                .aget => |*v| {
+                    const rep_a = resolve(replacements, v.array);
+                    const rep_i = resolve(replacements, v.index);
+                    if (rep_a.reg != v.array.reg or rep_a.version != v.array.version) {
+                        v.array = rep_a;
+                        changed = true;
+                    }
+                    if (rep_i.reg != v.index.reg or rep_i.version != v.index.version) {
+                        v.index = rep_i;
+                        changed = true;
+                    }
+                },
+                .aput => |*v| {
+                    const rep_d = resolve(replacements, v.dest_or_src);
+                    const rep_a = resolve(replacements, v.array);
+                    const rep_i = resolve(replacements, v.index);
+                    if (rep_d.reg != v.dest_or_src.reg or rep_d.version != v.dest_or_src.version) {
+                        v.dest_or_src = rep_d;
+                        changed = true;
+                    }
+                    if (rep_a.reg != v.array.reg or rep_a.version != v.array.version) {
+                        v.array = rep_a;
+                        changed = true;
+                    }
+                    if (rep_i.reg != v.index.reg or rep_i.version != v.index.version) {
+                        v.index = rep_i;
+                        changed = true;
+                    }
+                },
+                .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le => |*v| {
+                    const rep_l = resolve(replacements, v.left);
+                    const rep_r = resolve(replacements, v.right);
+                    if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
+                        v.left = rep_l;
+                        changed = true;
+                    }
+                    if (rep_r.reg != v.right.reg or rep_r.version != v.right.version) {
+                        v.right = rep_r;
+                        changed = true;
+                    }
+                },
+                .if_eqz, .if_nez, .if_ltz, .if_gez, .if_gtz, .if_lez => |*v| {
+                    const rep = resolve(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .switch_op => |*v| {
+                    const rep = resolve(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .invoke => |*v| {
+                    for (v.args) |*arg| {
+                        const rep = resolve(replacements, arg.*);
+                        if (rep.reg != arg.reg or rep.version != arg.version) {
+                            arg.* = rep;
+                            changed = true;
+                        }
+                    }
+                },
+                .ret => |*v| {
+                    if (v.src) |*s| {
+                        const rep = resolve(replacements, s.*);
+                        if (rep.reg != s.reg or rep.version != s.version) {
+                            s.* = rep;
+                            changed = true;
+                        }
+                    }
+                },
+                .throw_op => |*v| {
+                    const rep = resolve(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                else => {},
+            }
+            i += 1;
+        }
+    }
+
+    return changed;
+}
+
 pub fn eliminatePhis(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !void {
     // Map: Predecessor Block ID -> List of raw Move configurations
     var moves_to_insert = std.AutoHashMap(usize, std.ArrayList(Move)).init(allocator);
@@ -441,3 +632,162 @@ test "eliminatePhis: parallel copy and swap cycle resolution" {
     }
     try std.testing.expect(found_temp);
 }
+
+test "propagateCopies: removes redundant move chain and rewires uses" {
+    const a = std.testing.allocator;
+
+    // Manually construct a tiny 1-block CFG:
+    //   Block 0:
+    //     v0_1 = const 42
+    //     v1_1 = move v0_1        <- copy introduced by eliminatePhis
+    //     ret v1_1                <- should be rewritten to ret v0_1
+    //
+    // After propagateCopies the move should be gone and ret should use v0_1.
+
+    var cfg = cfgmod.CFG{
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
+        .entry_block_id = 0,
+        .allocator = a,
+    };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 2,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+
+    try block.instructions.append(a, .{ .const_int = .{ .dest = v0, .val = 42 } });
+    try block.instructions.append(a, .{ .move = .{ .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .ret = .{ .src = v1 } });
+    try cfg.blocks.append(a, block);
+
+    const changed = try propagateCopies(a, &cfg);
+
+    try std.testing.expect(changed);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+
+    var has_move = false;
+    for (insts) |inst| {
+        if (inst == .move) has_move = true;
+    }
+    try std.testing.expect(!has_move);
+
+    var ret_uses_v0 = false;
+    for (insts) |inst| {
+        if (inst == .ret) {
+            if (inst.ret.src) |s| {
+                if (s.reg == v0.reg and s.version == v0.version) {
+                    ret_uses_v0 = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(ret_uses_v0);
+}
+
+test "propagateCopies: no-op when no moves present" {
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
+        .entry_block_id = 0,
+        .allocator = a,
+    };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    try block.instructions.append(a, .{ .const_int = .{ .dest = v0, .val = 7 } });
+    try block.instructions.append(a, .{ .ret = .{ .src = v0 } });
+    try cfg.blocks.append(a, block);
+
+    const changed = try propagateCopies(a, &cfg);
+    try std.testing.expect(!changed);
+}
+
+test "propagateCopies: propagates through arithmetic operands" {
+    const a = std.testing.allocator;
+
+    // Block 0:
+    //   v0_1 = const 10
+    //   v1_1 = move v0_1           <- copy
+    //   v2_1 = add_lit v1_1, 5     <- should be rewritten to add_lit v0_1, 5
+    //   ret v2_1
+    //
+    // After propagateCopies the move is gone and add_lit uses v0_1 directly.
+
+    var cfg = cfgmod.CFG{
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
+        .entry_block_id = 0,
+        .allocator = a,
+    };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 3,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v2 = ir.SSAVar{ .reg = 2, .version = 1 };
+
+    try block.instructions.append(a, .{ .const_int = .{ .dest = v0, .val = 10 } });
+    try block.instructions.append(a, .{ .move = .{ .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .add_lit = .{ .dest = v2, .src = v1, .lit = 5 } });
+    try block.instructions.append(a, .{ .ret = .{ .src = v2 } });
+    try cfg.blocks.append(a, block);
+
+    const changed = try propagateCopies(a, &cfg);
+    try std.testing.expect(changed);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+    var has_move = false;
+    for (insts) |inst| {
+        if (inst == .move) has_move = true;
+    }
+    try std.testing.expect(!has_move);
+
+    var add_uses_v0 = false;
+    for (insts) |inst| {
+        if (inst == .add_lit) {
+            if (inst.add_lit.src.reg == v0.reg and inst.add_lit.src.version == v0.version) {
+                add_uses_v0 = true;
+            }
+        }
+    }
+    try std.testing.expect(add_uses_v0);
+}
+

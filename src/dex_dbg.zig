@@ -174,7 +174,7 @@ fn usage(writer: anytype) !void {
         \\  cfg <class_name> <method_name> [--dom]   Print CFG; --dom adds predecessors + idom.
         \\  ssa <class_name> <method_name>           Print SSA IR for a method.
         \\  ssa-opt <class_name> <method_name>       Print Optimized SSA IR (with Dead Code Elimination).
-        \\  dessa <class_name> <method_name>         Print SSA IR after Out-of-SSA translation (eliminating Phis).
+        \\  dessa <class_name> <method_name>         Print SSA IR after Out-of-SSA translation (eliminatePhis + propagateCopies).
         \\  emit <class_name> <method_name> [f] Dumps method instructions to stdout or a file.
         \\  kotlin <class_name>                 Show Kotlin metadata declarations (decoded using C protobuf lib).
         \\
@@ -597,7 +597,8 @@ pub fn main(init: std.process.Init) !void {
 
         if (std.mem.eql(u8, cmd, "dessa")) {
             try dessa.eliminatePhis(arena, &cfg);
-            try writer.print("SSA IR after de-SSA (eliminatePhis) for method {s}:\n", .{method.name});
+            while (try dessa.propagateCopies(arena, &cfg)) {}
+            try writer.print("SSA IR after de-SSA (eliminatePhis + propagateCopies) for method {s}:\n", .{method.name});
         } else {
             try writer.print("SSA IR for method {s}:\n", .{method.name});
         }
