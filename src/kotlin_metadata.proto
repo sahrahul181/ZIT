@@ -1,0 +1,90 @@
+syntax = "proto2";
+
+package org.jetbrains.kotlin.metadata;
+
+// Kotlin ProtoBuf class metadata schema.
+// Field numbers verified against ProtoBuf$Class / ProtoBuf$Function / ProtoBuf$Property
+// using javap on kotlin-compiler.jar (v2.x).
+
+message Class {
+    // flags = 1
+    optional int32 flags = 1;
+    // old_flags = 2
+    optional int32 old_flags = 2;
+    // name (string table index) = 3
+    optional int32 name = 3;
+    // companion_object_name = 4
+    optional int32 companion_object_name = 4;
+    // type_parameter = 5
+    repeated TypeParameter type_parameter = 5;
+    // supertype = 6
+    repeated Type supertype = 6;
+    // supertype_id = 7
+    repeated int32 supertype_id = 7;
+    // constructor = 8 (CONSTRUCTOR_FIELD_NUMBER = 8)
+    repeated Constructor constructor = 8;
+    // function = 9 (FUNCTION_FIELD_NUMBER = 9)
+    repeated Function function = 9;
+    // property = 10 (PROPERTY_FIELD_NUMBER = 10)
+    repeated Property property = 10;
+    // type_alias = 48
+    repeated TypeAlias type_alias = 48;
+}
+
+message Constructor {
+    optional int32 flags = 1;
+    repeated ValueParameter value_parameter = 2;
+}
+
+message Function {
+    // flags = 9 (FLAGS_FIELD_NUMBER = 9)
+    optional int32 flags = 9;
+    optional int32 old_flags = 15;
+    // name (string table index) = 2 (NAME_FIELD_NUMBER = 2)
+    optional int32 name = 2;
+    optional Type return_type = 3;
+    optional int32 return_type_id = 4;
+    repeated TypeParameter type_parameter = 4;
+    optional Type receiver_type = 5;
+    optional int32 receiver_type_id = 14;
+    // value_parameter = 6 (VALUE_PARAMETER_FIELD_NUMBER = 6)
+    repeated ValueParameter value_parameter = 6;
+}
+
+message Property {
+    // flags = 11 (FLAGS_FIELD_NUMBER = 11)
+    optional int32 flags = 11;
+    optional int32 old_flags = 12;
+    // name (string table index) = 2 (NAME_FIELD_NUMBER = 2)
+    optional int32 name = 2;
+    optional Type return_type = 3;
+    optional int32 return_type_id = 4;
+    repeated TypeParameter type_parameter = 5;
+    optional Type receiver_type = 6;
+    optional int32 receiver_type_id = 15;
+    optional ValueParameter setter_value_parameter = 7;
+}
+
+message ValueParameter {
+    optional int32 flags = 1;
+    optional int32 name = 2;
+    optional Type type = 3;
+    optional int32 type_id = 4;
+}
+
+message Type {
+    optional bool nullable = 3 [default = false];
+    optional int32 class_name = 6;
+    optional int32 type_parameter = 7;
+    optional int32 flags = 1;
+}
+
+message TypeParameter {
+    required int32 id = 1;
+    required int32 name = 2;
+}
+
+message TypeAlias {
+    optional int32 flags = 1;
+    optional int32 name = 2;
+}
