@@ -109,6 +109,20 @@ pub fn build(b: *std.Build) void {
     const opt_mod_test = b.addTest(.{ .root_module = opt_mod });
     test_step.dependOn(&b.addRunArtifact(opt_mod_test).step);
 
+    const dessa_mod = b.addModule("dessa", .{
+        .root_source_file = b.path("jit/dessa.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "ir", .module = ir_mod },
+            .{ .name = "cfg", .module = cfg_mod },
+            .{ .name = "instruction", .module = inst_mod },
+            .{ .name = "translate", .module = translate_mod },
+        },
+    });
+    const dessa_mod_test = b.addTest(.{ .root_module = dessa_mod });
+    test_step.dependOn(&b.addRunArtifact(dessa_mod_test).step);
+
     const dex_dbg = b.addExecutable(.{
         .name = "dex-dbg",
         .root_module = b.createModule(.{
@@ -123,6 +137,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "translate", .module = translate_mod },
                 .{ .name = "ir", .module = ir_mod },
                 .{ .name = "opt", .module = opt_mod },
+                .{ .name = "dessa", .module = dessa_mod },
             },
         }),
     });

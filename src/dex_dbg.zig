@@ -6,6 +6,7 @@ const printer = @import("printer");
 const translate = @import("translate");
 const ir = @import("ir");
 const opt = @import("opt");
+const dessa = @import("dessa");
 const Io = std.Io;
 
 const c = @cImport({
@@ -173,6 +174,7 @@ fn usage(writer: anytype) !void {
         \\  cfg <class_name> <method_name> [--dom]   Print CFG; --dom adds predecessors + idom.
         \\  ssa <class_name> <method_name>           Print SSA IR for a method.
         \\  ssa-opt <class_name> <method_name>       Print Optimized SSA IR (with Dead Code Elimination).
+        \\  dessa <class_name> <method_name>         Print SSA IR after Out-of-SSA translation (eliminating Phis).
         \\  emit <class_name> <method_name> [f] Dumps method instructions to stdout or a file.
         \\  kotlin <class_name>                 Show Kotlin metadata declarations (decoded using C protobuf lib).
         \\
@@ -500,9 +502,9 @@ pub fn main(init: std.process.Init) !void {
                 try writer.writeByte('\n');
             }
         }
-    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt")) {
+    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa")) {
         if (args.len < 5) {
-            try writer.print("Error: 'ssa' command requires <class_name> and <method_name> arguments.\n", .{});
+            try writer.print("Error: '{s}' command requires <class_name> and <method_name> arguments.\n", .{cmd});
             return;
         }
         const class_arg = args[3];
@@ -589,11 +591,16 @@ pub fn main(init: std.process.Init) !void {
         try cfg.insertPhiFunctions(def_map);
         try cfg.renameVariables(method.registers_size);
 
-        if (std.mem.eql(u8, cmd, "ssa-opt")) {
+        if (std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa")) {
             _ = try opt.optimize(arena, &cfg);
         }
 
-        try writer.print("SSA IR for method {s}:\n", .{method.name});
+        if (std.mem.eql(u8, cmd, "dessa")) {
+            try dessa.eliminatePhis(arena, &cfg);
+            try writer.print("SSA IR after de-SSA (eliminatePhis) for method {s}:\n", .{method.name});
+        } else {
+            try writer.print("SSA IR for method {s}:\n", .{method.name});
+        }
         for (cfg.blocks.items) |block| {
             try writer.print("  Block {d}:\n", .{block.id});
             for (block.instructions.items) |inst| {
