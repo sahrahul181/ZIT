@@ -83,7 +83,7 @@ test "exec_mem: end-to-end JIT execution on physical CPU" {
     defer prog.deinit();
 
     // 3. Allocate Registers
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, 2, 1);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 2, 1);
 
     // 4. Emit Machine Code Bytes
     const code_bytes = try emitter.emitProgram(a, &prog);

@@ -652,13 +652,27 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                 // ---- Returns ----
                 .ret => |v| {
                     if (v) |op| {
-                        if (op == .reg and regCode(op.reg) != 0) {
-                            // If the return operand is not in RAX, MOV it to RAX!
-                            const s = regCode(op.reg);
-                            const rex = makeRex(true, s, 0); // RAX is 0
-                            try code.append(rex);
-                            try code.append(0x89);
-                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 0));
+                        if (op == .reg) {
+                            const is_xmm = std.mem.startsWith(u8, op.reg.name(), "xmm");
+                            if (is_xmm) {
+                                if (regCode(op.reg) != 0) { // XMM0 is 0
+                                    const s = regCode(op.reg);
+                                    try code.append(0xF3);
+                                    const rex = makeRex(false, 0, s);
+                                    if (rex != 0x40) try code.append(rex);
+                                    try code.append(0x0F);
+                                    try code.append(0x10);
+                                    try code.append(makeModRM(0b11, 0, @as(u3, @truncate(s))));
+                                }
+                            } else {
+                                if (regCode(op.reg) != 0) { // RAX is 0
+                                    const s = regCode(op.reg);
+                                    const rex = makeRex(true, s, 0); // RAX is 0
+                                    try code.append(rex);
+                                    try code.append(0x89);
+                                    try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 0));
+                                }
+                            }
                         }
                     }
                     // Emit pops in reverse order!

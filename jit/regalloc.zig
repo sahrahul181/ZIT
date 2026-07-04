@@ -38,19 +38,31 @@ fn compareActive(context: void, a: *const LiveInterval, b: *const LiveInterval) 
     return a.end < b.end;
 }
 
-pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram, cfg_opt: ?*cfgmod.CFG, registers_size: u16, ins_size: u16) !void {
+pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram, cfg_opt: ?*cfgmod.CFG, is_float_param: ?[]const bool, registers_size: u16, ins_size: u16) !void {
     // 0. Prepend parameter mov instructions to the entry block to load parameters from RCX, RDX, R8, R9.
     if (ins_size > 0 and program.blocks.items.len > 0) {
         const first_block = &program.blocks.items[0];
         const arg_regs = [_]x86.PhysicalReg{ .rcx, .rdx, .r8, .r9 };
+        const float_arg_regs = [_]x86.PhysicalReg{ .xmm0, .xmm1, .xmm2, .xmm3 };
         var i: u16 = 0;
         while (i < ins_size and i < 4) : (i += 1) {
             const param_reg = registers_size - ins_size + i;
             const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
-            try first_block.instructions.insert(allocator, i, .{ .mov = .{
-                .dest = .{ .vreg = v },
-                .src = .{ .reg = arg_regs[i] },
-            } });
+            
+            const is_float = if (is_float_param) |list| (i < list.len and list[i]) else false;
+            const src_reg = if (is_float) float_arg_regs[i] else arg_regs[i];
+            
+            if (is_float) {
+                try first_block.instructions.insert(allocator, i, .{ .movss = .{
+                    .dest = .{ .vreg = v },
+                    .src = .{ .reg = src_reg },
+                } });
+            } else {
+                try first_block.instructions.insert(allocator, i, .{ .mov = .{
+                    .dest = .{ .vreg = v },
+                    .src = .{ .reg = src_reg },
+                } });
+            }
         }
     }
 
@@ -985,7 +997,7 @@ test "regalloc: basic linear scan" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, 0, 0);
+    try allocateRegisters(a, &prog, null, null, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -1019,7 +1031,7 @@ test "regalloc: float register allocation" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, 0, 0);
+    try allocateRegisters(a, &prog, null, null, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     // Verify that the float variables are allocated to XMM registers!
@@ -1062,7 +1074,7 @@ test "regalloc: SIB array indexing rewrite" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, 0, 0);
+    try allocateRegisters(a, &prog, null, null, 0, 0);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -1159,7 +1171,7 @@ test "regalloc: loop liveness analysis" {
     try prog.blocks.append(a, mb1);
 
     // Test that variable v0_2 is live across the back-edge, so its interval doesn't terminate prematurely
-    try allocateRegisters(a, &prog, &test_cfg, 2, 0);
+    try allocateRegisters(a, &prog, &test_cfg, null, 2, 0);
 
     // Let's assert that the allocations succeeded and registers were assigned
     const mb1_insts = prog.blocks.items[1].instructions.items;

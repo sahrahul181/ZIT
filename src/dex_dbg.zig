@@ -661,13 +661,60 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, cmd, "lower") or std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
             var machine = try lower.lowerCFG(arena, &cfg);
             defer machine.deinit();
+            var all_types = std.ArrayList(bool).empty;
+            var sig_idx: usize = 0;
+            if (sig_idx < method.signature.len and method.signature[sig_idx] == '(') {
+                sig_idx += 1;
+            }
+            while (sig_idx < method.signature.len) {
+                if (method.signature[sig_idx] == ')') {
+                    sig_idx += 1;
+                    continue;
+                }
+                const char = method.signature[sig_idx];
+                if (char == 'F' or char == 'D') {
+                    try all_types.append(arena, true);
+                    sig_idx += 1;
+                } else if (char == 'L') {
+                    try all_types.append(arena, false);
+                    while (sig_idx < method.signature.len and method.signature[sig_idx] != ';') : (sig_idx += 1) {}
+                    if (sig_idx < method.signature.len) sig_idx += 1;
+                } else if (char == '[') {
+                    try all_types.append(arena, false);
+                    sig_idx += 1;
+                    while (sig_idx < method.signature.len and method.signature[sig_idx] == '[') : (sig_idx += 1) {}
+                    if (sig_idx < method.signature.len and method.signature[sig_idx] == 'L') {
+                        while (sig_idx < method.signature.len and method.signature[sig_idx] != ';') : (sig_idx += 1) {}
+                        if (sig_idx < method.signature.len) sig_idx += 1;
+                    } else if (sig_idx < method.signature.len) {
+                        sig_idx += 1;
+                    }
+                } else {
+                    try all_types.append(arena, false);
+                    sig_idx += 1;
+                }
+            }
+
+            var is_float_param = std.ArrayList(bool).empty;
+            if (all_types.items.len > 1) {
+                try is_float_param.appendSlice(arena, all_types.items[0 .. all_types.items.len - 1]);
+            }
+            const is_float_ret = if (all_types.items.len > 0 and all_types.items[all_types.items.len - 1]) true else false;
+            // Wait, we need to inspect double return separately
+            var is_double_ret = false;
+            if (std.mem.lastIndexOfScalar(u8, method.signature, 'D')) |d_idx| {
+                if (d_idx == method.signature.len - 1) {
+                    is_double_ret = true;
+                }
+            }
+
+            std.debug.print("Method signature: {s}, is_float_param: {any}, is_float_ret: {}, is_double_ret: {}\n", .{method.signature, is_float_param.items, is_float_ret, is_double_ret});
+
             if (std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
-                try regalloc.allocateRegisters(arena, &machine, &cfg, method.registers_size, method.ins_size);
+                try regalloc.allocateRegisters(arena, &machine, &cfg, is_float_param.items, method.registers_size, method.ins_size);
                 if (std.mem.eql(u8, cmd, "run")) {
                     const code_bytes = try emitter.emitProgram(arena, &machine);
                     defer arena.free(code_bytes);
-
-
 
                     const exec_page = try exec_mem.allocateExecMemory(code_bytes.len);
                     defer exec_mem.freeExecMemory(exec_page);
@@ -683,11 +730,38 @@ pub fn main(init: std.process.Init) !void {
                     if (args.len >= 8) arg2 = std.fmt.parseInt(i64, args[7], 10) catch 0;
                     if (args.len >= 9) arg3 = std.fmt.parseInt(i64, args[8], 10) catch 0;
 
-                    const JITFn = *const fn (i64, i64, i64, i64) callconv(.c) i64;
-                    const func = @as(JITFn, @ptrCast(exec_page.ptr));
-
-                    const result = func(arg0, arg1, arg2, arg3);
-                    try writer.print("JIT execution result: {d}\n", .{result});
+                    if (is_float_ret) {
+                        const JITFn = *const fn (f32, f32, f32, f32) callconv(.c) f32;
+                        const func = @as(JITFn, @ptrCast(exec_page.ptr));
+                        var f_arg0: f32 = 0.0;
+                        var f_arg1: f32 = 0.0;
+                        var f_arg2: f32 = 0.0;
+                        var f_arg3: f32 = 0.0;
+                        if (args.len >= 6) f_arg0 = std.fmt.parseFloat(f32, args[5]) catch 0.0;
+                        if (args.len >= 7) f_arg1 = std.fmt.parseFloat(f32, args[6]) catch 0.0;
+                        if (args.len >= 8) f_arg2 = std.fmt.parseFloat(f32, args[7]) catch 0.0;
+                        if (args.len >= 9) f_arg3 = std.fmt.parseFloat(f32, args[8]) catch 0.0;
+                        const result = func(f_arg0, f_arg1, f_arg2, f_arg3);
+                        try writer.print("JIT execution result: {d}\n", .{result});
+                    } else if (is_double_ret) {
+                        const JITFn = *const fn (f64, f64, f64, f64) callconv(.c) f64;
+                        const func = @as(JITFn, @ptrCast(exec_page.ptr));
+                        var f_arg0: f64 = 0.0;
+                        var f_arg1: f64 = 0.0;
+                        var f_arg2: f64 = 0.0;
+                        var f_arg3: f64 = 0.0;
+                        if (args.len >= 6) f_arg0 = std.fmt.parseFloat(f64, args[5]) catch 0.0;
+                        if (args.len >= 7) f_arg1 = std.fmt.parseFloat(f64, args[6]) catch 0.0;
+                        if (args.len >= 8) f_arg2 = std.fmt.parseFloat(f64, args[7]) catch 0.0;
+                        if (args.len >= 9) f_arg3 = std.fmt.parseFloat(f64, args[8]) catch 0.0;
+                        const result = func(f_arg0, f_arg1, f_arg2, f_arg3);
+                        try writer.print("JIT execution result: {d}\n", .{result});
+                    } else {
+                        const JITFn = *const fn (i64, i64, i64, i64) callconv(.c) i64;
+                        const func = @as(JITFn, @ptrCast(exec_page.ptr));
+                        const result = func(arg0, arg1, arg2, arg3);
+                        try writer.print("JIT execution result: {d}\n", .{result});
+                    }
                     return;
                 }
                 try writer.print("Register-allocated x86-64 assembly for method {s}:\n", .{method.name});

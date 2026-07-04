@@ -32,4 +32,12 @@ public class Main {
         }
         return result;
     }
+
+    static float floatDivComplex(float a, float b) {
+        float add = a + b;
+        float sub = a - b;
+        float mul = add * sub;
+        float div = mul / b;
+        return div;
+    }
 }
