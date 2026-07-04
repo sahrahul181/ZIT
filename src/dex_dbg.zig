@@ -757,6 +757,7 @@ pub fn main(init: std.process.Init) !void {
                     if (args.len >= 8) arg2 = std.fmt.parseInt(i64, args[7], 10) catch 0;
                     if (args.len >= 9) arg3 = std.fmt.parseInt(i64, args[8], 10) catch 0;
 
+                    const start_ns = Io.Clock.awake.now(io).nanoseconds;
                     if (is_float_ret) {
                         const JITFn = *const fn (f32, f32, f32, f32) callconv(.c) f32;
                         const func = @as(JITFn, @ptrCast(exec_page.ptr));
@@ -769,7 +770,9 @@ pub fn main(init: std.process.Init) !void {
                         if (args.len >= 8) f_arg2 = std.fmt.parseFloat(f32, args[7]) catch 0.0;
                         if (args.len >= 9) f_arg3 = std.fmt.parseFloat(f32, args[8]) catch 0.0;
                         const result = func(f_arg0, f_arg1, f_arg2, f_arg3);
+                        const end_ns = Io.Clock.awake.now(io).nanoseconds;
                         try writer.print("JIT execution result: {d}\n", .{result});
+                        try writer.print("JIT execution time: {d:.3} ms\n", .{@as(f64, @floatFromInt(end_ns - start_ns)) / 1_000_000.0});
                     } else if (is_double_ret) {
                         const JITFn = *const fn (f64, f64, f64, f64) callconv(.c) f64;
                         const func = @as(JITFn, @ptrCast(exec_page.ptr));
@@ -782,12 +785,16 @@ pub fn main(init: std.process.Init) !void {
                         if (args.len >= 8) f_arg2 = std.fmt.parseFloat(f64, args[7]) catch 0.0;
                         if (args.len >= 9) f_arg3 = std.fmt.parseFloat(f64, args[8]) catch 0.0;
                         const result = func(f_arg0, f_arg1, f_arg2, f_arg3);
+                        const end_ns = Io.Clock.awake.now(io).nanoseconds;
                         try writer.print("JIT execution result: {d}\n", .{result});
+                        try writer.print("JIT execution time: {d:.3} ms\n", .{@as(f64, @floatFromInt(end_ns - start_ns)) / 1_000_000.0});
                     } else {
                         const JITFn = *const fn (i64, i64, i64, i64) callconv(.c) i64;
                         const func = @as(JITFn, @ptrCast(exec_page.ptr));
                         const result = func(arg0, arg1, arg2, arg3);
+                        const end_ns = Io.Clock.awake.now(io).nanoseconds;
                         try writer.print("JIT execution result: {d}\n", .{result});
+                        try writer.print("JIT execution time: {d:.3} ms\n", .{@as(f64, @floatFromInt(end_ns - start_ns)) / 1_000_000.0});
                     }
                     return;
                 }
