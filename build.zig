@@ -65,15 +65,32 @@ pub fn build(b: *std.Build) void {
     const print_mod_test = b.addTest(.{ .root_module = print_mod });
     test_step.dependOn(&b.addRunArtifact(print_mod_test).step);
 
-    const cfg_mod = b.addModule("cfg", .{ .root_source_file = b.path("jit/cfg.zig"), .optimize = optimize, .target = target, .imports = &.{.{ .name = "instruction", .module = inst_mod }} });
+    const ir_mod = b.addModule("ir", .{ .root_source_file = b.path("jit/ir.zig"), .optimize = optimize, .target = target });
+    const ir_mod_test = b.addTest(.{ .root_module = ir_mod });
+    test_step.dependOn(&b.addRunArtifact(ir_mod_test).step);
+
+    const cfg_mod = b.addModule("cfg", .{ .root_source_file = b.path("jit/cfg.zig"), .optimize = optimize, .target = target, .imports = &.{
+        .{ .name = "instruction", .module = inst_mod },
+        .{ .name = "ir", .module = ir_mod },
+    } });
     const cfg_mod_test = b.addTest(.{ .root_module = cfg_mod });
     test_step.dependOn(&b.addRunArtifact(cfg_mod_test).step);
+
+    const translate_mod = b.addModule("translate", .{ .root_source_file = b.path("jit/translate.zig"), .optimize = optimize, .target = target, .imports = &.{
+        .{ .name = "instruction", .module = inst_mod },
+        .{ .name = "ir", .module = ir_mod },
+        .{ .name = "cfg", .module = cfg_mod },
+    } });
+    const translate_mod_test = b.addTest(.{ .root_module = translate_mod });
+    test_step.dependOn(&b.addRunArtifact(translate_mod_test).step);
 
     // Integration test: parse the real d8-produced DEX and build a CFG from it.
     const cfg_it_mod = b.createModule(.{ .root_source_file = b.path("jit/cfg_integration_test.zig"), .optimize = optimize, .target = target, .imports = &.{
         .{ .name = "dex", .module = dex_mod },
         .{ .name = "cfg", .module = cfg_mod },
         .{ .name = "instruction", .module = inst_mod },
+        .{ .name = "translate", .module = translate_mod },
+        .{ .name = "ir", .module = ir_mod },
     } });
     const cfg_it_test = b.addTest(.{ .root_module = cfg_it_mod });
     test_step.dependOn(&b.addRunArtifact(cfg_it_test).step);
@@ -89,6 +106,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "cfg", .module = cfg_mod },
                 .{ .name = "instruction", .module = inst_mod },
                 .{ .name = "printer", .module = print_mod },
+                .{ .name = "translate", .module = translate_mod },
+                .{ .name = "ir", .module = ir_mod },
             },
         }),
     });

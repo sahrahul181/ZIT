@@ -3,6 +3,8 @@ const parser = @import("parser");
 const cfgmod = @import("cfg");
 const instruction = @import("instruction");
 const printer = @import("printer");
+const translate = @import("translate");
+const ir = @import("ir");
 const Io = std.Io;
 
 const c = @cImport({
@@ -168,6 +170,7 @@ fn usage(writer: anytype) !void {
         \\  strings [pattern]                   List or search for strings in the string pool.
         \\  disasm <class_name> <method_name>   Disassemble a method with raw hex bytes.
         \\  cfg <class_name> <method_name> [--dom]   Print CFG; --dom adds predecessors + idom.
+        \\  ssa <class_name> <method_name>           Print SSA IR for a method.
         \\  emit <class_name> <method_name> [f] Dumps method instructions to stdout or a file.
         \\  kotlin <class_name>                 Show Kotlin metadata declarations (decoded using C protobuf lib).
         \\
@@ -492,6 +495,104 @@ pub fn main(init: std.process.Init) !void {
         } else {
             for (insts) |inst| {
                 try printer.printInstruction(writer, inst);
+                try writer.writeByte('\n');
+            }
+        }
+    } else if (std.mem.eql(u8, cmd, "ssa")) {
+        if (args.len < 5) {
+            try writer.print("Error: 'ssa' command requires <class_name> and <method_name> arguments.\n", .{});
+            return;
+        }
+        const class_arg = args[3];
+        const method_arg = args[4];
+
+        const class = findClass(&dex, class_arg) orelse {
+            try writer.print("Error: Class '{s}' not found.\n", .{class_arg});
+            return;
+        };
+        const method = findMethod(&class, method_arg) orelse {
+            try writer.print("Error: Method '{s}' not found in class '{s}'.\n", .{ method_arg, class.name });
+            return;
+        };
+
+        const insts = dex.decodeMethod(arena, method) catch |err| {
+            try writer.print("Error decoding bytecode: {s}\n", .{@errorName(err)});
+            return;
+        };
+
+        var cfg = cfgmod.buildCFG(arena, insts) catch |err| {
+            try writer.print("Error building CFG: {s}\n", .{@errorName(err)});
+            return;
+        };
+
+        try cfg.computePredecessors();
+        try cfg.computeDominators();
+        try cfg.computeDominatorChildren();
+        try cfg.computeDominanceFrontiers();
+
+        try translate.translateCFG(arena, &cfg, insts);
+
+        var def_map = std.AutoHashMap(u16, std.ArrayList(usize)).init(arena);
+        defer {
+            var it = def_map.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit(arena);
+            def_map.deinit();
+        }
+
+        for (cfg.blocks.items) |block| {
+            for (block.instructions.items) |inst| {
+                const dest_reg: ?u16 = switch (inst) {
+                    .phi => |v| v.dest.reg,
+                    .move => |v| v.dest.reg,
+                    .const_int => |v| v.dest.reg,
+                    .const_wide => |v| v.dest.reg,
+                    .const_string => |v| v.dest.reg,
+                    .const_class => |v| v.dest.reg,
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int,
+                    .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
+                    .add_float, .sub_float, .mul_float, .div_float,
+                    .add_wide, .sub_wide, .mul_wide, .div_wide,
+                    => |v| v.dest.reg,
+                    .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
+                    .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                    => |v| v.dest.reg,
+                    .new_instance => |v| v.dest.reg,
+                    .new_array => |v| v.dest.reg,
+                    .iget => |v| v.dest_or_src.reg,
+                    .sget => |v| v.dest_or_src.reg,
+                    .aget => |v| v.dest_or_src.reg,
+                    .invoke => |v| if (v.dest) |d| d.reg else null,
+                    else => null,
+                };
+
+                if (dest_reg) |reg| {
+                    var res = try def_map.getOrPut(reg);
+                    if (!res.found_existing) {
+                        res.value_ptr.* = .empty;
+                    }
+                    var contains = false;
+                    for (res.value_ptr.items) |b_id| {
+                        if (b_id == block.id) {
+                            contains = true;
+                            break;
+                        }
+                    }
+                    if (!contains) {
+                        try res.value_ptr.append(arena, block.id);
+                    }
+                }
+            }
+        }
+
+        try cfg.insertPhiFunctions(def_map);
+        try cfg.renameVariables(method.registers_size);
+
+        try writer.print("SSA IR for method {s}:\n", .{method.name});
+        for (cfg.blocks.items) |block| {
+            try writer.print("  Block {d}:\n", .{block.id});
+            for (block.instructions.items) |inst| {
+                try writer.writeAll("    ");
+                try inst.format(writer);
                 try writer.writeByte('\n');
             }
         }

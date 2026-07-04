@@ -1,10 +1,12 @@
 const std = @import("std");
 const instmod = @import("instruction");
 const Instruction = instmod.Instruction;
+const ir = @import("ir");
 
 pub const PhiNode = struct {
     original_reg: u16,
     ssa_version: ?u32 = null,
+    incoming: []ir.PhiArg,
 };
 
 /// A Basic Block represents a straight-line sequence of instructions
@@ -24,7 +26,33 @@ pub const BasicBlock = struct {
     /// The set of block IDs where this block's dominance ends
     dominance_frontier: std.ArrayList(usize),
     /// Tracks which original registers have a Phi function at the start of this block
-    phi_functions: std.AutoHashMapUnmanaged(u16, PhiNode),
+    phi_functions: std.ArrayList(PhiNode),
+    /// Blocks that are immediately dominated by this block
+    dom_children: std.ArrayList(usize),
+    /// Instructions in 3-Address Code IR form (populated by translateCFG)
+    instructions: std.ArrayList(ir.IRInst),
+
+    pub fn getPhi(self: *BasicBlock, reg: u16) ?*PhiNode {
+        for (self.phi_functions.items) |*phi| {
+            if (phi.original_reg == reg) return phi;
+        }
+        return null;
+    }
+
+    pub fn getPhiConst(self: *const BasicBlock, reg: u16) ?*const PhiNode {
+        for (self.phi_functions.items) |*phi| {
+            if (phi.original_reg == reg) return phi;
+        }
+        return null;
+    }
+
+    pub fn putPhi(self: *BasicBlock, allocator: std.mem.Allocator, phi: PhiNode) !void {
+        if (self.getPhi(phi.original_reg)) |existing| {
+            existing.* = phi;
+            return;
+        }
+        try self.phi_functions.append(allocator, phi);
+    }
 };
 
 pub const CFG = struct {
@@ -38,7 +66,22 @@ pub const CFG = struct {
             block.successors.deinit(self.allocator);
             block.predecessors.deinit(self.allocator);
             block.dominance_frontier.deinit(self.allocator);
+            
+            for (block.phi_functions.items) |phi| {
+                self.allocator.free(phi.incoming);
+            }
             block.phi_functions.deinit(self.allocator);
+            
+            block.dom_children.deinit(self.allocator);
+            for (block.instructions.items) |inst| {
+                switch (inst) {
+                    .invoke => |v| self.allocator.free(v.args),
+                    .phi => |v| self.allocator.free(v.args),
+                    .switch_op => |v| self.allocator.free(v.target_block_ids),
+                    else => {},
+                }
+            }
+            block.instructions.deinit(self.allocator);
         }
         self.blocks.deinit(self.allocator);
     }
@@ -151,6 +194,15 @@ pub const CFG = struct {
             self.blocks.items[i].idom = idom_candidate;
         }
     }
+    pub fn computeDominatorChildren(self: *CFG) !void {
+        for (self.blocks.items) |*b| b.dom_children.clearRetainingCapacity();
+
+        for (self.blocks.items) |b| {
+            if (b.idom) |parent_id| {
+                try self.blocks.items[parent_id].dom_children.append(self.allocator, b.id);
+            }
+        }
+    }
     /// Step 3: Calculate the Dominance Frontier for every block.
     /// A block's dominance frontier is the set of nodes where its dominance ends.
     pub fn computeDominanceFrontiers(self: *CFG) !void {
@@ -233,7 +285,17 @@ pub const CFG = struct {
                     if (!has_phi.isSet(d_id)) {
                         // Insert the Phi function!
                         var d_block = &self.blocks.items[d_id];
-                        try d_block.phi_functions.put(self.allocator, reg, .{ .original_reg = reg });
+                        const incoming = try self.allocator.alloc(ir.PhiArg, d_block.predecessors.items.len);
+                        for (incoming, 0..) |*arg, i| {
+                            arg.* = .{
+                                .pred_block_id = d_block.predecessors.items[i],
+                                .val = .{ .reg = reg, .version = 0 },
+                            };
+                        }
+                        try d_block.putPhi(self.allocator, .{
+                            .original_reg = reg,
+                            .incoming = incoming,
+                        });
                         has_phi.set(d_id);
 
                         // A phi function is a NEW definition.
@@ -245,6 +307,274 @@ pub const CFG = struct {
                     }
                 }
             }
+        }
+    }
+    /// Phase 2 of SSA: Rename variables top-down across the dominator tree.
+    pub fn renameVariables(self: *CFG, total_virtual_registers: usize) !void {
+        // Track the highest version number issued for each original register
+        const counters = try self.allocator.alloc(u32, total_virtual_registers);
+        @memset(counters, 0);
+        defer self.allocator.free(counters);
+
+        // Track the "current active" version of each original register
+        var stacks = try self.allocator.alloc(std.ArrayList(u32), total_virtual_registers);
+        for (0..total_virtual_registers) |i| {
+            stacks[i] = .empty;
+            // Push version 0 as the uninitialized default
+            try stacks[i].append(self.allocator, 0);
+        }
+        defer {
+            for (stacks) |*s| s.deinit(self.allocator);
+            self.allocator.free(stacks);
+        }
+
+        // Kick off the recursive renaming starting at the entry block
+        try self.renameBlock(self.entry_block_id, counters, stacks);
+
+        // Prepend phi IR instructions
+        for (self.blocks.items) |*block| {
+            const num_phis = block.phi_functions.items.len;
+            if (num_phis == 0) continue;
+
+            var new_insts = std.ArrayList(ir.IRInst).empty;
+            errdefer new_insts.deinit(self.allocator);
+            try new_insts.ensureTotalCapacity(self.allocator, num_phis + block.instructions.items.len);
+
+            for (block.phi_functions.items) |phi_node| {
+                const reg = phi_node.original_reg;
+
+                const args = try self.allocator.alloc(ir.PhiArg, phi_node.incoming.len);
+                @memcpy(args, phi_node.incoming);
+
+                try new_insts.append(self.allocator, .{
+                    .phi = .{
+                        .dest = .{ .reg = reg, .version = phi_node.ssa_version.? },
+                        .args = args,
+                    },
+                });
+            }
+
+            try new_insts.appendSlice(self.allocator, block.instructions.items);
+            block.instructions.deinit(self.allocator);
+            block.instructions = new_insts;
+        }
+    }
+
+    fn renameBlock(self: *CFG, block_id: usize, counters: []u32, stacks: []std.ArrayList(u32)) !void {
+        const block = &self.blocks.items[block_id];
+
+        // 1. Rename Phi function definitions first
+        for (block.phi_functions.items) |*phi_node| {
+            const reg = phi_node.original_reg;
+
+            // Generate a fresh version for this register
+            counters[@as(usize, reg)] += 1;
+            const new_version = counters[@as(usize, reg)];
+
+            // Push it to the stack to make it the active version
+            try stacks[@as(usize, reg)].append(self.allocator, new_version);
+
+            // Record it in the phi node (e.g., v0_3 = Phi(...))
+            phi_node.ssa_version = new_version;
+        }
+
+        // 2. Iterate through normal instructions in this block
+        var defs = std.ArrayList(u16).empty;
+        defer defs.deinit(self.allocator);
+
+        const renameUse = struct {
+            fn f(st: []const std.ArrayList(u32), variable: *ir.SSAVar) void {
+                variable.version = st[@as(usize, variable.reg)].items[st[@as(usize, variable.reg)].items.len - 1];
+            }
+        }.f;
+
+        const renameDef = struct {
+            fn f(alloc: std.mem.Allocator, cnt: []u32, st: []std.ArrayList(u32), variable: *ir.SSAVar, dl: *std.ArrayList(u16)) !void {
+                const reg = variable.reg;
+                cnt[@as(usize, reg)] += 1;
+                const new_version = cnt[@as(usize, reg)];
+                try st[@as(usize, reg)].append(alloc, new_version);
+                variable.version = new_version;
+                try dl.append(alloc, reg);
+            }
+        }.f;
+
+        for (block.instructions.items) |*inst| {
+            switch (inst.*) {
+                .phi => unreachable,
+
+                // Moves
+                .move => |*v| {
+                    renameUse(stacks, &v.src);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Constants
+                .const_int => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+                .const_wide => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+                .const_string => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+                .const_class => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Binary Math
+                .add_int,
+                .sub_int,
+                .mul_int,
+                .div_int,
+                .rem_int,
+                .and_int,
+                .or_int,
+                .xor_int,
+                .shl_int,
+                .shr_int,
+                .ushr_int,
+                .add_float,
+                .sub_float,
+                .mul_float,
+                .div_float,
+                .add_wide,
+                .sub_wide,
+                .mul_wide,
+                .div_wide,
+                => |*v| {
+                    renameUse(stacks, &v.left);
+                    renameUse(stacks, &v.right);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Literal Math
+                .add_lit,
+                .sub_lit,
+                .mul_lit,
+                .div_lit,
+                .rem_lit,
+                .and_lit,
+                .or_lit,
+                .xor_lit,
+                .shl_lit,
+                .shr_lit,
+                .ushr_lit,
+                => |*v| {
+                    renameUse(stacks, &v.src);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Object & Array Allocation
+                .new_instance => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+                .new_array => |*v| {
+                    renameUse(stacks, &v.size);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Memory Access
+                .iget => |*v| {
+                    renameUse(stacks, &v.obj);
+                    try renameDef(self.allocator, counters, stacks, &v.dest_or_src, &defs);
+                },
+                .iput => |*v| {
+                    renameUse(stacks, &v.obj);
+                    renameUse(stacks, &v.dest_or_src);
+                },
+                .sget => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest_or_src, &defs);
+                },
+                .sput => |*v| {
+                    renameUse(stacks, &v.dest_or_src);
+                },
+                .aget => |*v| {
+                    renameUse(stacks, &v.array);
+                    renameUse(stacks, &v.index);
+                    try renameDef(self.allocator, counters, stacks, &v.dest_or_src, &defs);
+                },
+                .aput => |*v| {
+                    renameUse(stacks, &v.array);
+                    renameUse(stacks, &v.index);
+                    renameUse(stacks, &v.dest_or_src);
+                },
+
+                // Control Flow
+                .goto => {},
+                .if_eq,
+                .if_ne,
+                .if_lt,
+                .if_ge,
+                .if_gt,
+                .if_le,
+                => |*v| {
+                    renameUse(stacks, &v.left);
+                    renameUse(stacks, &v.right);
+                },
+                .if_eqz,
+                .if_nez,
+                .if_ltz,
+                .if_gez,
+                .if_gtz,
+                .if_lez,
+                => |*v| {
+                    renameUse(stacks, &v.src);
+                },
+                .switch_op => |*v| {
+                    renameUse(stacks, &v.src);
+                },
+
+                // Functions
+                .invoke => |*v| {
+                    for (v.args) |*arg| {
+                        renameUse(stacks, arg);
+                    }
+                    if (v.dest) |*d| {
+                        try renameDef(self.allocator, counters, stacks, d, &defs);
+                    }
+                },
+                .ret => |*v| {
+                    if (v.src) |*s| {
+                        renameUse(stacks, s);
+                    }
+                },
+                .throw_op => |*v| {
+                    renameUse(stacks, &v.src);
+                },
+            }
+        }
+
+        // 3. Fill in Phi function arguments for our Successors
+        for (block.successors.items) |succ_id| {
+            const succ_block = &self.blocks.items[succ_id];
+            for (succ_block.phi_functions.items) |*phi_node| {
+                const reg = phi_node.original_reg;
+                const current_active_version = stacks[@as(usize, reg)].items[stacks[@as(usize, reg)].items.len - 1];
+
+                for (phi_node.incoming) |*arg| {
+                    if (arg.pred_block_id == block_id) {
+                        arg.val.version = current_active_version;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 4. Recurse down the dominator tree
+        for (block.dom_children.items) |child_id| {
+            try self.renameBlock(child_id, counters, stacks);
+        }
+
+        // 5. Cleanup (Pop the stacks)
+        for (block.phi_functions.items) |phi_node| {
+            _ = stacks[@as(usize, phi_node.original_reg)].pop();
+        }
+
+        while (defs.items.len > 0) {
+            const reg = defs.pop().?;
+            _ = stacks[@as(usize, reg)].pop();
         }
     }
 };
@@ -334,8 +664,10 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
             .successors = std.ArrayList(usize).empty,
             .predecessors = std.ArrayList(usize).empty,
             .idom = null,
-            .dominance_frontier = std.ArrayListUnmanaged(usize).empty,
+            .dominance_frontier = std.ArrayList(usize).empty,
             .phi_functions = .empty,
+            .dom_children = std.ArrayList(usize).empty,
+            .instructions = std.ArrayList(ir.IRInst).empty,
         });
     }
 
@@ -751,9 +1083,9 @@ test "insertPhiFunctions: diamond CFG" {
     const a = std.testing.allocator;
     const insns = [_]Instruction{
         .{ .if_eqz = .{ .src = 0, .offset = 2 } }, // idx 0
-        .{ .goto_ = .{ .offset = 2 } },              // idx 1
-        .{ .nop = {} },                               // idx 2
-        .return_void,                                 // idx 3
+        .{ .goto_ = .{ .offset = 2 } }, // idx 1
+        .{ .nop = {} }, // idx 2
+        .return_void, // idx 3
     };
     var cfg = try buildCFG(a, &insns);
     defer cfg.deinit();
@@ -779,12 +1111,11 @@ test "insertPhiFunctions: diamond CFG" {
     try cfg.insertPhiFunctions(def_map);
 
     // Block 3 is in DF(1), so it should have a phi function for v0
-    const phi = cfg.blocks.items[3].phi_functions.get(0);
+    const phi = cfg.blocks.items[3].getPhiConst(0);
     try std.testing.expect(phi != null);
     try std.testing.expectEqual(@as(u16, 0), phi.?.original_reg);
 
     // Block 1 and 2 should not have a phi function for v0
-    try std.testing.expect(cfg.blocks.items[1].phi_functions.get(0) == null);
-    try std.testing.expect(cfg.blocks.items[2].phi_functions.get(0) == null);
+    try std.testing.expect(cfg.blocks.items[1].getPhiConst(0) == null);
+    try std.testing.expect(cfg.blocks.items[2].getPhiConst(0) == null);
 }
-

@@ -1,0 +1,299 @@
+const std = @import("std");
+
+// --- Variables ---
+
+/// Represents a variable in Static Single Assignment (SSA) form.
+/// Initially, `version` will be 0. The Renaming phase will overwrite it.
+pub const SSAVar = struct {
+    reg: u16,
+    version: u32,
+
+    /// Custom formatter to print variables like "v0_1"
+    pub fn format(
+        self: SSAVar,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("v{d}_{d}", .{ self.reg, self.version });
+    }
+};
+
+/// An argument to a Phi function, linking a predecessor block to the
+/// specific version of the variable that flows from it.
+pub const PhiArg = struct {
+    pred_block_id: usize,
+    val: SSAVar,
+};
+
+// --- Operation Payloads ---
+
+pub const BinOp = struct { dest: SSAVar, left: SSAVar, right: SSAVar };
+pub const UnOp = struct { dest: SSAVar, src: SSAVar };
+pub const BinOpLit = struct { dest: SSAVar, src: SSAVar, lit: i32 };
+
+pub const CondBranch = struct {
+    left: SSAVar,
+    right: SSAVar,
+    /// The block to jump to if the condition is true.
+    /// (If false, it falls through to the next block sequentially).
+    target_block_id: usize,
+};
+
+pub const CondBranchZ = struct { src: SSAVar, target_block_id: usize };
+
+pub const FieldAccess = struct { dest_or_src: SSAVar, obj: SSAVar, field_idx: u32 };
+pub const StaticFieldAccess = struct { dest_or_src: SSAVar, field_idx: u32 };
+pub const ArrayAccess = struct { dest_or_src: SSAVar, array: SSAVar, index: SSAVar };
+
+// --- The IR Instruction Set ---
+
+/// A unified, SSA-ready instruction set.
+/// Slices (like `[]PhiArg` or `[]SSAVar`) should be allocated using an ArenaAllocator
+/// tied to the lifespan of the CFG.
+pub const IRInst = union(enum) {
+    // SSA specific
+    phi: struct { dest: SSAVar, args: []PhiArg },
+
+    // Base
+    move: UnOp,
+
+    // Constants
+    const_int: struct { dest: SSAVar, val: i32 },
+    const_wide: struct { dest: SSAVar, val: i64 },
+    const_string: struct { dest: SSAVar, str_idx: u32 },
+    const_class: struct { dest: SSAVar, type_idx: u32 },
+
+    // Integer Math
+    add_int: BinOp,
+    sub_int: BinOp,
+    mul_int: BinOp,
+    div_int: BinOp,
+    rem_int: BinOp,
+    and_int: BinOp,
+    or_int: BinOp,
+    xor_int: BinOp,
+    shl_int: BinOp,
+    shr_int: BinOp,
+    ushr_int: BinOp,
+
+    // Integer Math (Literal)
+    add_lit: BinOpLit,
+    sub_lit: BinOpLit,
+    mul_lit: BinOpLit,
+    div_lit: BinOpLit,
+    rem_lit: BinOpLit,
+    and_lit: BinOpLit,
+    or_lit: BinOpLit,
+    xor_lit: BinOpLit,
+    shl_lit: BinOpLit,
+    shr_lit: BinOpLit,
+    ushr_lit: BinOpLit,
+
+    // Floating Point & Wide Math
+    add_float: BinOp,
+    sub_float: BinOp,
+    mul_float: BinOp,
+    div_float: BinOp,
+    add_wide: BinOp,
+    sub_wide: BinOp,
+    mul_wide: BinOp,
+    div_wide: BinOp,
+
+    // Object & Array Allocation
+    new_instance: struct { dest: SSAVar, type_idx: u32 },
+    new_array: struct { dest: SSAVar, size: SSAVar, type_idx: u32 },
+
+    // Memory Access
+    iget: FieldAccess,
+    iput: FieldAccess,
+    sget: StaticFieldAccess,
+    sput: StaticFieldAccess,
+    aget: ArrayAccess,
+    aput: ArrayAccess,
+
+    // Control Flow
+    goto: struct { target_block_id: usize },
+    if_eq: CondBranch,
+    if_ne: CondBranch,
+    if_lt: CondBranch,
+    if_ge: CondBranch,
+    if_gt: CondBranch,
+    if_le: CondBranch,
+    if_eqz: CondBranchZ,
+    if_nez: CondBranchZ,
+    if_ltz: CondBranchZ,
+    if_gez: CondBranchZ,
+    if_gtz: CondBranchZ,
+    if_lez: CondBranchZ,
+
+    // Switches
+    switch_op: struct { src: SSAVar, keys: []const i32, target_block_ids: []const usize },
+
+    // Function Calls & Returns
+    invoke: struct {
+        dest: ?SSAVar, // null if return type is void or result is unused
+        method_idx: u32,
+        is_static: bool,
+        args: []SSAVar,
+    },
+    ret: struct { src: ?SSAVar },
+    throw_op: struct { src: SSAVar },
+
+    // --- Pretty Printing ---
+
+    /// Dumps the IR instruction to a writer in a human-readable format.
+    pub fn format(
+        self: IRInst,
+        writer: *std.Io.Writer,
+    ) !void {
+        switch (self) {
+            .phi => |v| {
+                try writer.print("{f} = phi(", .{v.dest});
+                for (v.args, 0..) |arg, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.print("[bb{d}: {f}]", .{ arg.pred_block_id, arg.val });
+                }
+                try writer.writeAll(")");
+            },
+            .move => |v| try writer.print("{f} = move {f}", .{ v.dest, v.src }),
+
+            .const_int => |v| try writer.print("{f} = const {d}", .{ v.dest, v.val }),
+            .const_wide => |v| try writer.print("{f} = const-wide {d}", .{ v.dest, v.val }),
+            .const_string => |v| try writer.print("{f} = const-string @{d}", .{ v.dest, v.str_idx }),
+            .const_class => |v| try writer.print("{f} = const-class @{d}", .{ v.dest, v.type_idx }),
+
+            .add_int => |v| try writer.print("{f} = add {f}, {f}", .{ v.dest, v.left, v.right }),
+            .sub_int => |v| try writer.print("{f} = sub {f}, {f}", .{ v.dest, v.left, v.right }),
+            .mul_int => |v| try writer.print("{f} = mul {f}, {f}", .{ v.dest, v.left, v.right }),
+            .div_int => |v| try writer.print("{f} = div {f}, {f}", .{ v.dest, v.left, v.right }),
+            .rem_int => |v| try writer.print("{f} = rem {f}, {f}", .{ v.dest, v.left, v.right }),
+            .and_int => |v| try writer.print("{f} = and {f}, {f}", .{ v.dest, v.left, v.right }),
+            .or_int => |v| try writer.print("{f} = or {f}, {f}", .{ v.dest, v.left, v.right }),
+            .xor_int => |v| try writer.print("{f} = xor {f}, {f}", .{ v.dest, v.left, v.right }),
+            .shl_int => |v| try writer.print("{f} = shl {f}, {f}", .{ v.dest, v.left, v.right }),
+            .shr_int => |v| try writer.print("{f} = shr {f}, {f}", .{ v.dest, v.left, v.right }),
+            .ushr_int => |v| try writer.print("{f} = ushr {f}, {f}", .{ v.dest, v.left, v.right }),
+
+            .add_lit => |v| try writer.print("{f} = add {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .sub_lit => |v| try writer.print("{f} = sub {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .mul_lit => |v| try writer.print("{f} = mul {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .div_lit => |v| try writer.print("{f} = div {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .rem_lit => |v| try writer.print("{f} = rem {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .and_lit => |v| try writer.print("{f} = and {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .or_lit => |v| try writer.print("{f} = or {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .xor_lit => |v| try writer.print("{f} = xor {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .shl_lit => |v| try writer.print("{f} = shl {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .shr_lit => |v| try writer.print("{f} = shr {f}, #{d}", .{ v.dest, v.src, v.lit }),
+            .ushr_lit => |v| try writer.print("{f} = ushr {f}, #{d}", .{ v.dest, v.src, v.lit }),
+
+            .add_float => |v| try writer.print("{f} = add {f}, {f}", .{ v.dest, v.left, v.right }),
+            .sub_float => |v| try writer.print("{f} = sub {f}, {f}", .{ v.dest, v.left, v.right }),
+            .mul_float => |v| try writer.print("{f} = mul {f}, {f}", .{ v.dest, v.left, v.right }),
+            .div_float => |v| try writer.print("{f} = div {f}, {f}", .{ v.dest, v.left, v.right }),
+            .add_wide => |v| try writer.print("{f} = add-wide {f}, {f}", .{ v.dest, v.left, v.right }),
+            .sub_wide => |v| try writer.print("{f} = sub-wide {f}, {f}", .{ v.dest, v.left, v.right }),
+            .mul_wide => |v| try writer.print("{f} = mul-wide {f}, {f}", .{ v.dest, v.left, v.right }),
+            .div_wide => |v| try writer.print("{f} = div-wide {f}, {f}", .{ v.dest, v.left, v.right }),
+
+            .new_instance => |v| try writer.print("{f} = new-instance @{d}", .{ v.dest, v.type_idx }),
+            .new_array => |v| try writer.print("{f} = new-array {f}, @{d}", .{ v.dest, v.size, v.type_idx }),
+
+            .iget => |v| try writer.print("{f} = iget {f}.@{d}", .{ v.dest_or_src, v.obj, v.field_idx }),
+            .iput => |v| try writer.print("{f}.@{d} = iput {f}", .{ v.obj, v.field_idx, v.dest_or_src }),
+            .sget => |v| try writer.print("{f} = sget @{d}", .{ v.dest_or_src, v.field_idx }),
+            .sput => |v| try writer.print("@{d} = sput {f}", .{ v.field_idx, v.dest_or_src }),
+            .aget => |v| try writer.print("{f} = aget {f}[{f}]", .{ v.dest_or_src, v.array, v.index }),
+            .aput => |v| try writer.print("{f}[{f}] = aput {f}", .{ v.array, v.index, v.dest_or_src }),
+
+            .goto => |v| try writer.print("goto bb{d}", .{v.target_block_id}),
+
+            .if_eq => |v| try writer.print("if {f} == {f} goto bb{d}", .{ v.left, v.right, v.target_block_id }),
+            .if_ne => |v| try writer.print("if {f} != {f} goto bb{d}", .{ v.left, v.right, v.target_block_id }),
+            .if_ge => |v| try writer.print("if {f} >= {f} goto bb{d}", .{ v.left, v.right, v.target_block_id }),
+            .if_gt => |v| try writer.print("if {f} > {f} goto bb{d}", .{ v.left, v.right, v.target_block_id }),
+            .if_lt => |v| try writer.print("if {f} < {f} goto bb{d}", .{ v.left, v.right, v.target_block_id }),
+            .if_le => |v| try writer.print("if {f} <= {f} goto bb{d}", .{ v.left, v.right, v.target_block_id }),
+            .if_eqz => |v| try writer.print("if {f} == 0 goto bb{d}", .{ v.src, v.target_block_id }),
+            .if_nez => |v| try writer.print("if {f} != 0 goto bb{d}", .{ v.src, v.target_block_id }),
+            .if_ltz => |v| try writer.print("if {f} < 0 goto bb{d}", .{ v.src, v.target_block_id }),
+            .if_gez => |v| try writer.print("if {f} >= 0 goto bb{d}", .{ v.src, v.target_block_id }),
+            .if_gtz => |v| try writer.print("if {f} > 0 goto bb{d}", .{ v.src, v.target_block_id }),
+            .if_lez => |v| try writer.print("if {f} <= 0 goto bb{d}", .{ v.src, v.target_block_id }),
+
+            .switch_op => |v| {
+                try writer.print("switch {f} (", .{v.src});
+                for (v.keys, 0..) |key, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.print("{d} -> bb{d}", .{ key, v.target_block_ids[i] });
+                }
+                try writer.writeAll(")");
+            },
+
+            .invoke => |v| {
+                if (v.dest) |d| {
+                    try writer.print("{f} = ", .{d});
+                }
+                const call_type = if (v.is_static) "invoke-static" else "invoke-virtual";
+                try writer.print("{s} @{d}(", .{ call_type, v.method_idx });
+                for (v.args, 0..) |arg, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.print("{f}", .{arg});
+                }
+                try writer.writeAll(")");
+            },
+
+            .ret => |v| {
+                if (v.src) |s| {
+                    try writer.print("ret {f}", .{s});
+                } else {
+                    try writer.writeAll("ret void");
+                }
+            },
+            .throw_op => |v| try writer.print("throw {f}", .{v.src}),
+        }
+    }
+};
+
+test "ir formatting: const, binop, and move" {
+    var buf: [128]u8 = undefined;
+
+    // Test const_int
+    const inst_const = IRInst{ .const_int = .{ .dest = .{ .reg = 0, .version = 1 }, .val = 42 } };
+    const s1 = try std.fmt.bufPrint(&buf, "{f}", .{inst_const});
+    try std.testing.expectEqualStrings("v0_1 = const 42", s1);
+
+    // Test add_int
+    const inst_add = IRInst{ .add_int = .{
+        .dest = .{ .reg = 2, .version = 0 },
+        .left = .{ .reg = 0, .version = 1 },
+        .right = .{ .reg = 1, .version = 2 },
+    } };
+    const s2 = try std.fmt.bufPrint(&buf, "{f}", .{inst_add});
+    try std.testing.expectEqualStrings("v2_0 = add v0_1, v1_2", s2);
+
+    // Test move
+    const inst_move = IRInst{ .move = .{ .dest = .{ .reg = 3, .version = 4 }, .src = .{ .reg = 2, .version = 0 } } };
+    const s3 = try std.fmt.bufPrint(&buf, "{f}", .{inst_move});
+    try std.testing.expectEqualStrings("v3_4 = move v2_0", s3);
+}
+
+test "ir formatting: phi and ret" {
+    var buf: [256]u8 = undefined;
+    const a = std.testing.allocator;
+
+    var args = try a.alloc(PhiArg, 2);
+    defer a.free(args);
+    args[0] = .{ .pred_block_id = 0, .val = .{ .reg = 1, .version = 1 } };
+    args[1] = .{ .pred_block_id = 1, .val = .{ .reg = 1, .version = 2 } };
+
+    const inst_phi = IRInst{ .phi = .{ .dest = .{ .reg = 1, .version = 3 }, .args = args } };
+    const s1 = try std.fmt.bufPrint(&buf, "{f}", .{inst_phi});
+    try std.testing.expectEqualStrings("v1_3 = phi([bb0: v1_1], [bb1: v1_2])", s1);
+
+    const inst_ret = IRInst{ .ret = .{ .src = .{ .reg = 1, .version = 3 } } };
+    const s2 = try std.fmt.bufPrint(&buf, "{f}", .{inst_ret});
+    try std.testing.expectEqualStrings("ret v1_3", s2);
+
+    const inst_ret_void = IRInst{ .ret = .{ .src = null } };
+    const s3 = try std.fmt.bufPrint(&buf, "{f}", .{inst_ret_void});
+    try std.testing.expectEqualStrings("ret void", s3);
+}

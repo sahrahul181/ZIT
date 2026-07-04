@@ -70,3 +70,98 @@ test "every successor id is a valid block index" {
         }
     }
 }
+
+test "full JIT SSA compilation pipeline on Main.fib" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dex = try parseFixture(arena);
+    const method = dex.findMethod("Main", "fib") orelse return error.MethodNotFound;
+
+    const insns = try dex.decodeMethod(arena, method);
+    try std.testing.expect(insns.len > 0);
+
+    var cfg = try cfgmod.buildCFG(std.testing.allocator, insns);
+    defer cfg.deinit();
+
+    // 4. Compute predecessors, dominators, and frontiers
+    try cfg.computePredecessors();
+    try cfg.computeDominators();
+    try cfg.computeDominatorChildren();
+    try cfg.computeDominanceFrontiers();
+
+    // 5. Translate to IR
+    const translate = @import("translate");
+    try translate.translateCFG(std.testing.allocator, &cfg, insns);
+
+    // 6. Map Definitions (Find which blocks define which registers)
+    var def_map = std.AutoHashMap(u16, std.ArrayList(usize)).init(std.testing.allocator);
+    defer {
+        var it = def_map.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(std.testing.allocator);
+        def_map.deinit();
+    }
+
+    for (cfg.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const dest_reg: ?u16 = switch (inst) {
+                .phi => |v| v.dest.reg,
+                .move => |v| v.dest.reg,
+                .const_int => |v| v.dest.reg,
+                .const_wide => |v| v.dest.reg,
+                .const_string => |v| v.dest.reg,
+                .const_class => |v| v.dest.reg,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int,
+                .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
+                .add_float, .sub_float, .mul_float, .div_float,
+                .add_wide, .sub_wide, .mul_wide, .div_wide,
+                => |v| v.dest.reg,
+                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
+                .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                => |v| v.dest.reg,
+                .new_instance => |v| v.dest.reg,
+                .new_array => |v| v.dest.reg,
+                .iget => |v| v.dest_or_src.reg,
+                .sget => |v| v.dest_or_src.reg,
+                .aget => |v| v.dest_or_src.reg,
+                .invoke => |v| if (v.dest) |d| d.reg else null,
+                else => null,
+            };
+
+            if (dest_reg) |reg| {
+                var res = try def_map.getOrPut(reg);
+                if (!res.found_existing) {
+                    res.value_ptr.* = .empty;
+                }
+                var contains = false;
+                for (res.value_ptr.items) |b_id| {
+                    if (b_id == block.id) {
+                        contains = true;
+                        break;
+                    }
+                }
+                if (!contains) {
+                    try res.value_ptr.append(std.testing.allocator, block.id);
+                }
+            }
+        }
+    }
+
+    // 7. Insert Phi Nodes using Dominance Frontiers
+    try cfg.insertPhiFunctions(def_map);
+
+    // 8. Rename Variables
+    try cfg.renameVariables(method.registers_size);
+
+    // Verify SSA renaming and phi nodes
+    var has_phi = false;
+    for (cfg.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst == .phi) {
+                has_phi = true;
+            }
+        }
+    }
+    try std.testing.expect(has_phi);
+}
