@@ -103,3 +103,66 @@ test "exec_mem: end-to-end JIT execution on physical CPU" {
     const result = func(25); // 25 + 100 = 125
     try std.testing.expectEqual(@as(i64, 125), result);
 }
+
+test "JIT: pass 5 parameters (stack parameter support)" {
+    const a = std.testing.allocator;
+
+    var test_cfg = cfg.CFG{
+        .blocks = std.ArrayList(cfg.BasicBlock).empty,
+        .allocator = a,
+    };
+    defer {
+        for (test_cfg.blocks.items) |*b| b.instructions.deinit(a);
+        test_cfg.blocks.deinit(a);
+    }
+
+    var block = cfg.BasicBlock{
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfg.PhiNode).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .idom = null,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0_0 = ir.SSAVar{ .reg = 4, .version = 0 };
+    const v1_0 = ir.SSAVar{ .reg = 5, .version = 0 };
+    const v2_0 = ir.SSAVar{ .reg = 6, .version = 0 };
+    const v3_0 = ir.SSAVar{ .reg = 7, .version = 0 };
+    const v4_0 = ir.SSAVar{ .reg = 8, .version = 0 };
+
+    const t0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const t1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const t2 = ir.SSAVar{ .reg = 2, .version = 1 };
+    const t3 = ir.SSAVar{ .reg = 3, .version = 1 };
+
+    try block.instructions.append(a, .{ .add_int = .{ .dest = t0, .left = v0_0, .right = v1_0 } });
+    try block.instructions.append(a, .{ .add_int = .{ .dest = t1, .left = t0, .right = v2_0 } });
+    try block.instructions.append(a, .{ .add_int = .{ .dest = t2, .left = t1, .right = v3_0 } });
+    try block.instructions.append(a, .{ .add_int = .{ .dest = t3, .left = t2, .right = v4_0 } });
+    try block.instructions.append(a, .{ .ret = .{ .src = t3 } });
+
+    try test_cfg.blocks.append(a, block);
+
+    var prog = try lower.lowerCFG(a, &test_cfg);
+    defer prog.deinit();
+
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 9, 5);
+    const code_bytes = try emitter.emitProgram(a, &prog);
+    defer a.free(code_bytes);
+
+    const exec_page = try allocateExecMemory(code_bytes.len);
+    defer freeExecMemory(exec_page);
+
+    @memcpy(exec_page, code_bytes);
+
+    const JITSum5Fn = *const fn (i64, i64, i64, i64, i64) callconv(.c) i64;
+    const func = @as(JITSum5Fn, @ptrCast(exec_page.ptr));
+
+    const result = func(10, 20, 30, 40, 50); // 10+20+30+40+50 = 150
+    try std.testing.expectEqual(@as(i64, 150), result);
+}

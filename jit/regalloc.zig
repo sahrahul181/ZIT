@@ -44,23 +44,37 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
         const first_block = &program.blocks.items[0];
         const arg_regs = [_]x86.PhysicalReg{ .rcx, .rdx, .r8, .r9 };
         const float_arg_regs = [_]x86.PhysicalReg{ .xmm0, .xmm1, .xmm2, .xmm3 };
-        var i: u16 = 0;
-        while (i < ins_size and i < 4) : (i += 1) {
-            const param_reg = registers_size - ins_size + i;
+        
+        var i: i32 = @intCast(ins_size);
+        while (i > 0) {
+            i -= 1;
+            const param_reg = registers_size - ins_size + @as(u16, @intCast(i));
             const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
+            const is_float = if (is_float_param) |list| (i < list.len and list[@intCast(i)]) else false;
             
-            const is_float = if (is_float_param) |list| (i < list.len and list[i]) else false;
-            const src_reg = if (is_float) float_arg_regs[i] else arg_regs[i];
-            
-            if (is_float) {
-                try first_block.instructions.insert(allocator, i, .{ .movss = .{
-                    .dest = .{ .vreg = v },
-                    .src = .{ .reg = src_reg },
-                } });
+            if (i < 4) {
+                const src_reg = if (is_float) float_arg_regs[@intCast(i)] else arg_regs[@intCast(i)];
+                if (is_float) {
+                    try first_block.instructions.insert(allocator, 0, .{ .movss = .{
+                        .dest = .{ .vreg = v },
+                        .src = .{ .reg = src_reg },
+                    } });
+                } else {
+                    try first_block.instructions.insert(allocator, 0, .{ .mov = .{
+                        .dest = .{ .vreg = v },
+                        .src = .{ .reg = src_reg },
+                    } });
+                }
             } else {
-                try first_block.instructions.insert(allocator, i, .{ .mov = .{
+                const offset = 16 + 8 * @as(i32, @intCast(i));
+                const tmp_v = ir.SSAVar{ .reg = param_reg, .version = 0x4000 };
+                try first_block.instructions.insert(allocator, 0, .{ .mov = .{
                     .dest = .{ .vreg = v },
-                    .src = .{ .reg = src_reg },
+                    .src = .{ .vreg = tmp_v },
+                } });
+                try first_block.instructions.insert(allocator, 0, .{ .mov = .{
+                    .dest = .{ .vreg = tmp_v },
+                    .src = .{ .stack = -offset },
                 } });
             }
         }
@@ -592,10 +606,14 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
     }
     std.mem.sort(LiveInterval, intervals.items, {}, compareIntervals);
 
+    for (intervals.items) |interval| {
+        std.debug.print("Interval: v{d}_{d}, start: {d}, end: {d}, class: {any}\n", .{interval.vreg.reg, interval.vreg.version, interval.start, interval.end, interval.class});
+    }
+
     // List of allocatable GPR registers.
     // Excluding RAX and RDX to prevent collision/clobbering by IDIV/IREM easily.
     const gpr_registers = [_]x86.PhysicalReg{
-        .rbx, .rcx, .rsi, .rdi, .r8, .r9, .r10, .r11, .r12, .r13, .r14, .r15
+        .rbx, .rsi, .rdi, .r10, .r11, .r12, .r13, .r14, .r15, .rcx, .r8, .r9
     };
 
     // List of SSE XMM registers.
@@ -703,7 +721,10 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
             }
         }
 
-        try allocation_results.put(interval.vreg, interval.*);
+    }
+
+    for (intervals.items) |interval| {
+        try allocation_results.put(interval.vreg, interval);
     }
 
     // Now rewrite all instructions in the program using the allocation results.

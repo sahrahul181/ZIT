@@ -75,7 +75,8 @@ fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachinePro
                     if (op == .reg) {
                         const r = op.reg;
                         const is_callee = switch (r) {
-                            .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15 => true,
+                            .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15,
+                            .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 => true,
                             else => false,
                         };
                         if (is_callee) {
@@ -191,6 +192,84 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
         }
     }.run;
 
+    const emitSubRsp = struct {
+        fn run(c: *CodeWriter, val: i32) !void {
+            if (val == 0) return;
+            try c.append(0x48);
+            if (val >= -128 and val <= 127) {
+                try c.append(0x83);
+                try c.append(0xEC);
+                try c.append(@as(u8, @bitCast(@as(i8, @truncate(val)))));
+            } else {
+                try c.append(0x81);
+                try c.append(0xEC);
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(i32, &bytes, val, .little);
+                try c.appendSlice(&bytes);
+            }
+        }
+    }.run;
+
+    const emitAddRsp = struct {
+        fn run(c: *CodeWriter, val: i32) !void {
+            if (val == 0) return;
+            try c.append(0x48);
+            if (val >= -128 and val <= 127) {
+                try c.append(0x83);
+                try c.append(0xC4);
+                try c.append(@as(u8, @bitCast(@as(i8, @truncate(val)))));
+            } else {
+                try c.append(0x81);
+                try c.append(0xC4);
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(i32, &bytes, val, .little);
+                try c.appendSlice(&bytes);
+            }
+        }
+    }.run;
+
+    const emitSaveXmm = struct {
+        fn run(c: *CodeWriter, reg: x86.PhysicalReg, offset: i32) !void {
+            const r = regCode(reg);
+            const rex = makeRex(false, r, 4); // RSP is 4
+            if (rex != 0x40) try c.append(rex);
+            try c.append(0x0F);
+            try c.append(0x11);
+            if (offset >= -128 and offset <= 127) {
+                try c.append(makeModRM(0b01, @as(u3, @truncate(r)), 4));
+                try c.append(0x24);
+                try c.append(@as(u8, @bitCast(@as(i8, @truncate(offset)))));
+            } else {
+                try c.append(makeModRM(0b10, @as(u3, @truncate(r)), 4));
+                try c.append(0x24);
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(i32, &bytes, offset, .little);
+                try c.appendSlice(&bytes);
+            }
+        }
+    }.run;
+
+    const emitRestoreXmm = struct {
+        fn run(c: *CodeWriter, reg: x86.PhysicalReg, offset: i32) !void {
+            const r = regCode(reg);
+            const rex = makeRex(false, r, 4);
+            if (rex != 0x40) try c.append(rex);
+            try c.append(0x0F);
+            try c.append(0x10);
+            if (offset >= -128 and offset <= 127) {
+                try c.append(makeModRM(0b01, @as(u3, @truncate(r)), 4));
+                try c.append(0x24);
+                try c.append(@as(u8, @bitCast(@as(i8, @truncate(offset)))));
+            } else {
+                try c.append(makeModRM(0b10, @as(u3, @truncate(r)), 4));
+                try c.append(0x24);
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(i32, &bytes, offset, .little);
+                try c.appendSlice(&bytes);
+            }
+        }
+    }.run;
+
     var code = CodeWriter{ .buf = &raw_code, .alloc = allocator };
     code.updateItems();
 
@@ -204,9 +283,35 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
     var callee_saved = try getUsedCalleeSavedRegs(allocator, program);
     defer callee_saved.deinit(allocator);
 
-    // Emit pushes at entry point
+    var gpr_saved = std.ArrayList(x86.PhysicalReg).empty;
+    defer gpr_saved.deinit(allocator);
+    var xmm_saved = std.ArrayList(x86.PhysicalReg).empty;
+    defer xmm_saved.deinit(allocator);
+
     for (callee_saved.items) |r| {
+        if (std.mem.startsWith(u8, r.name(), "xmm")) {
+            try xmm_saved.append(allocator, r);
+        } else {
+            try gpr_saved.append(allocator, r);
+        }
+    }
+    
+    // Establish RBP frame pointer
+    try code.append(0x55); // push rbp
+    try code.appendSlice(&[_]u8{ 0x48, 0x89, 0xE5 }); // mov rbp, rsp
+
+    // Emit pushes for callee-saved GPRs
+    for (gpr_saved.items) |r| {
         try emitPush(&code, r);
+    }
+
+    // Save callee-saved XMMs to stack
+    const xmm_space = @as(i32, @intCast(xmm_saved.items.len)) * 16;
+    if (xmm_space > 0) {
+        try emitSubRsp(&code, xmm_space);
+        for (xmm_saved.items, 0..) |r, idx| {
+            try emitSaveXmm(&code, r, @as(i32, @intCast(idx)) * 16);
+        }
     }
 
     // Pass 1: Emit instructions and record label offsets and relocation sites.
@@ -675,12 +780,23 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             }
                         }
                     }
-                    // Emit pops in reverse order!
-                    var idx_saved = callee_saved.items.len;
+                    // Restore callee-saved XMMs
+                    if (xmm_space > 0) {
+                        for (xmm_saved.items, 0..) |r, idx| {
+                            try emitRestoreXmm(&code, r, @as(i32, @intCast(idx)) * 16);
+                        }
+                        try emitAddRsp(&code, xmm_space);
+                    }
+
+                    // Emit pops in reverse order for GPRs
+                    var idx_saved = gpr_saved.items.len;
                     while (idx_saved > 0) {
                         idx_saved -= 1;
-                        try emitPop(&code, callee_saved.items[idx_saved]);
+                        try emitPop(&code, gpr_saved.items[idx_saved]);
                     }
+
+                    // Restore RBP frame pointer
+                    try code.append(0x5D); // pop rbp
                     try code.append(0xC3); // RET
                 },
 
@@ -741,10 +857,13 @@ test "emitter: basic arithmetic and moves to machine bytes" {
     // ADD RAX, RBX -> 48 01 D8
     // RET          -> C3
     const expected = [_]u8{
+        0x55,
+        0x48, 0x89, 0xE5,
         0x53, // push rbx
         0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x01, 0xD8,
         0x5B, // pop rbx
+        0x5D,
         0xC3,
     };
     try std.testing.expectEqualSlices(u8, &expected, bytes);
@@ -783,10 +902,13 @@ test "emitter: callee-saved registers and register-8 immediate load encoding" {
     // pop r15        -> 41 5F
     // ret            -> C3
     const expected = [_]u8{
+        0x55,
+        0x48, 0x89, 0xE5,
         0x41, 0x57,
         0x49, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x49, 0xBF, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x41, 0x5F,
+        0x5D,
         0xC3,
     };
     try std.testing.expectEqualSlices(u8, &expected, bytes);
