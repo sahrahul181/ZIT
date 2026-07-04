@@ -193,45 +193,77 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     }
                 },
 
-                // ── Float & Wide Binary (same coalescing as int) ────────────
-                .add_float, .add_wide => |v| {
+                // ── Float & Wide Binary (Lowered to native SSE instructions) ──
+                .add_float => |v| {
                     if (eqVar(v.dest, v.left)) {
-                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .addss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     } else if (eqVar(v.dest, v.right)) {
-                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .addss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .movss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .addss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
-                .sub_float, .sub_wide => |v| {
+                .add_wide => |v| {
                     if (eqVar(v.dest, v.left)) {
-                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .addsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     } else if (eqVar(v.dest, v.right)) {
-                        try mi.append(allocator, .{ .neg = .{ .dest = opReg(v.dest) } });
-                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .addsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .addsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
-                .mul_float, .mul_wide => |v| {
+                .sub_float => |v| {
                     if (eqVar(v.dest, v.left)) {
-                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
-                    } else if (eqVar(v.dest, v.right)) {
-                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .subss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     } else {
-                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .movss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .subss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
-                .div_float, .div_wide => |v| {
-                    const rem_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
+                .sub_wide => |v| {
                     if (eqVar(v.dest, v.left)) {
-                        try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .subsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     } else {
-                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                        try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                        try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .subsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .mul_float => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .mulss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .mulss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .movss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mulss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .mul_wide => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .mulsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .mulsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mulsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .div_float => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .divss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .movss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .divss = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .div_wide => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .divsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .divsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
 
@@ -305,12 +337,24 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     try mi.append(allocator, .{ .field_store = .{ .src = opReg(v.dest_or_src), .obj = null, .field_idx = v.field_idx } });
                 },
 
-                // ── Array Element Access ──────────────────────────────────
+                // ── Array Element Access (Lowered to hardware SIB memory addressing) ──
                 .aget => |v| {
-                    try mi.append(allocator, .{ .arr_load = .{ .dest = opReg(v.dest_or_src), .array = opReg(v.array), .index = opReg(v.index) } });
+                    const mem_op = x86.Operand{ .mem = .{
+                        .base = .{ .vreg = v.array },
+                        .index = .{ .vreg = v.index },
+                        .scale = 4,
+                        .disp = 16,
+                    } };
+                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest_or_src), .src = mem_op } });
                 },
                 .aput => |v| {
-                    try mi.append(allocator, .{ .arr_store = .{ .src = opReg(v.dest_or_src), .array = opReg(v.array), .index = opReg(v.index) } });
+                    const mem_op = x86.Operand{ .mem = .{
+                        .base = .{ .vreg = v.array },
+                        .index = .{ .vreg = v.index },
+                        .scale = 4,
+                        .disp = 16,
+                    } };
+                    try mi.append(allocator, .{ .mov = .{ .dest = mem_op, .src = opReg(v.dest_or_src) } });
                 },
 
                 // ── Control Flow ──────────────────────────────────────────
@@ -643,12 +687,12 @@ test "opt: commutative coalescing - dest == right skips MOV and swaps operands" 
     defer prog.deinit();
 
     const insts = prog.blocks.items[0].instructions.items;
-    // Should emit exactly 1 × ADD (no MOV)
+    // Should emit exactly 1 × ADDSD (no MOV)
     try std.testing.expectEqual(@as(usize, 1), insts.len);
-    try std.testing.expect(insts[0] == .add);
-    // The ADD should use v1_1 as src (commutative swap)
-    try std.testing.expectEqual(v1_1.reg, insts[0].add.src.vreg.reg);
-    try std.testing.expectEqual(v1_1.version, insts[0].add.src.vreg.version);
+    try std.testing.expect(insts[0] == .addsd);
+    // The ADDSD should use v1_1 as src (commutative swap)
+    try std.testing.expectEqual(v1_1.reg, insts[0].addsd.src.vreg.reg);
+    try std.testing.expectEqual(v1_1.version, insts[0].addsd.src.vreg.version);
 }
 
 test "opt: commutative coalescing - dest == left skips MOV" {

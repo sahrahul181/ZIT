@@ -2,6 +2,8 @@ const std = @import("std");
 const ir = @import("ir");
 const x86 = @import("x86");
 
+pub const RegClass = enum { gpr, xmm };
+
 pub const LiveInterval = struct {
     vreg: ir.SSAVar,
     start: usize,
@@ -9,6 +11,7 @@ pub const LiveInterval = struct {
     reg: ?x86.PhysicalReg = null,
     stack_offset: ?i32 = null,
     hint_vreg: ?ir.SSAVar = null,
+    class: RegClass = .gpr,
 };
 
 /// Comparator to sort intervals by start position.
@@ -38,7 +41,7 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
         for (block.instructions.items) |inst| {
             // Helper closure/logic to update interval for a read or write
             const helper = struct {
-                fn process(map: *std.AutoHashMap(ir.SSAVar, LiveInterval), op: x86.Operand, idx: usize, is_def: bool) !void {
+                fn process(map: *std.AutoHashMap(ir.SSAVar, LiveInterval), op: x86.Operand, idx: usize, is_def: bool, class: RegClass) !void {
                     switch (op) {
                         .vreg => |v| {
                             if (map.getPtr(v)) |interval| {
@@ -48,14 +51,30 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                                 if (idx < interval.start) {
                                     interval.start = idx;
                                 }
+                                if (class == .xmm) {
+                                    interval.class = .xmm;
+                                }
                             } else {
                                 try map.put(v, .{
                                     .vreg = v,
                                     .start = idx,
                                     .end = idx,
+                                    .class = class,
                                 });
                             }
                             _ = is_def;
+                        },
+                        .mem => |m| {
+                            switch (m.base) {
+                                .vreg => |bv| try process(map, .{ .vreg = bv }, idx, false, .gpr),
+                                else => {},
+                            }
+                            if (m.index) |idx_op| {
+                                switch (idx_op) {
+                                    .vreg => |iv| try process(map, .{ .vreg = iv }, idx, false, .gpr),
+                                    else => {},
+                                }
+                            }
                         },
                         else => {},
                     }
@@ -65,8 +84,8 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
             // Inspect all operands for this instruction to compute intervals.
             switch (inst) {
                 .mov => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
 
                     // Set hint if both are virtual registers to allow coalescing.
                     if (v.dest == .vreg and v.src == .vreg) {
@@ -81,40 +100,96 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     }
                 },
                 .add => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .sub => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .imul => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .and_op => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .or_op => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .xor_op => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .shl => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .shr => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .ushr => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                },
+
+                // SSE Single Precision float instructions
+                .addss => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .subss => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .mulss => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .divss => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .movss => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                    if (v.dest == .vreg and v.src == .vreg) {
+                        const d = v.dest.vreg;
+                        const s = v.src.vreg;
+                        if (interval_map.getPtr(d)) |interval_d| interval_d.hint_vreg = s;
+                        if (interval_map.getPtr(s)) |interval_s| interval_s.hint_vreg = d;
+                    }
+                },
+
+                // SSE Double Precision float instructions
+                .addsd => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .subsd => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .mulsd => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .divsd => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                },
+                .movsd => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .xmm);
+                    if (v.dest == .vreg and v.src == .vreg) {
+                        const d = v.dest.vreg;
+                        const s = v.src.vreg;
+                        if (interval_map.getPtr(d)) |interval_d| interval_d.hint_vreg = s;
+                        if (interval_map.getPtr(s)) |interval_s| interval_s.hint_vreg = d;
+                    }
                 },
                 .idiv, .irem => {
                     // Split the capture to avoid union capture mismatch
@@ -133,59 +208,59 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                         .irem => |r| r.src,
                         else => unreachable,
                     };
-                    try helper.process(&interval_map, dest, global_inst_idx, true);
-                    try helper.process(&interval_map, rem, global_inst_idx, true);
-                    try helper.process(&interval_map, src, global_inst_idx, false);
+                    try helper.process(&interval_map, dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, rem, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, src, global_inst_idx, false, .gpr);
                 },
                 .neg => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                 },
                 .cmp => |v| {
-                    try helper.process(&interval_map, v.left, global_inst_idx, false);
-                    try helper.process(&interval_map, v.right, global_inst_idx, false);
+                    try helper.process(&interval_map, v.left, global_inst_idx, false, .gpr);
+                    try helper.process(&interval_map, v.right, global_inst_idx, false, .gpr);
                 },
                 .test_op => |v| {
-                    try helper.process(&interval_map, v.left, global_inst_idx, false);
-                    try helper.process(&interval_map, v.right, global_inst_idx, false);
+                    try helper.process(&interval_map, v.left, global_inst_idx, false, .gpr);
+                    try helper.process(&interval_map, v.right, global_inst_idx, false, .gpr);
                 },
                 .switch_stub => |v| {
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .call => |v| {
                     if (v.dest) |d| {
-                        try helper.process(&interval_map, d, global_inst_idx, true);
+                        try helper.process(&interval_map, d, global_inst_idx, true, .gpr); // Object references are GPR
                     }
                 },
                 .alloc_obj => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                 },
                 .alloc_arr => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.size, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.size, global_inst_idx, false, .gpr);
                 },
                 .field_load => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    if (v.obj) |o| try helper.process(&interval_map, o, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    if (v.obj) |o| try helper.process(&interval_map, o, global_inst_idx, false, .gpr);
                 },
                 .field_store => |v| {
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
-                    if (v.obj) |o| try helper.process(&interval_map, o, global_inst_idx, false);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                    if (v.obj) |o| try helper.process(&interval_map, o, global_inst_idx, false, .gpr);
                 },
                 .arr_load => |v| {
-                    try helper.process(&interval_map, v.dest, global_inst_idx, true);
-                    try helper.process(&interval_map, v.array, global_inst_idx, false);
-                    try helper.process(&interval_map, v.index, global_inst_idx, false);
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.array, global_inst_idx, false, .gpr);
+                    try helper.process(&interval_map, v.index, global_inst_idx, false, .gpr);
                 },
                 .arr_store => |v| {
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
-                    try helper.process(&interval_map, v.array, global_inst_idx, false);
-                    try helper.process(&interval_map, v.index, global_inst_idx, false);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                    try helper.process(&interval_map, v.array, global_inst_idx, false, .gpr);
+                    try helper.process(&interval_map, v.index, global_inst_idx, false, .gpr);
                 },
                 .ret => |v| {
-                    if (v) |op| try helper.process(&interval_map, op, global_inst_idx, false);
+                    if (v) |op| try helper.process(&interval_map, op, global_inst_idx, false, .gpr);
                 },
                 .throw_stub => |v| {
-                    try helper.process(&interval_map, v.src, global_inst_idx, false);
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
                 .jmp, .je, .jne, .jl, .jle, .jg, .jge, .jz, .jnz => {},
             }
@@ -203,15 +278,25 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
     }
     std.mem.sort(LiveInterval, intervals.items, {}, compareIntervals);
 
-    // List of allocatable registers.
+    // List of allocatable GPR registers.
     // Excluding RAX and RDX to prevent collision/clobbering by IDIV/IREM easily.
-    const registers = [_]x86.PhysicalReg{
+    const gpr_registers = [_]x86.PhysicalReg{
         .rbx, .rcx, .rsi, .rdi, .r8, .r9, .r10, .r11, .r12, .r13, .r14, .r15
     };
 
-    var free_regs = std.ArrayList(x86.PhysicalReg).empty;
-    defer free_regs.deinit(allocator);
-    try free_regs.appendSlice(allocator, &registers);
+    // List of SSE XMM registers.
+    const xmm_registers = [_]x86.PhysicalReg{
+        .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7,
+        .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15
+    };
+
+    var free_gprs = std.ArrayList(x86.PhysicalReg).empty;
+    defer free_gprs.deinit(allocator);
+    try free_gprs.appendSlice(allocator, &gpr_registers);
+
+    var free_xmms = std.ArrayList(x86.PhysicalReg).empty;
+    defer free_xmms.deinit(allocator);
+    try free_xmms.appendSlice(allocator, &xmm_registers);
 
     var active = std.ArrayList(*LiveInterval).empty;
     defer active.deinit(allocator);
@@ -226,9 +311,13 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
         while (active_idx < active.items.len) {
             const act = active.items[active_idx];
             if (act.end < interval.start) {
-                // Free reg
+                // Free reg to correct pool
                 if (act.reg) |r| {
-                    try free_regs.append(allocator, r);
+                    if (act.class == .xmm) {
+                        try free_xmms.append(allocator, r);
+                    } else {
+                        try free_gprs.append(allocator, r);
+                    }
                 }
                 _ = active.orderedRemove(active_idx);
             } else {
@@ -236,16 +325,18 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
             }
         }
 
-        if (free_regs.items.len > 0) {
+        const pool = if (interval.class == .xmm) &free_xmms else &free_gprs;
+
+        if (pool.items.len > 0) {
             // Allocate register: check if we can reuse the hint register.
             var selected_reg: ?x86.PhysicalReg = null;
             if (interval.hint_vreg) |hint_v| {
                 if (allocation_results.get(hint_v)) |hint_res| {
                     if (hint_res.reg) |hr| {
-                        // Check if the hinted register is actually currently free
-                        for (free_regs.items, 0..) |fr, fri| {
+                        // Check if the hinted register is actually currently free in this pool
+                        for (pool.items, 0..) |fr, fri| {
                             if (fr == hr) {
-                                selected_reg = free_regs.orderedRemove(fri);
+                                selected_reg = pool.orderedRemove(fri);
                                 break;
                             }
                         }
@@ -253,19 +344,28 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 }
             }
 
-            const reg = selected_reg orelse free_regs.pop();
+            const reg = selected_reg orelse pool.pop();
             interval.reg = reg;
             try active.append(allocator, interval);
             std.mem.sort(*LiveInterval, active.items, {}, compareActive);
         } else {
-            // Spill: Spill the one in active list that ends furthest
-            if (active.items.len > 0 and active.items[active.items.len - 1].end > interval.end) {
-                const victim = active.items[active.items.len - 1];
+            // Spill: Find the active interval of the SAME class that ends furthest
+            var victim_idx: ?usize = null;
+            var max_end: usize = 0;
+            for (active.items, 0..) |act, acti| {
+                if (act.class == interval.class and act.end > max_end) {
+                    max_end = act.end;
+                    victim_idx = acti;
+                }
+            }
+
+            if (victim_idx != null and max_end > interval.end) {
+                const victim = active.items[victim_idx.?];
                 interval.reg = victim.reg;
                 victim.reg = null;
                 victim.stack_offset = next_stack_offset;
                 next_stack_offset += 8;
-                active.items[active.items.len - 1] = interval;
+                active.items[victim_idx.?] = interval;
                 std.mem.sort(*LiveInterval, active.items, {}, compareActive);
             } else {
                 // Spill current interval
@@ -295,6 +395,40 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                                 }
                             }
                             return op;
+                        },
+                        .mem => |m| {
+                            var new_base = m.base;
+                            switch (m.base) {
+                                .vreg => |bv| {
+                                    const rw = run(results, .{ .vreg = bv });
+                                    switch (rw) {
+                                        .reg => |r| new_base = .{ .reg = r },
+                                        .stack => |s| new_base = .{ .stack = s },
+                                        else => {},
+                                    }
+                                },
+                                else => {},
+                            }
+                            var new_index = m.index;
+                            if (m.index) |idx| {
+                                switch (idx) {
+                                    .vreg => |iv| {
+                                        const rw = run(results, .{ .vreg = iv });
+                                        switch (rw) {
+                                            .reg => |r| new_index = .{ .reg = r },
+                                            .stack => |s| new_index = .{ .stack = s },
+                                            else => {},
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                            return .{ .mem = .{
+                                .base = new_base,
+                                .index = new_index,
+                                .scale = m.scale,
+                                .disp = m.disp,
+                            } };
                         },
                         else => return op,
                     }
@@ -341,6 +475,46 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     v.src = rewriteOp.run(&allocation_results, v.src);
                 },
                 .ushr => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .addss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .subss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .mulss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .divss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .movss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .addsd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .subsd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .mulsd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .divsd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .movsd => |*v| {
                     v.dest = rewriteOp.run(&allocation_results, v.dest);
                     v.src = rewriteOp.run(&allocation_results, v.src);
                 },
@@ -503,3 +677,87 @@ test "regalloc: basic linear scan" {
     try std.testing.expect(insts[2].add.src == .reg);
     try std.testing.expect(insts[3].ret.? == .reg);
 }
+
+test "regalloc: float register allocation" {
+    const a = std.testing.allocator;
+
+    var prog = x86.MachineProgram{
+        .blocks = std.ArrayList(x86.MachineBlock).empty,
+        .allocator = a,
+    };
+    defer prog.deinit();
+
+    var mblock = x86.MachineBlock{
+        .id = 0,
+        .instructions = std.ArrayList(x86.Inst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+
+    // MOVSS v0_1, v1_1
+    try mblock.instructions.append(a, .{ .movss = .{ .dest = .{ .vreg = v0 }, .src = .{ .vreg = v1 } } });
+    // ADDSS v0_1, v1_1
+    try mblock.instructions.append(a, .{ .addss = .{ .dest = .{ .vreg = v0 }, .src = .{ .vreg = v1 } } });
+
+    try prog.blocks.append(a, mblock);
+
+    try allocateRegisters(a, &prog);
+
+    const insts = prog.blocks.items[0].instructions.items;
+    // Verify that the float variables are allocated to XMM registers!
+    try std.testing.expect(insts[0].movss.dest == .reg);
+    try std.testing.expect(insts[0].movss.src == .reg);
+    
+    // Check they belong to the XMM register class (starts with xmm0 name or equivalent)
+    const dest_name = insts[0].movss.dest.reg.name();
+    const src_name = insts[0].movss.src.reg.name();
+    try std.testing.expect(std.mem.startsWith(u8, dest_name, "xmm"));
+    try std.testing.expect(std.mem.startsWith(u8, src_name, "xmm"));
+}
+
+test "regalloc: SIB array indexing rewrite" {
+    const a = std.testing.allocator;
+
+    var prog = x86.MachineProgram{
+        .blocks = std.ArrayList(x86.MachineBlock).empty,
+        .allocator = a,
+    };
+    defer prog.deinit();
+
+    var mblock = x86.MachineBlock{
+        .id = 0,
+        .instructions = std.ArrayList(x86.Inst).empty,
+    };
+
+    const v_array = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v_index = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v_dest  = ir.SSAVar{ .reg = 2, .version = 1 };
+
+    // MOV v_dest, [v_array + v_index * 4 + 16]
+    const mem_op = x86.Operand{ .mem = .{
+        .base = .{ .vreg = v_array },
+        .index = .{ .vreg = v_index },
+        .scale = 4,
+        .disp = 16,
+    } };
+    try mblock.instructions.append(a, .{ .mov = .{ .dest = .{ .vreg = v_dest }, .src = mem_op } });
+
+    try prog.blocks.append(a, mblock);
+
+    try allocateRegisters(a, &prog);
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expect(insts[0].mov.dest == .reg);
+    try std.testing.expect(insts[0].mov.src == .mem);
+    
+    // Verify that the memory operand's base and index have been rewritten to physical GPR registers
+    const rewritten_mem = insts[0].mov.src.mem;
+    try std.testing.expect(rewritten_mem.base == .reg);
+    try std.testing.expect(rewritten_mem.index.? == .reg);
+    
+    // GPRs should not be XMM
+    try std.testing.expect(!std.mem.startsWith(u8, rewritten_mem.base.reg.name(), "xmm"));
+    try std.testing.expect(!std.mem.startsWith(u8, rewritten_mem.index.?.reg.name(), "xmm"));
+}
+

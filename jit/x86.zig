@@ -3,9 +3,51 @@ const ir = @import("ir");
 
 pub const PhysicalReg = enum {
     rax, rcx, rdx, rbx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15,
+    xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15,
 
     pub fn name(self: PhysicalReg) []const u8 {
         return @tagName(self);
+    }
+};
+
+pub const BaseReg = union(enum) {
+    vreg: ir.SSAVar,
+    reg:  PhysicalReg,
+    stack: i32,
+
+    pub fn format(self: BaseReg, writer: *std.Io.Writer) !void {
+        switch (self) {
+            .vreg  => |v| try writer.print("v{d}_{d}", .{ v.reg, v.version }),
+            .reg   => |r| try writer.print("%{s}", .{r.name()}),
+            .stack => |o| try writer.print("[rbp-{d}]", .{o}),
+        }
+    }
+};
+
+pub const MemoryAddress = struct {
+    base:  BaseReg,
+    index: ?BaseReg = null,
+    scale: u3 = 1,
+    disp:  i32 = 0,
+
+    pub fn format(self: MemoryAddress, writer: *std.Io.Writer) !void {
+        try writer.writeAll("[");
+        try self.base.format(writer);
+        if (self.index) |idx| {
+            try writer.writeAll(" + ");
+            try idx.format(writer);
+            if (self.scale > 1) {
+                try writer.print(" * {d}", .{self.scale});
+            }
+        }
+        if (self.disp != 0) {
+            if (self.disp > 0) {
+                try writer.print(" + {d}", .{self.disp});
+            } else {
+                try writer.print(" - {d}", .{-self.disp});
+            }
+        }
+        try writer.writeAll("]");
     }
 };
 
@@ -14,6 +56,7 @@ pub const Operand = union(enum) {
     vreg:  ir.SSAVar,
     reg:   PhysicalReg,
     stack: i32, // Stack offset from RBP/RSP
+    mem:   MemoryAddress,
     imm:   i32,
     imm64: i64,
 
@@ -22,6 +65,7 @@ pub const Operand = union(enum) {
             .vreg  => |v| try writer.print("v{d}_{d}", .{ v.reg, v.version }),
             .reg   => |r| try writer.print("%{s}", .{r.name()}),
             .stack => |o| try writer.print("[rbp-{d}]", .{o}),
+            .mem   => |m| try m.format(writer),
             .imm   => |v| try writer.print("#{d}", .{v}),
             .imm64 => |v| try writer.print("#{d}L", .{v}),
         }
@@ -51,6 +95,20 @@ pub const Inst = union(enum) {
     shl:    struct { dest: Operand, src: Operand },
     shr:    struct { dest: Operand, src: Operand },  // arithmetic (SAR)
     ushr:   struct { dest: Operand, src: Operand },  // logical    (SHR)
+
+    // ---- SSE Floating-point Single Precision ----
+    addss: struct { dest: Operand, src: Operand },
+    subss: struct { dest: Operand, src: Operand },
+    mulss: struct { dest: Operand, src: Operand },
+    divss: struct { dest: Operand, src: Operand },
+    movss: struct { dest: Operand, src: Operand },
+
+    // ---- SSE Floating-point Double Precision ----
+    addsd: struct { dest: Operand, src: Operand },
+    subsd: struct { dest: Operand, src: Operand },
+    mulsd: struct { dest: Operand, src: Operand },
+    divsd: struct { dest: Operand, src: Operand },
+    movsd: struct { dest: Operand, src: Operand },
 
     // ---- Comparisons & Branches ----
     cmp:     struct { left: Operand, right: Operand },
@@ -119,6 +177,18 @@ pub const Inst = union(enum) {
             .jge  => |v| try writer.print("JGE bb{d}",  .{v}),
             .jz   => |v| try writer.print("JZ bb{d}",   .{v}),
             .jnz  => |v| try writer.print("JNZ bb{d}",  .{v}),
+
+            .addss   => |v| { try writer.writeAll("ADDSS "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .subss   => |v| { try writer.writeAll("SUBSS "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .mulss   => |v| { try writer.writeAll("MULSS "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .divss   => |v| { try writer.writeAll("DIVSS "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .movss   => |v| { try writer.writeAll("MOVSS "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+
+            .addsd   => |v| { try writer.writeAll("ADDSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .subsd   => |v| { try writer.writeAll("SUBSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .mulsd   => |v| { try writer.writeAll("MULSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .divsd   => |v| { try writer.writeAll("DIVSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .movsd   => |v| { try writer.writeAll("MOVSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .switch_stub => |v| { try writer.writeAll("SWITCH "); try v.src.format(writer); try writer.print(", {d} cases", .{v.num_cases}); },
             .call => |v| {
                 if (v.dest) |d| { try d.format(writer); try writer.writeAll(" = "); }
