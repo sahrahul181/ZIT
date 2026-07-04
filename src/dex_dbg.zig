@@ -542,6 +542,30 @@ pub fn main(init: std.process.Init) !void {
         try cfg.computeDominatorChildren();
         try cfg.computeDominanceFrontiers();
 
+        for (insts) |inst| {
+            switch (inst) {
+                .invoke => |inv| {
+                    var match_class = std.mem.eql(u8, inv.class_name, class.name);
+                    if (!match_class) {
+                        if (inv.class_name.len > 2 and inv.class_name[0] == 'L' and inv.class_name[inv.class_name.len - 1] == ';') {
+                            const inner_class = inv.class_name[1 .. inv.class_name.len - 1];
+                            match_class = std.mem.eql(u8, inner_class, class.name) or std.mem.endsWith(u8, class.name, inner_class);
+                        }
+                    }
+                    var match_method = std.mem.eql(u8, inv.method_name, method.name);
+                    if (!match_method) {
+                        if (std.mem.indexOf(u8, method.name, "->")) |idx| {
+                            match_method = std.mem.eql(u8, inv.method_name, method.name[idx + 2..]);
+                        }
+                    }
+                    if (match_class and match_method and std.mem.eql(u8, inv.signature, method.signature)) {
+                        inv.is_self_call = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
         try translate.translateCFG(arena, &cfg, insts);
 
         var def_map = std.AutoHashMap(u16, std.ArrayList(usize)).init(arena);
