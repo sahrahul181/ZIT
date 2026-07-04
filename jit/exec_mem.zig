@@ -86,10 +86,10 @@ test "exec_mem: end-to-end JIT execution on physical CPU" {
     defer prog.deinit();
 
     // 3. Allocate Registers
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 2, 1);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 2, 1, null, null);
 
     // 4. Emit Machine Code Bytes
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     // 5. Map into Executable Virtual Memory
@@ -141,8 +141,8 @@ test "JIT: un_op neg and not execute correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 2, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 2, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -171,8 +171,8 @@ test "JIT: int_to_byte narrowing conversion executes correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 2, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 2, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -203,8 +203,8 @@ test "JIT: cmp_long three-way compare executes correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 3, 2);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 3, 2, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -237,8 +237,8 @@ test "JIT: cmpl_float and NaN bias execute correctly" {
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
     const float_params = [_]bool{ true, true };
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, &float_params, 3, 2);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, &float_params, null, 3, 2, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -271,8 +271,8 @@ test "JIT: neg_float executes correctly" {
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
     const float_params = [_]bool{true};
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, &float_params, 2, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, &float_params, null, 2, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -301,8 +301,8 @@ test "JIT: int_to_float conversion executes correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 2, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 2, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -337,9 +337,9 @@ test "JIT: integer division and remainder execute correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 4, 2);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 4, 2, null, null);
 
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -369,8 +369,8 @@ test "JIT: div/rem exact values" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 3, 2);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 3, 2, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -401,8 +401,8 @@ test "JIT: rem exact values" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 3, 2);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 3, 2, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -438,9 +438,9 @@ test "JIT: bitwise and/or/xor execute correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 4, 2);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 4, 2, null, null);
 
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -473,8 +473,8 @@ test "JIT: shift by immediate and by register execute correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 3, 2);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 3, 2, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -513,8 +513,8 @@ test "JIT: if_ltz zero-comparison branch executes correctly" {
 
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 2, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 2, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -545,8 +545,8 @@ test "JIT: float remainder executes correctly" {
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
     const float_params = [_]bool{ true, true };
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, &float_params, 3, 2);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, &float_params, null, 3, 2, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -606,8 +606,8 @@ test "JIT: pass 5 parameters (stack parameter support)" {
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
 
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 9, 5);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 9, 5, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -669,8 +669,8 @@ test "JIT: self-recursive static call (Fibonacci) executes correctly" {
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
 
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 8, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 8, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);
@@ -723,8 +723,8 @@ test "JIT: monitor-enter and monitor-exit execution correctness" {
     var prog = try lower.lowerCFG(a, &test_cfg);
     defer prog.deinit();
 
-    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 4, 1);
-    const code_bytes = try emitter.emitProgram(a, &prog);
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, null, 4, 1, null, null);
+    const code_bytes = try emitter.emitProgram(a, &prog, null, null);
     defer a.free(code_bytes);
 
     const exec_page = try allocateExecMemory(code_bytes.len);

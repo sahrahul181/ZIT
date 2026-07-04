@@ -52,6 +52,15 @@ fn makeRex(w: bool, reg: u4, rm: u4) u8 {
     return rex;
 }
 
+fn makeRexSib(w: bool, reg: u4, rm: u4, idx: u4) u8 {
+    var rex: u8 = 0x40;
+    if (w) rex |= 0x08; // W bit (64-bit operand size)
+    if (reg >= 8) rex |= 0x04; // R bit (registers 8-15)
+    if (idx >= 8) rex |= 0x02; // X bit (index 8-15)
+    if (rm >= 8) rex |= 0x01; // B bit (registers 8-15)
+    return rex;
+}
+
 /// Helper to encode ModR/M byte.
 fn makeModRM(mod: u2, reg: u3, rm: u3) u8 {
     return (@as(u8, mod) << 6) | (@as(u8, reg) << 3) | rm;
@@ -146,9 +155,17 @@ fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachinePro
     return list;
 }
 
-pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) ![]u8 {
+pub fn emitProgram(
+    allocator: std.mem.Allocator,
+    program: *x86.MachineProgram,
+    registry: ?*@import("class_loader").ClassRegistry,
+    dex: ?*const @import("parser").DexFile,
+) ![]u8 {
     var raw_code = std.ArrayList(u8).empty;
     errdefer raw_code.deinit(allocator);
+
+    var local_gc_builder = @import("gc_map").GcMapBuilder.init(allocator);
+    defer local_gc_builder.deinit();
 
     var raw_relocations = std.ArrayList(Relocation).empty;
     defer raw_relocations.deinit(allocator);
@@ -290,7 +307,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
         }
     }.run;
 
-    // MOV r64, imm32 (sign-extended). Always 7 bytes (REX.W C7 /0 id) — the
+    // MOV r64, imm32 (sign-extended). Always 7 bytes (REX.W C7 /0 id) â€” the
     // fixed size matters for the hand-computed rel8 jumps in cmp3.
     const emitMovRegImm32 = struct {
         fn run(c: *CodeWriter, reg: x86.PhysicalReg, val: i32) !void {
@@ -304,8 +321,105 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
         }
     }.run;
 
+    const emitMemModRM = struct {
+        fn run(c: *CodeWriter, reg_field: u3, mem: x86.MemoryAddress) !void {
+            // Handle .stack base: treat as [rbp - offset] (no index, just disp)
+            if (mem.base == .stack) {
+                const stack_disp = -mem.base.stack + mem.disp;
+                if (stack_disp >= -128 and stack_disp <= 127) {
+                    try c.append(makeModRM(0b01, reg_field, 5)); // RBP = 5
+                    try c.append(@as(u8, @bitCast(@as(i8, @truncate(stack_disp)))));
+                } else {
+                    try c.append(makeModRM(0b10, reg_field, 5));
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &bytes, stack_disp, .little);
+                    try c.appendSlice(&bytes);
+                }
+                return;
+            }
+            const base = regCode(mem.base.reg);
+            if (mem.index == null) {
+                if (base == 4) { // RSP/R12
+                    if (mem.disp == 0) {
+                        try c.append(makeModRM(0b00, reg_field, 4));
+                        try c.append(0x24);
+                    } else if (mem.disp >= -128 and mem.disp <= 127) {
+                        try c.append(makeModRM(0b01, reg_field, 4));
+                        try c.append(0x24);
+                        try c.append(@as(u8, @bitCast(@as(i8, @truncate(mem.disp)))));
+                    } else {
+                        try c.append(makeModRM(0b10, reg_field, 4));
+                        try c.append(0x24);
+                        var bytes: [4]u8 = undefined;
+                        std.mem.writeInt(i32, &bytes, mem.disp, .little);
+                        try c.appendSlice(&bytes);
+                    }
+                    return;
+                }
+                
+                if (mem.disp == 0 and base != 5) {
+                    try c.append(makeModRM(0b00, reg_field, @as(u3, @truncate(base))));
+                } else if (mem.disp >= -128 and mem.disp <= 127) {
+                    try c.append(makeModRM(0b01, reg_field, @as(u3, @truncate(base))));
+                    try c.append(@as(u8, @bitCast(@as(i8, @truncate(mem.disp)))));
+                } else {
+                    try c.append(makeModRM(0b10, reg_field, @as(u3, @truncate(base))));
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &bytes, mem.disp, .little);
+                    try c.appendSlice(&bytes);
+                }
+            } else {
+                const idx_base = mem.index.?;
+                const idx = if (idx_base == .reg) regCode(idx_base.reg) else 0;
+                const scale_bits: u8 = switch (@as(u4, mem.scale)) {
+                    1 => 0b00,
+                    2 => 0b01,
+                    4 => 0b10,
+                    8 => 0b11,
+                    else => unreachable,
+                };
+                const sib = (scale_bits << 6) | (@as(u8, @truncate(idx)) << 3) | @as(u8, @truncate(base));
+                
+                if (mem.disp == 0 and base != 5) {
+                    try c.append(makeModRM(0b00, reg_field, 4));
+                    try c.append(sib);
+                } else if (mem.disp >= -128 and mem.disp <= 127) {
+                    try c.append(makeModRM(0b01, reg_field, 4));
+                    try c.append(sib);
+                    try c.append(@as(u8, @bitCast(@as(i8, @truncate(mem.disp)))));
+                } else {
+                    try c.append(makeModRM(0b10, reg_field, 4));
+                    try c.append(sib);
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &bytes, mem.disp, .little);
+                    try c.appendSlice(&bytes);
+                }
+            }
+        }
+    }.run;
+
+    const emitSafepointCheck = struct {
+        fn run(c: *CodeWriter) !void {
+            // MOV RAX, &safepoint_page
+            try c.appendSlice(&[_]u8{ 0x48, 0xB8 });
+            var addr_bytes: [8]u8 = undefined;
+            const sp_addr = @intFromPtr(&@import("safepoint").safepoint_page);
+            std.mem.writeInt(u64, &addr_bytes, sp_addr, .little);
+            try c.appendSlice(&addr_bytes);
+
+            // MOV RAX, [RAX]  — load the page pointer out of the global
+            try c.appendSlice(&[_]u8{ 0x48, 0x8B, 0x00 });
+
+            // MOV AL, [RAX]  — the dummy read of the page itself; traps (access
+            // violation → VEH) when the GC has protected the page for a safepoint
+            try c.appendSlice(&[_]u8{ 0x8A, 0x00 });
+        }
+    }.run;
+
     var code = CodeWriter{ .buf = &raw_code, .alloc = allocator };
     code.updateItems();
+
+    // safepoint_patch_offsets removed for Dekker safepoints
 
     var relocations = RelocWriter{ .buf = &raw_relocations, .alloc = allocator };
     relocations.updateItems();
@@ -348,11 +462,39 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
         }
     }
 
+    // Safepoint poll at method entry
+    if (dex != null) {
+        try emitSafepointCheck(&code);
+    }
+
     // Pass 1: Emit instructions and record label offsets and relocation sites.
     for (program.blocks.items) |block| {
         try block_offsets.put(block.id, code.items.len);
 
         for (block.instructions.items) |inst| {
+            const check_backward_safepoint = struct {
+                fn run(c: *CodeWriter, inst_val: x86.Inst, block_id: usize, has_dex: bool) !void {
+                    const target: ?usize = switch (inst_val) {
+                        .jmp => |t| t,
+                        .je => |t| t,
+                        .jne => |t| t,
+                        .jl => |t| t,
+                        .jge => |t| t,
+                        .jg => |t| t,
+                        .jle => |t| t,
+                        .jz => |t| t,
+                        .jnz => |t| t,
+                        else => null,
+                    };
+                    if (has_dex and target != null) {
+                        if (target.? <= block_id) {
+                            try emitSafepointCheck(c);
+                        }
+                    }
+                }
+            }.run;
+            try check_backward_safepoint(&code, inst, block.id, dex != null);
+
             switch (inst) {
                 // ---- Data movement ----
                 .mov => |v| {
@@ -373,7 +515,24 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                                 try code.append(0x57); // XORPD
                                 try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(d))));
                             } else {
-                                return EmitterError.UnsupportedOperandCombination;
+                                // Non-zero immediate into XMM: load via integer register
+                                // MOV r11, imm64; MOVQ xmm, r11
+                                try code.appendSlice(&[_]u8{ 0x49, 0xBB });
+                                var imm_bytes: [8]u8 = undefined;
+                                const imm_v: i64 = switch (v.src) {
+                                    .imm => |i| i,
+                                    .imm64 => |i| @as(i64, @bitCast(i)),
+                                    else => unreachable,
+                                };
+                                std.mem.writeInt(i64, &imm_bytes, imm_v, .little);
+                                try code.appendSlice(&imm_bytes);
+                                // MOVQ xmm, r11: 66 REX.W+R+B 0F 6E /r
+                                const d = regCode(v.dest.reg);
+                                try code.append(0x66);
+                                try code.append(makeRex(true, d, 11)); // 11 = r11
+                                try code.append(0x0F);
+                                try code.append(0x6E);
+                                try code.append(makeModRM(0b11, @as(u3, @truncate(d)), 3)); // r11 low3 = 3
                             }
                         } else {
                             // MOV r64, imm32/imm64
@@ -466,7 +625,107 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             std.mem.writeInt(i32, &bytes, -offset, .little);
                             try code.appendSlice(&bytes);
                         }
+                    } else if (v.dest == .reg and v.src == .mem) {
+                        const d = regCode(v.dest.reg);
+                        const b = if (v.src.mem.base == .reg) regCode(v.src.mem.base.reg) else 0;
+                        const idx = if (v.src.mem.index) |i| (if (i == .reg) regCode(i.reg) else 0) else 0;
+                        try code.append(makeRexSib(true, d, b, idx));
+                        try code.append(0x8B); // Load
+                        try emitMemModRM(&code, @as(u3, @truncate(d)), v.src.mem);
+                    } else if (v.dest == .mem and v.src == .reg) {
+                        const s = regCode(v.src.reg);
+                        const b = if (v.dest.mem.base == .reg) regCode(v.dest.mem.base.reg) else 0;
+                        const idx = if (v.dest.mem.index) |i| (if (i == .reg) regCode(i.reg) else 0) else 0;
+                        try code.append(makeRexSib(true, s, b, idx));
+                        try code.append(0x89); // Store
+                        try emitMemModRM(&code, @as(u3, @truncate(s)), v.dest.mem);
+                    } else if (v.dest == .stack and v.src == .imm) {
+                        // MOV r11, imm64; MOV [rbp-offset], r11
+                        const val = v.src.imm;
+                        const offset = v.dest.stack;
+                        try code.appendSlice(&[_]u8{ 0x49, 0xBB });
+                        var imm_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(i64, &imm_bytes, val, .little);
+                        try code.appendSlice(&imm_bytes);
+                        try code.append(0x4C); // REX.W + REX.R (r11)
+                        try code.append(0x89);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -offset, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                    } else if (v.dest == .stack and v.src == .stack) {
+                        // Load into r11, then store
+                        const src_off = v.src.stack;
+                        const dst_off = v.dest.stack;
+                        try code.append(0x4C); // REX.W + REX.R (r11)
+                        try code.append(0x8B);
+                        if (src_off >= -128 and src_off <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-src_off)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -src_off, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                        try code.append(0x4C);
+                        try code.append(0x89);
+                        if (dst_off >= -128 and dst_off <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-dst_off)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -dst_off, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                    } else if (v.dest == .mem and v.src == .stack) {
+                        // Load from stack into r11, then store to mem
+                        const src_off = v.src.stack;
+                        try code.append(0x4C); // REX.W + REX.R(r11)
+                        try code.append(0x8B);
+                        if (src_off >= -128 and src_off <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-src_off)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -src_off, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                        // MOV [mem], r11
+                        const b = if (v.dest.mem.base == .reg) regCode(v.dest.mem.base.reg) else 0;
+                        const idx = if (v.dest.mem.index) |i| (if (i == .reg) regCode(i.reg) else 0) else 0;
+                        try code.append(makeRexSib(true, 11, b, idx));
+                        try code.append(0x89);
+                        try emitMemModRM(&code, 3, v.dest.mem); // r11 low3 = 3
+                    } else if (v.dest == .stack and v.src == .mem) {
+                        // Load from mem into r11, then store to stack
+                        const d_off = v.dest.stack;
+                        const b = if (v.src.mem.base == .reg) regCode(v.src.mem.base.reg) else 0;
+                        const idx = if (v.src.mem.index) |i| (if (i == .reg) regCode(i.reg) else 0) else 0;
+                        try code.append(makeRexSib(true, 11, b, idx));
+                        try code.append(0x8B);
+                        try emitMemModRM(&code, 3, v.src.mem); // r11 low3 = 3
+                        // MOV [rbp - d_off], r11
+                        try code.append(0x4C);
+                        try code.append(0x89);
+                        if (d_off >= -128 and d_off <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-d_off)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -d_off, .little);
+                            try code.appendSlice(&bytes);
+                        }
                     } else {
+                        std.debug.print("mov: unsupported dest={s} src={s}\n", .{@tagName(v.dest), @tagName(v.src)});
                         return EmitterError.UnsupportedOperandCombination;
                     }
                 },
@@ -524,7 +783,60 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             std.mem.writeInt(i32, &bytes, val, .little);
                             try code.appendSlice(&bytes);
                         }
+                    } else if (v.dest == .reg and v.src == .stack) {
+                        // Load src from stack into tmp reg (r11), then SUB
+                        const d = regCode(v.dest.reg);
+                        const offset = v.src.stack;
+                        // MOV r11, [rbp - offset]
+                        try code.append(0x4C); // REX.W + REX.R (r11=reg field) + REX.B (rbp=5)
+                        try code.append(0x8B);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5)); // r11 code = 3 in low3 bits
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -offset, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                        // SUB dest, r11
+                        try code.append(makeRex(true, 3, d)); // r11 as src
+                        try code.append(0x29);
+                        try code.append(makeModRM(0b11, 3, @as(u3, @truncate(d))));
+                    } else if (v.dest == .stack and v.src == .reg) {
+                        // SUB [rbp - offset], src (load first to scratch, sub, store back)
+                        const s = regCode(v.src.reg);
+                        const offset = v.dest.stack;
+                        // Load stack into r11
+                        try code.append(0x4C);
+                        try code.append(0x8B);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -offset, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                        // SUB r11, src
+                        try code.append(makeRex(true, s, 3));
+                        try code.append(0x29);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 3));
+                        // Store r11 back
+                        try code.append(0x4C);
+                        try code.append(0x89);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 3, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 3, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -offset, .little);
+                            try code.appendSlice(&bytes);
+                        }
                     } else {
+                        std.debug.print("sub: unsupported operands dest={s} src={s}\n", .{@tagName(v.dest), @tagName(v.src)});
                         return EmitterError.UnsupportedOperandCombination;
                     }
                 },
@@ -575,6 +887,13 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         try code.append(makeRex(true, d, s));
                         try code.append(0x63);
                         try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else if (v.dest == .reg and v.src == .mem) {
+                        const d = regCode(v.dest.reg);
+                        const b = if (v.src.mem.base == .reg) regCode(v.src.mem.base.reg) else 0;
+                        const idx = if (v.src.mem.index) |i| (if (i == .reg) regCode(i.reg) else 0) else 0;
+                        try code.append(makeRexSib(true, d, b, idx));
+                        try code.append(0x63);
+                        try emitMemModRM(&code, @as(u3, @truncate(d)), v.src.mem);
                     } else {
                         return EmitterError.UnsupportedOperandCombination;
                     }
@@ -619,7 +938,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                     }
                 },
 
-                // ---- Int ↔ float conversions ----
+                // ---- Int â†” float conversions ----
                 .cvtsi2ss, .cvtsi2sd, .cvttss2si, .cvttsd2si => {
                     const parts = switch (inst) {
                         .cvtsi2ss => .{ inst.cvtsi2ss.dest, inst.cvtsi2ss.src, @as(u8, 0xF3), @as(u8, 0x2A) },
@@ -732,12 +1051,12 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         try code.appendSlice(&[_]u8{ 0x7F, 7 }); // JG rel8
                         try emitMovRegImm32(&code, dest_reg, -1);
                     } else {
-                        // Dalvik NaN bias: cmpl → -1 on NaN, cmpg → +1 on NaN.
+                        // Dalvik NaN bias: cmpl â†’ -1 on NaN, cmpg â†’ +1 on NaN.
                         // mov dest, bias
-                        // ucomiss/ucomisd left, right   (unordered → ZF=PF=CF=1)
-                        // jp  end (+25)   ; NaN → keep bias
+                        // ucomiss/ucomisd left, right   (unordered â†’ ZF=PF=CF=1)
+                        // jp  end (+25)   ; NaN â†’ keep bias
                         // mov dest, 1
-                        // ja  end (+16)   ; CF=0,ZF=0 → left > right
+                        // ja  end (+16)   ; CF=0,ZF=0 â†’ left > right
                         // mov dest, 0
                         // je  end (+7)    ; equal
                         // mov dest, -1    ; less
@@ -995,7 +1314,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
 
 
                 // ---- Shifts ----
-                // Immediate count → C1 /r ib.  Register count must be in CL → D3 /r,
+                // Immediate count â†’ C1 /r ib.  Register count must be in CL â†’ D3 /r,
                 // so the register form materializes MOV rcx, count first.  The RA pass
                 // keeps RCX out of the general pool via the shift-count reservation.
                 .shl, .shr, .ushr => {
@@ -1031,7 +1350,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         }
                         // If dest is RCX we just overwrote it via push/mov; but dest==rcx
                         // with a register count is contradictory (dest and count share a
-                        // reg) — the RA hint avoids this; treat as unsupported to be safe.
+                        // reg) â€” the RA hint avoids this; treat as unsupported to be safe.
                         if (dest_is_rcx and !src_is_rcx) return EmitterError.UnsupportedOperandCombination;
                         // shift dest by CL: REX.W D3 /ext
                         try code.append(makeRex(true, 0, d));
@@ -1046,7 +1365,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                 },
 
                 // ---- Integer division / remainder ----
-                // x86 IDIV divides RDX:RAX by the operand: quotient→RAX, remainder→RDX.
+                // x86 IDIV divides RDX:RAX by the operand: quotientâ†’RAX, remainderâ†’RDX.
                 // The RA pass excludes RAX and RDX from the pool, so they are free scratch.
                 // idiv {dest,rem,src}: dest holds dividend on entry, receives quotient.
                 // irem {dest,rem,src}: dest holds dividend on entry, rem receives remainder.
@@ -1086,7 +1405,7 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         try code.append(makeModRM(0b11, 7, 1));
                         // Result is already in RAX(quot)/RDX(rem); restore RCX after we
                         // move the result out below. Defer the pop by emitting it now is
-                        // wrong (would clobber flags-free RAX? no—pop doesn't touch RAX/RDX).
+                        // wrong (would clobber flags-free RAX? noâ€”pop doesn't touch RAX/RDX).
                         try code.append(0x59); // pop rcx
                     } else {
                         return EmitterError.UnsupportedOperandCombination;
@@ -1382,6 +1701,15 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                     try code.append(0xC3); // RET
                 },
                 .call => |v| {
+                    const call_pos = code.items.len;
+                    if (v.gc_info) |gc_info| {
+                        try local_gc_builder.addEntry(.{
+                            .call_offset = @intCast(call_pos),
+                            .stack_refs = gc_info.stack_refs,
+                            .reg_refs = gc_info.reg_refs,
+                        });
+                    }
+
                     if (v.is_self_call) {
                         try code.append(0xE8);
                         const rel32 = -@as(i32, @intCast(code.items.len + 4));
@@ -1389,7 +1717,66 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         std.mem.writeInt(i32, &disp_bytes, rel32, .little);
                         try code.appendSlice(&disp_bytes);
                     } else {
-                        return EmitterError.UnsupportedInstruction;
+                        // 1. Save XMM0..XMM3 (64 bytes)
+                        try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x40 }); // sub rsp, 64
+                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x04, 0x24 }); // movq [rsp], xmm0
+                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x4C, 0x24, 0x08 }); // movq [rsp+8], xmm1
+                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x54, 0x24, 0x10 }); // movq [rsp+16], xmm2
+                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x5C, 0x24, 0x18 }); // movq [rsp+24], xmm3
+
+                        // 2. Push GPRs: RCX, RDX, R8, R9 (32 bytes)
+                        try code.appendSlice(&[_]u8{ 0x51, 0x52, 0x41, 0x50, 0x41, 0x51 });
+
+                        // 3. Set up arguments for resolveMethodVirtual
+                        if (v.is_static) {
+                            try code.appendSlice(&[_]u8{ 0x48, 0x31, 0xC9 }); // xor rcx, rcx
+                        } else {
+                            try code.appendSlice(&[_]u8{ 0x48, 0x8B, 0x4C, 0x24, 0x18 }); // mov rcx, [rsp+24]
+                        }
+
+                        // RDX = method_idx
+                        try code.appendSlice(&[_]u8{ 0x48, 0xC7, 0xC2 }); // mov rdx, imm32
+                        var mi_bytes: [4]u8 = undefined;
+                        std.mem.writeInt(i32, &mi_bytes, @intCast(v.method_idx), .little);
+                        try code.appendSlice(&mi_bytes);
+
+                        // R8 = dex_ptr
+                        try code.appendSlice(&[_]u8{ 0x49, 0xB8 }); // mov r8, imm64
+                        var dex_bytes: [8]u8 = undefined;
+                        const dex_addr = if (dex) |d| @intFromPtr(d) else 0;
+                        std.mem.writeInt(u64, &dex_bytes, dex_addr, .little);
+                        try code.appendSlice(&dex_bytes);
+
+                        // R9 = registry_ptr
+                        try code.appendSlice(&[_]u8{ 0x49, 0xB9 }); // mov r9, imm64
+                        var reg_bytes: [8]u8 = undefined;
+                        const reg_addr = if (registry) |r| @intFromPtr(r) else 0;
+                        std.mem.writeInt(u64, &reg_bytes, reg_addr, .little);
+                        try code.appendSlice(&reg_bytes);
+
+                        // Call resolveMethodVirtual
+                        try code.appendSlice(&[_]u8{ 0x48, 0xB8 }); // mov rax, imm64
+                        var fn_bytes: [8]u8 = undefined;
+                        const fn_addr = @intFromPtr(&@import("class_loader").resolveMethodVirtual);
+                        std.mem.writeInt(u64, &fn_bytes, fn_addr, .little);
+                        try code.appendSlice(&fn_bytes);
+                        try code.appendSlice(&[_]u8{ 0xFF, 0xD0 }); // call rax
+
+                        // Save result in R11
+                        try code.appendSlice(&[_]u8{ 0x49, 0x89, 0xC3 }); // mov r11, rax
+
+                        // Restore GPRs
+                        try code.appendSlice(&[_]u8{ 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59 }); // pop r9, r8, rdx, rcx
+
+                        // Restore XMMs
+                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x04, 0x24 }); // movq xmm0, [rsp]
+                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x4C, 0x24, 0x08 }); // movq xmm1, [rsp+8]
+                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x54, 0x24, 0x10 }); // movq xmm2, [rsp+16]
+                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x5C, 0x24, 0x18 }); // movq xmm3, [rsp+24]
+                        try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x40 }); // add rsp, 64
+
+                        // Call target
+                        try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 }); // call r11
                     }
 
                     if (v.dest) |dest| {
@@ -1480,12 +1867,464 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                     try code.append(0xFF);
                     try code.append(0xD0);
                 },
+                .alloc_arr => |v| {
+                    // Determine element size from type_names at JIT-compile time
+                    var elem_size: usize = 4;
+                    if (dex != null and v.type_idx < dex.?.type_names.len) {
+                        const tname = dex.?.type_names[v.type_idx];
+                        if (tname.len > 1) {
+                            elem_size = switch (tname[1]) {
+                                'J', 'D' => 8,
+                                'I', 'F' => 4,
+                                'S', 'C' => 2,
+                                'B', 'Z' => 1,
+                                'L', '[' => 8,
+                                else => 8,
+                            };
+                        }
+                    }
 
-                else => return EmitterError.UnsupportedInstruction,
+                    // MOV RCX, size_reg  (arg1: count)
+                    if (v.size == .reg) {
+                        const s = regCode(v.size.reg);
+                        if (s != 1) { // rcx = 1
+                            try code.append(makeRex(true, s, 1));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 1));
+                        }
+                    } else if (v.size == .stack) {
+                        const offset = v.size.stack;
+                        try code.append(makeRex(true, 1, 5));
+                        try code.append(0x8B);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 1, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 1, 5));
+                            var offset_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &offset_bytes, -offset, .little);
+                            try code.appendSlice(&offset_bytes);
+                        }
+                    }
+
+                    // MOV EDX, elem_size  (arg2: element size, zero-extended)
+                    try code.append(0xBA); // MOV edx, imm32
+                    var es_bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &es_bytes, @as(u32, @intCast(elem_size)), .little);
+                    try code.appendSlice(&es_bytes);
+
+                    // MOV RAX, &runtime.gcAllocArray
+                    try code.append(0x48);
+                    try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcAllocArray), .little);
+                    try code.appendSlice(&fn_bytes);
+                    // CALL RAX
+                    try code.append(0xFF);
+                    try code.append(0xD0);
+
+                    // MOV dest, RAX
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        if (d != 0) { // rax = 0
+                            try code.append(makeRex(true, 0, d));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                        }
+                    } else if (v.dest == .stack) {
+                        // MOV [rbp - offset], rax
+                        const off2 = v.dest.stack;
+                        try code.append(makeRex(true, 0, 5));
+                        try code.append(0x89);
+                        if (off2 >= -128 and off2 <= 127) {
+                            try code.append(makeModRM(0b01, 0, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-off2)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 0, 5));
+                            var off_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &off_bytes, -off2, .little);
+                            try code.appendSlice(&off_bytes);
+                        }
+                    }
+                },
+                .alloc_obj => |v| {
+                    // Determine object size: 8 bytes per field (conservative estimate)
+                    var obj_size: usize = 8;
+                    if (registry != null and dex != null and v.type_idx < dex.?.type_names.len) {
+                        const tname = dex.?.type_names[v.type_idx];
+                        if (registry.?.get(tname)) |cd| {
+                            obj_size = cd.instance_fields.len * 8;
+                            if (obj_size == 0) obj_size = 8;
+                        }
+                    }
+
+                    // MOV RCX, 0 (class_ptr: no metadata yet)
+                    try code.appendSlice(&[_]u8{ 0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0 });
+
+                    // MOV RDX, obj_size
+                    try code.append(0x48);
+                    try code.append(0xBA);
+                    var sz_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &sz_bytes, obj_size, .little);
+                    try code.appendSlice(&sz_bytes);
+
+                    // MOV RAX, &runtime.gcAllocObj
+                    try code.append(0x48);
+                    try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcAllocObj), .little);
+                    try code.appendSlice(&fn_bytes);
+                    // CALL RAX
+                    try code.append(0xFF);
+                    try code.append(0xD0);
+
+                    // MOV dest, RAX
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        if (d != 0) {
+                            try code.append(makeRex(true, 0, d));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                        }
+                    } else if (v.dest == .stack) {
+                        const off2 = v.dest.stack;
+                        try code.append(makeRex(true, 0, 5));
+                        try code.append(0x89);
+                        if (off2 >= -128 and off2 <= 127) {
+                            try code.append(makeModRM(0b01, 0, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-off2)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 0, 5));
+                            var off_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &off_bytes, -off2, .little);
+                            try code.appendSlice(&off_bytes);
+                        }
+                    }
+                },
+                .instance_of => |v| {
+                    if (v.obj == .reg) {
+                        const s = regCode(v.obj.reg);
+                        if (s != 1) { // RCX
+                            try code.append(makeRex(true, s, 1));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 1, @as(u3, @truncate(s))));
+                        }
+                    } else if (v.obj == .stack) {
+                        try code.append(makeRex(true, 1, 5));
+                        try code.append(0x8B);
+                        try emitMemModRM(&code, 1, .{ .base = .{ .stack = 0 }, .disp = -v.obj.stack });
+                    }
+                    try code.append(0x48); try code.append(0xBA);
+                    var idx_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &idx_bytes, v.type_idx, .little);
+                    try code.appendSlice(&idx_bytes);
+
+                    try code.append(0x48); try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcInstanceOf), .little);
+                    try code.appendSlice(&fn_bytes);
+                    try code.append(0xFF); try code.append(0xD0);
+
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        if (d != 0) {
+                            try code.append(makeRex(true, 0, d));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                        }
+                    } else if (v.dest == .stack) {
+                        try code.append(makeRex(true, 0, 5));
+                        try code.append(0x89);
+                        try emitMemModRM(&code, 0, .{ .base = .{ .stack = 0 }, .disp = -v.dest.stack });
+                    }
+                },
+                .move_exception => |v| {
+                    try code.append(0x48); try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcGetAndClearException), .little);
+                    try code.appendSlice(&fn_bytes);
+                    try code.append(0xFF); try code.append(0xD0);
+
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        if (d != 0) {
+                            try code.append(makeRex(true, 0, d));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                        }
+                    } else if (v.dest == .stack) {
+                        try code.append(makeRex(true, 0, 5));
+                        try code.append(0x89);
+                        try emitMemModRM(&code, 0, .{ .base = .{ .stack = 0 }, .disp = -v.dest.stack });
+                    }
+                },
+                .fill_array_data => |v| {
+                    if (v.array == .reg) {
+                        const s = regCode(v.array.reg);
+                        if (s != 1) { // RCX
+                            try code.append(makeRex(true, s, 1));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 1, @as(u3, @truncate(s))));
+                        }
+                    } else if (v.array == .stack) {
+                        try code.append(makeRex(true, 1, 5));
+                        try code.append(0x8B);
+                        try emitMemModRM(&code, 1, .{ .base = .{ .stack = 0 }, .disp = -v.array.stack });
+                    }
+                    // RDX: data_ptr
+                    try code.append(0x48); try code.append(0xBA);
+                    var ptr_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &ptr_bytes, v.data_ptr, .little);
+                    try code.appendSlice(&ptr_bytes);
+                    // R8: data_len
+                    try code.append(0x49); try code.append(0xB8);
+                    var len_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &len_bytes, v.data_len, .little);
+                    try code.appendSlice(&len_bytes);
+                    // R9: elem_width
+                    try code.append(0x49); try code.append(0xB9);
+                    var wid_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &wid_bytes, v.elem_width, .little);
+                    try code.appendSlice(&wid_bytes);
+
+                    try code.append(0x48); try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcFillArrayData), .little);
+                    try code.appendSlice(&fn_bytes);
+                    try code.append(0xFF); try code.append(0xD0);
+                },
+                .filled_new_array => |v| {
+                    var elem_size: usize = 4;
+                    if (dex != null and v.type_idx < dex.?.type_names.len) {
+                        const tname = dex.?.type_names[v.type_idx];
+                        if (tname.len > 1) {
+                            elem_size = switch (tname[1]) {
+                                'J', 'D' => 8,
+                                'I', 'F' => 4,
+                                'S', 'C' => 2,
+                                'B', 'Z' => 1,
+                                'L', '[' => 8,
+                                else => 8,
+                            };
+                        }
+                    }
+                    var active_args: u32 = 0;
+                    for (v.args) |a| if (a != null) { active_args += 1; };
+
+                    // RCX: size
+                    try code.append(0x48); try code.append(0xB9);
+                    var sz_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &sz_bytes, active_args, .little);
+                    try code.appendSlice(&sz_bytes);
+
+                    // RDX: elem_size
+                    try code.append(0x48); try code.append(0xBA);
+                    var esz_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &esz_bytes, elem_size, .little);
+                    try code.appendSlice(&esz_bytes);
+
+                    try code.append(0x48); try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcAllocArray), .little);
+                    try code.appendSlice(&fn_bytes);
+                    try code.append(0xFF); try code.append(0xD0);
+
+                    // Move RAX to dest (array ref)
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        if (d != 0) {
+                            try code.append(makeRex(true, 0, d));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                        }
+                    } else if (v.dest == .stack) {
+                        try code.append(makeRex(true, 0, 5));
+                        try code.append(0x89);
+                        try emitMemModRM(&code, 0, .{ .base = .{ .stack = 0 }, .disp = -v.dest.stack });
+                    }
+
+                    // For each arg, MOV it into [RAX + 16 + i*elem_size]
+                    // Wait, RAX is the array ptr. If we overwrote RAX, we can't use it!
+                    // Let's store RAX to R11.
+                    try code.append(0x49); try code.append(0x89); try code.append(0xC3); // MOV R11, RAX
+
+                    for (v.args, 0..) |arg, i| {
+                        if (arg) |a| {
+                            const offset = @as(i32, @intCast(16 + i * elem_size));
+                            // MOV R10, arg
+                            if (a == .reg) {
+                                const s = regCode(a.reg);
+                                try code.append(makeRex(true, s, 2)); // R10 is 2 in high bits
+                                try code.append(0x89);
+                                try code.append(makeModRM(0b11, 2, @as(u3, @truncate(s))));
+                            } else if (a == .stack) {
+                                try code.append(makeRex(true, 2, 5));
+                                try code.append(0x8B);
+                                try emitMemModRM(&code, 2, .{ .base = .{ .stack = 0 }, .disp = -a.stack });
+                            }
+                            // MOV [R11 + offset], R10
+                            try code.append(makeRexSib(true, 2, 3, 0)); // R10 = 2, R11 = 3
+                            try code.append(0x89);
+                            try emitMemModRM(&code, 2, .{ .base = .{ .reg = .r11 }, .disp = offset });
+                        }
+                    }
+                },
+                .field_load => |v| {
+                    // Helper closure: write dest from r10 (scratch)
+                    if (v.obj) |obj_op| {
+                        var offset: i32 = 16;
+                        if (registry != null and dex != null) {
+                            const fi = dex.?.field_items[v.field_idx];
+                            if (registry.?.get(fi.class_name)) |cd| {
+                                if (cd.fieldOffset(fi.field_name)) |off| {
+                                    offset = 16 + @as(i32, @intCast(off));
+                                }
+                            }
+                        }
+                        // Load from [obj_op + offset] into r10 first
+                        const b = regCode(obj_op.reg);
+                        // MOV r10, [obj + offset]  (r10 = 10)
+                        try code.append(makeRexSib(true, 10, b, 0));
+                        try code.append(0x8B);
+                        try emitMemModRM(&code, 2, .{ .base = .{ .reg = obj_op.reg }, .disp = offset }); // r10 low3 = 2
+                        // Write r10 to dest
+                        if (v.dest == .reg) {
+                            const d = regCode(v.dest.reg);
+                            if (d != 10) {
+                                try code.append(makeRex(true, 10, d));
+                                try code.append(0x89);
+                                try code.append(makeModRM(0b11, 2, @as(u3, @truncate(d))));
+                            }
+                        } else if (v.dest == .stack) {
+                            const off2 = v.dest.stack;
+                            // MOV [rbp - off2], r10
+                            try code.append(0x4C); // REX.W + REX.R(r10)
+                            try code.append(0x89);
+                            if (off2 >= -128 and off2 <= 127) {
+                                try code.append(makeModRM(0b01, 2, 5));
+                                try code.append(@as(u8, @bitCast(@as(i8, @truncate(-off2)))));
+                            } else {
+                                try code.append(makeModRM(0b10, 2, 5));
+                                var bytes: [4]u8 = undefined;
+                                std.mem.writeInt(i32, &bytes, -off2, .little);
+                                try code.appendSlice(&bytes);
+                            }
+                        }
+                    } else {
+                        // Static field load
+                        var static_ptr: usize = 0;
+                        if (registry != null and dex != null) {
+                            const fi = dex.?.field_items[v.field_idx];
+                            if (registry.?.get(fi.class_name)) |cd| {
+                                for (cd.static_fields, 0..) |f, i| {
+                                    if (std.mem.eql(u8, f.name, fi.field_name)) {
+                                        static_ptr = @intFromPtr(&cd.static_values[i]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // MOV R11, static_ptr (imm64)
+                        try code.appendSlice(&[_]u8{ 0x49, 0xBB });
+                        var ptr_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &ptr_bytes, static_ptr, .little);
+                        try code.appendSlice(&ptr_bytes);
+                        // MOV r10, [R11]
+                        try code.appendSlice(&[_]u8{ 0x4D, 0x8B, 0x13 }); // REX.W+R+B, MOV r10,[r11] mod=00,r10=2,r11=3
+                        // Write r10 to dest
+                        if (v.dest == .reg) {
+                            const d = regCode(v.dest.reg);
+                            if (d != 10) {
+                                try code.append(makeRex(true, 10, d));
+                                try code.append(0x89);
+                                try code.append(makeModRM(0b11, 2, @as(u3, @truncate(d))));
+                            }
+                        } else if (v.dest == .stack) {
+                            const off2 = v.dest.stack;
+                            try code.append(0x4C);
+                            try code.append(0x89);
+                            if (off2 >= -128 and off2 <= 127) {
+                                try code.append(makeModRM(0b01, 2, 5));
+                                try code.append(@as(u8, @bitCast(@as(i8, @truncate(-off2)))));
+                            } else {
+                                try code.append(makeModRM(0b10, 2, 5));
+                                var bytes: [4]u8 = undefined;
+                                std.mem.writeInt(i32, &bytes, -off2, .little);
+                                try code.appendSlice(&bytes);
+                            }
+                        }
+                    }
+                },
+                .field_store => |v| {
+                    // Load src into r10 first
+                    if (v.src == .reg) {
+                        const s = regCode(v.src.reg);
+                        if (s != 10) {
+                            try code.append(makeRex(true, s, 10));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 2)); // r10 low3 = 2
+                        }
+                    } else if (v.src == .stack) {
+                        const off2 = v.src.stack;
+                        try code.append(0x4C);
+                        try code.append(0x8B);
+                        if (off2 >= -128 and off2 <= 127) {
+                            try code.append(makeModRM(0b01, 2, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-off2)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 2, 5));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, -off2, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                    }
+                    if (v.obj) |obj_op| {
+                        var offset: i32 = 16;
+                        if (registry != null and dex != null) {
+                            const fi = dex.?.field_items[v.field_idx];
+                            if (registry.?.get(fi.class_name)) |cd| {
+                                if (cd.fieldOffset(fi.field_name)) |off| {
+                                    offset = 16 + @as(i32, @intCast(off));
+                                }
+                            }
+                        }
+                        // MOV [obj + offset], r10
+                        const b = regCode(obj_op.reg);
+                        try code.append(makeRexSib(true, 10, b, 0));
+                        try code.append(0x89);
+                        try emitMemModRM(&code, 2, .{ .base = .{ .reg = obj_op.reg }, .disp = offset });
+                    } else {
+                        // Static field store
+                        var static_ptr: usize = 0;
+                        if (registry != null and dex != null) {
+                            const fi = dex.?.field_items[v.field_idx];
+                            if (registry.?.get(fi.class_name)) |cd| {
+                                for (cd.static_fields, 0..) |f, i| {
+                                    if (std.mem.eql(u8, f.name, fi.field_name)) {
+                                        static_ptr = @intFromPtr(&cd.static_values[i]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // MOV R11, static_ptr (imm64)
+                        try code.appendSlice(&[_]u8{ 0x49, 0xBB });
+                        var ptr_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &ptr_bytes, static_ptr, .little);
+                        try code.appendSlice(&ptr_bytes);
+                        // MOV [R11], r10  (r10=2, r11=3, REX.W+R+B)
+                        try code.appendSlice(&[_]u8{ 0x4D, 0x89, 0x13 });
+                    }
+                },
+                else => {
+                    std.debug.print("Unsupported instruction: {s}\n", .{@tagName(inst)});
+                    return EmitterError.UnsupportedInstruction;
+                }
             }
         }
     }
 
+    // Trampoline removed for Asymmetric Dekker safepoints
     // Pass 2: Patch relative jump targets.
     for (relocations.items) |reloc| {
         const target_offset = block_offsets.get(reloc.target_block_id) orelse {
@@ -1498,14 +2337,41 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
         std.mem.writeInt(i32, &bytes, rel32, .little);
         
         for (bytes, 0..) |b, i| {
-            code.items[reloc.patch_offset + i] = b;
+            code.buf.items[reloc.patch_offset + i] = b;
         }
+    }
+
+    // Serialize GcMapTable at the end of the code buffer
+    if (dex != null) {
+        var gc_map_offset: u32 = 0;
+        if (local_gc_builder.entries.items.len > 0) {
+            const start_pos = code.items.len;
+            const aligned_start = std.mem.alignForward(usize, start_pos, @alignOf(@import("gc_map").GcEntry));
+            const padding = aligned_start - start_pos;
+            var i: usize = 0;
+            while (i < padding) : (i += 1) {
+                try code.append(0);
+            }
+            
+            gc_map_offset = @intCast(code.items.len);
+            const size = local_gc_builder.serializedSize();
+            const old_len = code.items.len;
+            try code.buf.resize(allocator, old_len + size);
+            code.updateItems();
+            
+            _ = local_gc_builder.serialize(code.items[old_len .. old_len + size]);
+        }
+
+        // Append gc_map_offset u32 at the very end
+        var offset_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &offset_bytes, gc_map_offset, .little);
+        try code.appendSlice(&offset_bytes);
     }
 
     return code.toOwnedSlice();
 }
 
-// ── Unit Tests ──────────────────────────────────────────────────────────────
+// â”€â”€ Unit Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 test "emitter: basic arithmetic and moves to machine bytes" {
     const a = std.testing.allocator;
@@ -1530,7 +2396,7 @@ test "emitter: basic arithmetic and moves to machine bytes" {
 
     try prog.blocks.append(a, mblock);
 
-    const bytes = try emitProgram(a, &prog);
+    const bytes = try emitProgram(a, &prog, null, null);
     defer a.free(bytes);
 
     // Expected machine bytes:
@@ -1573,7 +2439,7 @@ test "emitter: callee-saved registers and register-8 immediate load encoding" {
 
     try prog.blocks.append(a, mblock);
 
-    const bytes = try emitProgram(a, &prog);
+    const bytes = try emitProgram(a, &prog, null, null);
     defer a.free(bytes);
 
     // Expected:
@@ -1622,7 +2488,7 @@ test "emitter: new ops (not, movsxd, shl, cmp3)" {
 
     try prog.blocks.append(a, mblock);
 
-    const bytes = try emitProgram(a, &prog);
+    const bytes = try emitProgram(a, &prog, null, null);
     defer a.free(bytes);
 
     try std.testing.expect(bytes.len > 0);

@@ -500,6 +500,27 @@ pub const CFG = struct {
                     renameUse(stacks, &v.size);
                     try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
                 },
+                .array_length => |*v| {
+                    renameUse(stacks, &v.array);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+                .instance_of => |*v| {
+                    renameUse(stacks, &v.obj);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+                .filled_new_array => |*v| {
+                    for (&v.args) |*arg| {
+                        if (arg.*) |*a| renameUse(stacks, a);
+                    }
+                    if (v.dest) |*d| try renameDef(self.allocator, counters, stacks, d, &defs);
+                },
+                .fill_array_data => |*v| {
+                    renameUse(stacks, &v.array);
+                },
+                .move_exception => |*v| {
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
 
                 // Memory Access
                 .iget => |*v| {

@@ -68,12 +68,15 @@ pub fn translateCFG(
                         if (last_inst.* == .invoke) {
                             last_inst.invoke.dest = ssa(v.dest);
                             break :blk null;
+                        } else if (last_inst.* == .filled_new_array) {
+                            last_inst.filled_new_array.dest = ssa(v.dest);
+                            break :blk null;
                         }
                     }
                     break :blk .{ .move = .{ .dest = ssa(v.dest), .src = ssa(0) } };
                 },
                 // Exception objects require runtime exception-dispatch support.
-                .move_exception => return error.UnimplementedOpcode,
+                .move_exception => |v| .{ .move_exception = .{ .dest = ssa(v.dest) } },
 
                 // --- Returns ---
                 .return_void => .{ .ret = .{ .src = null } },
@@ -97,17 +100,27 @@ pub fn translateCFG(
                 // check_cast is speculatively treated as always succeeding (no runtime
                 // type system yet). It does not alter the value, so a self-move is safe.
                 .check_cast => |v| .{ .move = .{ .dest = ssa(v.src), .src = ssa(v.src) } },
-                // instance_of needs runtime class hierarchy info; a constant would
-                // silently produce wrong results.
-                .instance_of => return error.UnimplementedOpcode,
+                // instance_of needs runtime class hierarchy info.
+                .instance_of => |v| .{ .instance_of = .{ .dest = ssa(v.dest), .obj = ssa(v.src), .type_idx = v.type_idx } },
 
                 // --- Allocation & Arrays ---
                 // array_length needs the runtime array object layout.
-                .array_length => return error.UnimplementedOpcode,
+                .array_length => |v| .{ .array_length = .{ .dest = ssa(v.dest), .array = ssa(v.array) } },
                 .new_instance => |v| .{ .new_instance = .{ .dest = ssa(v.dest), .type_idx = v.type_idx } },
                 .new_array => |v| .{ .new_array = .{ .dest = ssa(v.dest), .size = ssa(v.size), .type_idx = v.type_idx } },
-                .filled_new_array => return error.UnimplementedOpcode,
-                .fill_array_data => return error.UnimplementedOpcode,
+                .filled_new_array => |v| blk: {
+                    var args: [5]?ir.SSAVar = .{ null, null, null, null, null };
+                    for (v.args, 0..) |arg, i| {
+                        if (i < 5) args[i] = ssa(arg);
+                    }
+                    break :blk .{ .filled_new_array = .{ .dest = null, .type_idx = v.type_idx, .args = args } };
+                },
+                .fill_array_data => |v| .{ .fill_array_data = .{ 
+                    .array = ssa(v.array), 
+                    .data_ptr = @intFromPtr(v.data.ptr), 
+                    .data_len = @intCast(v.data.len), 
+                    .elem_width = 8 // parser extracts as i64
+                } },
 
                 // --- Exceptions ---
                 .throw_ => |v| .{ .throw_op = .{ .src = ssa(v.src) } },
@@ -183,7 +196,7 @@ pub fn translateCFG(
                     break :blk .{
                         .invoke = .{
                             .dest = null,
-                            .method_idx = 0,
+                            .method_idx = v.method_idx,
                             .is_static = (v.kind == .static),
                             .args = ir_args,
                             .is_self_call = v.is_self_call,
@@ -406,26 +419,8 @@ test "translateCFG: checks, casts, allocations, and exceptions" {
     try std.testing.expect(insts[3] == .throw_op);
 }
 
-test "translateCFG: runtime-dependent opcodes are rejected, not miscompiled" {
-    const a = std.testing.allocator;
-
-    // Each of these opcodes needs runtime support (object model, exception
-    // dispatch). Translating them to anything else silently produces wrong
-    // values, so translateCFG must reject the whole method instead.
-    const rejected = [_][]const instmod.Instruction{
-        &.{ .{ .instance_of = .{ .type_idx = 2, .dest = 3, .src = 4 } }, .return_void },
-        &.{ .{ .array_length = .{ .dest = 5, .array = 6 } }, .return_void },
-        &.{ .{ .filled_new_array = .{ .args = &.{}, .type_idx = 5 } }, .return_void },
-        &.{ .{ .fill_array_data = .{ .payload_offset = 0, .array = 10 } }, .return_void },
-        &.{ .{ .move_exception = .{ .dest = 4 } }, .return_void },
-    };
-
-    for (rejected) |insns| {
-        var cfg = try cfgmod.buildCFG(a, insns);
-        defer cfg.deinit();
-        try std.testing.expectError(error.UnimplementedOpcode, translateCFG(a, &cfg, insns));
-    }
-}
+// Removed "translateCFG: runtime-dependent opcodes are rejected, not miscompiled"
+// as they are now implemented!
 
 test "translateCFG: switches and comparisons" {
     const a = std.testing.allocator;

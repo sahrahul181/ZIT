@@ -489,6 +489,38 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                 .new_array => |v| {
                     try mi.append(allocator, .{ .alloc_arr = .{ .dest = opReg(v.dest), .size = opReg(v.size), .type_idx = v.type_idx } });
                 },
+                .instance_of => |v| {
+                    try mi.append(allocator, .{ .instance_of = .{ .dest = opReg(v.dest), .obj = opReg(v.obj), .type_idx = v.type_idx } });
+                },
+                .filled_new_array => |v| {
+                    if (v.dest) |d| {
+                        var margs: [5]?x86.Operand = .{ null, null, null, null, null };
+                        for (v.args, 0..) |a, i| {
+                            if (a) |arg| margs[i] = opReg(arg);
+                        }
+                        try mi.append(allocator, .{ .filled_new_array = .{ .dest = opReg(d), .type_idx = v.type_idx, .args = margs } });
+                    }
+                },
+                .fill_array_data => |v| {
+                    try mi.append(allocator, .{ .fill_array_data = .{ 
+                        .array = opReg(v.array), 
+                        .data_ptr = v.data_ptr, 
+                        .data_len = v.data_len, 
+                        .elem_width = v.elem_width 
+                    } });
+                },
+                .move_exception => |v| {
+                    try mi.append(allocator, .{ .move_exception = .{ .dest = opReg(v.dest) } });
+                },
+                .array_length => |v| {
+                    const mem_op = x86.Operand{ .mem = .{
+                        .base = .{ .vreg = v.array },
+                        .index = null,
+                        .scale = 1,
+                        .disp = 16,
+                    } };
+                    try mi.append(allocator, .{ .movsxd = .{ .dest = opReg(v.dest), .src = mem_op } });
+                },
 
                 // ── Field Access ──────────────────────────────────────────
                 .iget => |v| {

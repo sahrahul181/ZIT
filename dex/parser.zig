@@ -45,6 +45,7 @@ pub const DexClass = struct {
     name: []const u8,
     super_class_idx: u32,
     methods: std.ArrayList(DexMethod),
+    static_field_indices: std.ArrayList(u32),
     kotlin_metadata: ?KotlinMetadata = null,
 };
 
@@ -414,7 +415,14 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !DexFile {
         const direct_methods_size = readUleb128(bytes, &cursor);
         const virtual_methods_size = readUleb128(bytes, &cursor);
 
-        for (0..static_fields_size + instance_fields_size) |_| {
+        var static_field_indices = try std.ArrayList(u32).initCapacity(arena, static_fields_size);
+        var fidx: u32 = 0;
+        for (0..static_fields_size) |_| {
+            fidx += readUleb128(bytes, &cursor);
+            _ = readUleb128(bytes, &cursor); // access_flags
+            static_field_indices.appendAssumeCapacity(fidx);
+        }
+        for (0..instance_fields_size) |_| {
             _ = readUleb128(bytes, &cursor);
             _ = readUleb128(bytes, &cursor);
         }
@@ -458,6 +466,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !DexFile {
             .name = stripTypePrefix(class_name_raw),
             .super_class_idx = super_class_idx,
             .methods = methods,
+            .static_field_indices = static_field_indices,
             .kotlin_metadata = kotlin_meta,
         });
     }
@@ -986,6 +995,7 @@ fn decodeBytecode(
                     .method_name = info.method_name,
                     .signature = info.signature,
                     .args = args,
+                    .method_idx = @intCast(method_idx),
                     .is_self_call = false,
                     .call_target = null,
                     .native_target = null,
@@ -1020,6 +1030,7 @@ fn decodeBytecode(
                     .method_name = info.method_name,
                     .signature = info.signature,
                     .args = args,
+                    .method_idx = @intCast(method_idx),
                     .is_self_call = false,
                     .call_target = null,
                     .native_target = null,

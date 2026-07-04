@@ -5,8 +5,14 @@ pub const SpinLock = struct {
     locked: bool = false,
 
     pub fn lock(self: *SpinLock) void {
+        var backoff: u32 = 0;
         while (@cmpxchgWeak(bool, &self.locked, false, true, .acquire, .monotonic) != null) {
-            std.Thread.yield() catch {};
+            std.atomic.spinLoopHint();
+            backoff += 1;
+            if (backoff > 1000) {
+                std.Thread.yield() catch {};
+                backoff = 0;
+            }
         }
     }
 
@@ -31,82 +37,80 @@ pub const ClassMetadata = struct {
     vtable: []const usize,
 };
 
-// ── Cheney Semi-Space Copying GC ────────────────────────────────────────────
-pub const GC = struct {
-    space_size: usize,
-    from_space: []u8,
-    to_space: []u8,
-    bump_ptr: usize,
-    allocator: std.mem.Allocator,
+const layout = @import("gc").immix.layout;
+pub const sync = @import("sync");
+pub const thread = @import("thread");
+pub const chase_lev = @import("chase_lev");
+pub const MutatorAllocator = @import("gc").immix.allocator.MutatorAllocator;
+const Block = layout.Block;
 
-    pub fn init(allocator: std.mem.Allocator, space_size: usize) !GC {
-        const from = try allocator.alloc(u8, space_size);
-        const to = try allocator.alloc(u8, space_size);
-        return GC{
-            .space_size = space_size,
-            .from_space = from,
-            .to_space = to,
-            .bump_ptr = @intFromPtr(from.ptr),
+pub const ImmixGC = struct {
+    allocator: std.mem.Allocator,
+    // Note: A true production GC manages OS mmap pages globally.
+    // For now, we will simulate a global pool by tracking active blocks.
+    
+    pub fn init(allocator: std.mem.Allocator) !ImmixGC {
+        return .{
             .allocator = allocator,
         };
     }
-
-    pub fn deinit(self: *GC) void {
-        self.allocator.free(self.from_space);
-        self.allocator.free(self.to_space);
+    
+    pub fn deinit(self: *ImmixGC) void {
+        _ = self;
     }
-
-    pub fn alloc(self: *GC, class_ptr: usize, size: usize) !*anyopaque {
-        const aligned_size = std.mem.alignForward(usize, size, 8);
-        const total_size = aligned_size + @sizeOf(ObjectHeader);
-
-        const limit = @intFromPtr(self.from_space.ptr) + self.space_size;
-        if (self.bump_ptr + total_size > limit) {
-            try self.collect();
-            if (self.bump_ptr + total_size > limit) {
-                return error.OutOfMemory;
-            }
-        }
-
-        const ptr = @as(*ObjectHeader, @ptrFromInt(self.bump_ptr));
-        self.bump_ptr += total_size;
-
-        ptr.class_ptr = class_ptr;
-        ptr.monitor = 0;
-
-        const obj_ptr = @intFromPtr(ptr) + @sizeOf(ObjectHeader);
-        @memset(@as([*]u8, @ptrFromInt(obj_ptr))[0..aligned_size], 0);
-
-        return @ptrFromInt(obj_ptr);
-    }
-
-    pub fn collect(self: *GC) !void {
-        // Swap spaces
-        const temp = self.from_space;
-        self.from_space = self.to_space;
-        self.to_space = temp;
-
-        const to_start = @intFromPtr(self.from_space.ptr);
-        self.bump_ptr = to_start;
+    
+    pub fn requestBlock(self: *ImmixGC) !*Block {
+        // Allocate a new block from the OS (via Zig allocator)
+        const mem = try self.allocator.alloc(u8, layout.BLOCK_SIZE);
+        const block = @as(*Block, @ptrCast(@alignCast(mem.ptr)));
+        block.* = Block.init();
+        return block;
     }
 };
 
-// Global GC instance
-pub var global_gc: ?GC = null;
+// Global Immix Coordinator
+pub var global_gc: ?ImmixGC = null;
+pub var global_io: std.Io = undefined;
 
 pub fn initRuntime(allocator: std.mem.Allocator, gc_size: usize) !void {
-    global_gc = try GC.init(allocator, gc_size);
-    try global_pool.init(allocator, 4); // Initialize with 4 worker threads
+    _ = gc_size; // Not used in dynamic Immix yet
+    global_gc = try ImmixGC.init(allocator);
+    try thread.initThreadSubsystem(allocator);
 }
 
 pub fn deinitRuntime() void {
     if (global_gc) |*gc| gc.deinit();
-    global_pool.deinit();
+    thread.deinitThreadSubsystem();
 }
 
 pub fn gcAlloc(class_ptr: usize, size: usize) callconv(.c) *anyopaque {
+    const current_thread = thread.getCurrent() orelse @panic("gcAlloc called without thread context");
+    
     if (global_gc) |*gc| {
-        return gc.alloc(class_ptr, size) catch @panic("GC Allocation OOM");
+        // Total size = ObjectHeader (16) + aligned instance size
+        const aligned_size = std.mem.alignForward(usize, size, 8);
+        const total_size = aligned_size + 16;
+        
+        var ptr = current_thread.tls.allocator.alloc(total_size);
+        if (ptr == null) {
+            // TLAB exhausted, request a new block from the global coordinator
+            const new_block = gc.requestBlock() catch @panic("OOM: Failed to allocate Immix Block");
+            current_thread.tls.allocator.setBlock(new_block);
+            ptr = current_thread.tls.allocator.alloc(total_size);
+            if (ptr == null) @panic("Object too large for Immix block");
+        }
+        
+        // Initialize header
+        const obj_ptr_int = @intFromPtr(ptr.?);
+        const hdr = @as(*ObjectHeader, @ptrFromInt(obj_ptr_int));
+        hdr.class_ptr = class_ptr;
+        hdr.monitor = 0;
+        
+        // Zero body
+        const obj_ptr = obj_ptr_int + 16;
+        @memset(@as([*]u8, @ptrFromInt(obj_ptr))[0..aligned_size], 0);
+        
+        return @ptrFromInt(obj_ptr);
     }
     @panic("Runtime not initialized");
 }
@@ -159,108 +163,52 @@ pub fn memoryBarrier() callconv(.c) void {
     asm volatile ("mfence");
 }
 
-// ── Work-Stealing Parallelism Thread Pool ────────────────────────────────────
-pub const Task = struct {
-    run: *const fn (?*anyopaque) callconv(.c) void,
-    arg: ?*anyopaque,
-};
-
-pub const Worker = struct {
-    thread: std.Thread,
-    queue: std.ArrayList(Task),
-    mutex: SpinLock,
-    pool: *ThreadPool,
-    id: usize,
-
-    pub fn init(pool: *ThreadPool, id: usize, allocator: std.mem.Allocator) !*Worker {
-        const w = try allocator.create(Worker);
-        w.* = .{
-            .thread = undefined,
-            .queue = std.ArrayList(Task).empty,
-            .mutex = .{},
-            .pool = pool,
-            .id = id,
-        };
-        return w;
-    }
-
-    pub fn start(self: *Worker) !void {
-        self.thread = try std.Thread.spawn(.{}, workerRun, .{self});
-    }
-
-    pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
-        self.queue.deinit(allocator);
-        allocator.destroy(self);
-    }
-};
-
-pub const ThreadPool = struct {
-    workers: []*Worker,
-    allocator: std.mem.Allocator,
-    running: bool,
-    mutex: SpinLock,
-
-    pub fn init(self: *ThreadPool, allocator: std.mem.Allocator, num_workers: usize) !void {
-        self.allocator = allocator;
-        self.running = true;
-        self.workers = try allocator.alloc(*Worker, num_workers);
-        for (0..num_workers) |i| {
-            self.workers[i] = try Worker.init(self, i, allocator);
-        }
-        for (0..num_workers) |i| {
-            try self.workers[i].start();
-        }
-    }
-
-    pub fn deinit(self: *ThreadPool) void {
-        self.running = false;
-        for (self.workers) |w| {
-            w.thread.join();
-            w.deinit(self.allocator);
-        }
-        self.allocator.free(self.workers);
-    }
-
-    pub fn submit(self: *ThreadPool, task: Task) !void {
-        const w = self.workers[0];
-        w.mutex.lock();
-        defer w.mutex.unlock();
-        try w.queue.append(self.allocator, task);
-    }
-};
-
-fn workerRun(worker: *Worker) void {
-    const pool = worker.pool;
-    while (pool.running) {
-        var task: ?Task = null;
-
-        worker.mutex.lock();
-        if (worker.queue.items.len > 0) {
-            task = worker.queue.items[worker.queue.items.len - 1];
-            worker.queue.items.len -= 1;
-        }
-        worker.mutex.unlock();
-
-        if (task == null) {
-            for (pool.workers) |other| {
-                if (other.id == worker.id) continue;
-                if (other.mutex.tryLock()) {
-                    if (other.queue.items.len > 0) {
-                        task = other.queue.items[other.queue.items.len - 1];
-                        other.queue.items.len -= 1;
-                    }
-                    other.mutex.unlock();
-                }
-                if (task != null) break;
-            }
-        }
-
-        if (task) |t| {
-            t.run(t.arg);
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
+/// JIT helper: allocate an array of `count` elements with the given element size
+/// (elem_size: 1=byte/bool, 2=short/char, 4=int/float, 8=long/double/ref).
+/// Returns pointer to the array body (first field is i32 length).
+pub fn gcAllocArray(count: i64, elem_size: usize) callconv(.c) usize {
+    if (count < 0) return 0;
+    const byte_count = @as(usize, @intCast(count)) * elem_size + 8; // 4-byte len + 4 pad
+    const raw = gcAlloc(0, byte_count);
+    const ptr = @intFromPtr(raw);
+    @as(*i32, @ptrFromInt(ptr)).* = @intCast(count);
+    return ptr;
 }
 
-pub var global_pool: ThreadPool = undefined;
+/// JIT helper: allocate an instance of the given class (size in bytes, excl header).
+pub fn gcAllocObj(class_ptr: usize, size: usize) callconv(.c) usize {
+    const raw = gcAlloc(class_ptr, size);
+    return @intFromPtr(raw);
+}
+
+/// JIT helper: check if object is instance of class. (Currently minimal check)
+pub fn gcInstanceOf(obj_ptr: usize, type_idx: u32) callconv(.c) i32 {
+    if (obj_ptr == 0) return 0;
+    _ = type_idx;
+    // For a real implementation, we would look up type_idx in native.global_dex
+    // and compare it to the class_ptr of the object.
+    // For now, return 1 to mimic interpreter behavior.
+    return 1;
+}
+
+/// JIT helper: fill array with data payload.
+pub fn gcFillArrayData(array_ptr: usize, data_ptr: usize, elements: u32, width: u32) callconv(.c) void {
+    if (array_ptr == 0 or data_ptr == 0) return;
+    const array_body = @as([*]u8, @ptrFromInt(array_ptr));
+    // Array body starts with 4-byte length. Elements start at offset 8 (after 4 bytes padding).
+    const dest = array_body[8..];
+    const src = @as([*]const u8, @ptrFromInt(data_ptr))[0 .. elements * width];
+    @memcpy(dest[0..src.len], src);
+}
+
+/// JIT helper: move exception from TLS
+pub fn gcGetAndClearException() callconv(.c) usize {
+    const th = thread.current_thread;
+    if (th) |t| {
+        const ex = t.tls.exception;
+        t.tls.exception = 0;
+        return ex;
+    }
+    return 0;
+}
+

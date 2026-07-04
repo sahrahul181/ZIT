@@ -66,6 +66,7 @@ pub const Invoke = struct {
     method_name: []const u8,
     signature: []const u8,
     args: []const u16,
+    method_idx: u32 = 0,
 
     /// Set by `jit/program.zig`'s `resolveInvokeTargets`. Index into the
     /// program's shared method list.

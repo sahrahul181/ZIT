@@ -1,6 +1,11 @@
 const std = @import("std");
 const ir = @import("ir");
 
+pub const GcCallSiteInfo = struct {
+    stack_refs: u64 = 0,
+    reg_refs: u32 = 0,
+};
+
 pub const PhysicalReg = enum {
     rax, rcx, rdx, rbx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15,
     xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15,
@@ -161,11 +166,17 @@ pub const Inst = union(enum) {
         is_static:  bool,
         arg_count:  usize,
         is_self_call: bool = false,
+        gc_info: ?GcCallSiteInfo = null,
     },
+
 
     // ---- Allocation stubs ----
     alloc_obj: struct { dest: Operand, type_idx: u32 },
     alloc_arr: struct { dest: Operand, size: Operand, type_idx: u32 },
+    filled_new_array: struct { dest: Operand, type_idx: u32, args: [5]?Operand },
+    instance_of: struct { dest: Operand, obj: Operand, type_idx: u32 },
+    fill_array_data: struct { array: Operand, data_ptr: usize, data_len: u32, elem_width: u32 },
+    move_exception: struct { dest: Operand },
 
     // ---- Field access stubs ----
     field_load:  struct { dest: Operand, obj: ?Operand, field_idx: u32 },
@@ -256,6 +267,10 @@ pub const Inst = union(enum) {
             },
             .alloc_obj  => |v| { try v.dest.format(writer); try writer.print(" = NEW type[{d}]", .{v.type_idx}); },
             .alloc_arr  => |v| { try v.dest.format(writer); try writer.writeAll(" = NEWARR["); try v.size.format(writer); try writer.print("] type[{d}]", .{v.type_idx}); },
+            .filled_new_array => |v| { try v.dest.format(writer); try writer.print(" = FILLED_NEWARR type[{d}]", .{v.type_idx}); },
+            .instance_of => |v| { try v.dest.format(writer); try writer.writeAll(" = INSTANCEOF "); try v.obj.format(writer); try writer.print(" type[{d}]", .{v.type_idx}); },
+            .fill_array_data => |v| { try writer.writeAll("FILL_ARRAY_DATA "); try v.array.format(writer); try writer.print(" ptr=0x{x} len={d} width={d}", .{v.data_ptr, v.data_len, v.elem_width}); },
+            .move_exception => |v| { try v.dest.format(writer); try writer.writeAll(" = MOVE_EXCEPTION"); },
             .field_load  => |v| {
                 try v.dest.format(writer); try writer.print(" = FLOAD field[{d}]", .{v.field_idx});
                 if (v.obj) |o| { try writer.writeAll(" obj="); try o.format(writer); }

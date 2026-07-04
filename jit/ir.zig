@@ -159,6 +159,12 @@ pub const IRInst = union(enum) {
     // Object & Array Allocation
     new_instance: struct { dest: SSAVar, type_idx: u32 },
     new_array: struct { dest: SSAVar, size: SSAVar, type_idx: u32 },
+    array_length: struct { dest: SSAVar, array: SSAVar },
+    instance_of: struct { dest: SSAVar, obj: SSAVar, type_idx: u32 },
+    filled_new_array: struct { dest: ?SSAVar, type_idx: u32, args: [5]?SSAVar },
+    fill_array_data: struct { array: SSAVar, data_ptr: usize, data_len: u32, elem_width: u32 },
+    move_exception: struct { dest: SSAVar },
+
 
     // Memory Access
     iget: FieldAccess,
@@ -270,8 +276,25 @@ pub const IRInst = union(enum) {
             .div_wide => |v| try writer.print("{f} = div-wide {f}, {f}", .{ v.dest, v.left, v.right }),
             .rem_wide => |v| try writer.print("{f} = rem-wide {f}, {f}", .{ v.dest, v.left, v.right }),
 
-            .new_instance => |v| try writer.print("{f} = new-instance @{d}", .{ v.dest, v.type_idx }),
-            .new_array => |v| try writer.print("{f} = new-array {f}, @{d}", .{ v.dest, v.size, v.type_idx }),
+            .new_instance => |v| try writer.print("{f} = new-instance type@{d}", .{ v.dest, v.type_idx }),
+            .new_array => |v| try writer.print("{f} = new-array {f}, type@{d}", .{ v.dest, v.size, v.type_idx }),
+            .array_length => |v| try writer.print("{f} = array-length {f}", .{ v.dest, v.array }),
+            .instance_of => |v| try writer.print("{f} = instance-of {f}, type@{d}", .{ v.dest, v.obj, v.type_idx }),
+            .filled_new_array => |v| {
+                if (v.dest) |d| {
+                    try writer.print("{f} = ", .{d});
+                }
+                try writer.print("filled-new-array type@{d} {{ ", .{v.type_idx});
+                for (v.args) |arg| {
+                    if (arg) |a| {
+                        try writer.print("{f}, ", .{a});
+                    }
+                }
+                try writer.writeAll("}");
+            },
+            .fill_array_data => |v| try writer.print("fill-array-data {f}, data_ptr=0x{x}, len={d}", .{ v.array, v.data_ptr, v.data_len }),
+            .move_exception => |v| try writer.print("{f} = move-exception", .{ v.dest }),
+
 
             .iget => |v| try writer.print("{f} = iget {f}.@{d}", .{ v.dest_or_src, v.obj, v.field_idx }),
             .iput => |v| try writer.print("{f}.@{d} = iput {f}", .{ v.obj, v.field_idx, v.dest_or_src }),

@@ -2,6 +2,8 @@ const std = @import("std");
 const ir = @import("ir");
 const x86 = @import("x86");
 const cfgmod = @import("cfg");
+const parser = @import("parser");
+const runtime = @import("runtime");
 
 pub const RegClass = enum { gpr, xmm };
 
@@ -38,7 +40,39 @@ fn compareActive(context: void, a: *const LiveInterval, b: *const LiveInterval) 
     return a.end < b.end;
 }
 
-pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProgram, cfg_opt: ?*cfgmod.CFG, is_float_param: ?[]const bool, registers_size: u16, ins_size: u16) !void {
+fn regCode(reg: x86.PhysicalReg) u4 {
+    return switch (reg) {
+        .rax => 0,
+        .rcx => 1,
+        .rdx => 2,
+        .rbx => 3,
+        .rsi => 6,
+        .rdi => 7,
+        .r8 => 8,
+        .r9 => 9,
+        .r10 => 10,
+        .r11 => 11,
+        .r12 => 12,
+        .r13 => 13,
+        .r14 => 14,
+        .r15 => 15,
+        else => 0,
+    };
+}
+
+
+pub fn allocateRegisters(
+    allocator: std.mem.Allocator,
+    program: *x86.MachineProgram,
+    cfg_opt: ?*cfgmod.CFG,
+    is_float_param: ?[]const bool,
+    is_ref_param: ?[]const bool,
+    registers_size: u16,
+    ins_size: u16,
+    gc_map_builder: ?*@import("gc_map").GcMapBuilder,
+    dex: ?*const parser.DexFile,
+) !void {
+    _ = gc_map_builder;
     // 0. Prepend parameter mov instructions to the entry block to load parameters from RCX, RDX, R8, R9.
     if (ins_size > 0 and program.blocks.items.len > 0) {
         const first_block = &program.blocks.items[0];
@@ -76,6 +110,170 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     .dest = .{ .vreg = tmp_v },
                     .src = .{ .stack = -offset },
                 } });
+            }
+        }
+    }
+
+    // Type inference pass to identify reference variables
+    var reference_vars = std.AutoHashMap(ir.SSAVar, void).init(allocator);
+    defer reference_vars.deinit();
+
+    var var_types = std.AutoHashMap(ir.SSAVar, []const u8).init(allocator);
+    defer var_types.deinit();
+
+    if (cfg_opt) |cfg| {
+        if (is_ref_param) |ref_params| {
+            var i: usize = 0;
+            while (i < ins_size) : (i += 1) {
+                if (i < ref_params.len and ref_params[i]) {
+                    const param_reg = registers_size - ins_size + @as(u16, @intCast(i));
+                    const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
+                    try reference_vars.put(v, {});
+                    try var_types.put(v, "Ljava/lang/Object;");
+                }
+            }
+        }
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (cfg.blocks.items) |block| {
+                for (block.instructions.items) |inst| {
+                    switch (inst) {
+                        .new_instance => |v| {
+                            if (!reference_vars.contains(v.dest)) {
+                                try reference_vars.put(v.dest, {});
+                                if (dex) |d| {
+                                    if (v.type_idx < d.type_names.len) {
+                                        const type_name = d.type_names[v.type_idx];
+                                        const full_desc = try std.fmt.allocPrint(allocator, "L{s};", .{type_name});
+                                        try var_types.put(v.dest, full_desc);
+                                    }
+                                }
+                                changed = true;
+                            }
+                        },
+                        .new_array => |v| {
+                            if (!reference_vars.contains(v.dest)) {
+                                try reference_vars.put(v.dest, {});
+                                if (dex) |d| {
+                                    if (v.type_idx < d.type_names.len) {
+                                        const type_name = d.type_names[v.type_idx];
+                                        const full_desc = try std.fmt.allocPrint(allocator, "[L{s};", .{type_name});
+                                        try var_types.put(v.dest, full_desc);
+                                    }
+                                }
+                                changed = true;
+                            }
+                        },
+                        .const_string => |v| {
+                            if (!reference_vars.contains(v.dest)) {
+                                try reference_vars.put(v.dest, {});
+                                try var_types.put(v.dest, "Ljava/lang/String;");
+                                changed = true;
+                            }
+                        },
+                        .const_class => |v| {
+                            if (!reference_vars.contains(v.dest)) {
+                                try reference_vars.put(v.dest, {});
+                                try var_types.put(v.dest, "Ljava/lang/Class;");
+                                changed = true;
+                            }
+                        },
+                        .move => |v| {
+                            if (reference_vars.contains(v.src)) {
+                                if (!reference_vars.contains(v.dest)) {
+                                    try reference_vars.put(v.dest, {});
+                                    if (var_types.get(v.src)) |t| {
+                                        try var_types.put(v.dest, t);
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        },
+                        .phi => |v| {
+                            var any_ref = false;
+                            var ref_type: ?[]const u8 = null;
+                            for (v.args) |arg| {
+                                if (reference_vars.contains(arg.val)) {
+                                    any_ref = true;
+                                    if (var_types.get(arg.val)) |t| {
+                                        ref_type = t;
+                                    }
+                                }
+                            }
+                            if (any_ref and !reference_vars.contains(v.dest)) {
+                                try reference_vars.put(v.dest, {});
+                                if (ref_type) |t| {
+                                    try var_types.put(v.dest, t);
+                                }
+                                changed = true;
+                            }
+                        },
+                        .iget => |v| {
+                            if (dex) |d| {
+                                if (v.field_idx < d.field_items.len) {
+                                    const ftype = d.field_items[v.field_idx].type_name;
+                                    if (ftype.len > 0 and (ftype[0] == 'L' or ftype[0] == '[')) {
+                                        if (!reference_vars.contains(v.dest_or_src)) {
+                                            try reference_vars.put(v.dest_or_src, {});
+                                            try var_types.put(v.dest_or_src, ftype);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .sget => |v| {
+                            if (dex) |d| {
+                                if (v.field_idx < d.field_items.len) {
+                                    const ftype = d.field_items[v.field_idx].type_name;
+                                    if (ftype.len > 0 and (ftype[0] == 'L' or ftype[0] == '[')) {
+                                        if (!reference_vars.contains(v.dest_or_src)) {
+                                            try reference_vars.put(v.dest_or_src, {});
+                                            try var_types.put(v.dest_or_src, ftype);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .aget => |v| {
+                            if (var_types.get(v.array)) |arr_type| {
+                                if (arr_type.len > 1 and arr_type[0] == '[') {
+                                    const elem_type = arr_type[1..];
+                                    if (elem_type.len > 0 and (elem_type[0] == 'L' or elem_type[0] == '[')) {
+                                        if (!reference_vars.contains(v.dest_or_src)) {
+                                            try reference_vars.put(v.dest_or_src, {});
+                                            try var_types.put(v.dest_or_src, elem_type);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .invoke => |v| {
+                            if (v.dest) |dest| {
+                                if (dex) |d| {
+                                    if (v.method_idx < d.method_items.len) {
+                                        const sig = d.method_items[v.method_idx].signature;
+                                        if (std.mem.lastIndexOfScalar(u8, sig, ')')) |close_paren| {
+                                            const ret_sig = sig[close_paren + 1 ..];
+                                            if (ret_sig.len > 0 and (ret_sig[0] == 'L' or ret_sig[0] == '[')) {
+                                                if (!reference_vars.contains(dest)) {
+                                                    try reference_vars.put(dest, {});
+                                                    try var_types.put(dest, ret_sig);
+                                                    changed = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
             }
         }
     }
@@ -291,6 +489,22 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 .alloc_arr => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                     try helper.process(&interval_map, v.size, global_inst_idx, false, .gpr);
+                },
+                .instance_of => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.obj, global_inst_idx, false, .gpr);
+                },
+                .filled_new_array => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    for (v.args) |a| {
+                        if (a) |arg| try helper.process(&interval_map, arg, global_inst_idx, false, .gpr);
+                    }
+                },
+                .fill_array_data => |v| {
+                    try helper.process(&interval_map, v.array, global_inst_idx, false, .gpr);
+                },
+                .move_exception => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                 },
                 .field_load => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
@@ -832,6 +1046,7 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
     }
 
     // Now rewrite all instructions in the program using the allocation results.
+    var rewrite_inst_idx: usize = 0;
     for (program.blocks.items) |*block| {
         var rewritten_insts = std.ArrayList(x86.Inst).empty;
         errdefer rewritten_insts.deinit(allocator);
@@ -1000,6 +1215,24 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     if (v.dest) |*d| {
                         d.* = rewriteOp.run(&allocation_results, d.*);
                     }
+                    var gc_info = x86.GcCallSiteInfo{ .stack_refs = 0, .reg_refs = 0 };
+                    var iter = allocation_results.valueIterator();
+                    while (iter.next()) |interval| {
+                        if (reference_vars.contains(interval.vreg)) {
+                            if (rewrite_inst_idx >= interval.start and rewrite_inst_idx <= interval.end) {
+                                if (interval.reg) |r| {
+                                    const r_code = regCode(r);
+                                    gc_info.reg_refs |= (@as(u32, 1) << r_code);
+                                } else if (interval.stack_offset) |offset| {
+                                    const slot = @divExact(-offset, 8);
+                                    if (slot >= 0 and slot < 64) {
+                                        gc_info.stack_refs |= (@as(u64, 1) << @intCast(slot));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    v.gc_info = gc_info;
                 },
                 .alloc_obj => |*v| {
                     v.dest = rewriteOp.run(&allocation_results, v.dest);
@@ -1007,6 +1240,22 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 .alloc_arr => |*v| {
                     v.dest = rewriteOp.run(&allocation_results, v.dest);
                     v.size = rewriteOp.run(&allocation_results, v.size);
+                },
+                .instance_of => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.obj = rewriteOp.run(&allocation_results, v.obj);
+                },
+                .filled_new_array => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    for (&v.args) |*a| {
+                        if (a.*) |*arg| arg.* = rewriteOp.run(&allocation_results, arg.*);
+                    }
+                },
+                .fill_array_data => |*v| {
+                    v.array = rewriteOp.run(&allocation_results, v.array);
+                },
+                .move_exception => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
                 },
                 .field_load => |*v| {
                     v.dest = rewriteOp.run(&allocation_results, v.dest);
@@ -1153,6 +1402,7 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
             }
 
             try rewritten_insts.append(allocator, new_inst);
+            rewrite_inst_idx += 1;
         }
 
         block.instructions.deinit(allocator);
@@ -1190,7 +1440,7 @@ test "regalloc: basic linear scan" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, null, 0, 0);
+    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -1224,7 +1474,7 @@ test "regalloc: float register allocation" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, null, 0, 0);
+    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null);
 
     const insts = prog.blocks.items[0].instructions.items;
     // Verify that the float variables are allocated to XMM registers!
@@ -1267,7 +1517,7 @@ test "regalloc: SIB array indexing rewrite" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, null, 0, 0);
+    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -1364,7 +1614,7 @@ test "regalloc: loop liveness analysis" {
     try prog.blocks.append(a, mb1);
 
     // Test that variable v0_2 is live across the back-edge, so its interval doesn't terminate prematurely
-    try allocateRegisters(a, &prog, &test_cfg, null, 2, 0);
+    try allocateRegisters(a, &prog, &test_cfg, null, null, 2, 0, null, null);
 
     // Let's assert that the allocations succeeded and registers were assigned
     const mb1_insts = prog.blocks.items[1].instructions.items;

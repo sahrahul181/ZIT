@@ -145,6 +145,101 @@ pub fn build(b: *std.Build) void {
     const lower_mod_test = b.addTest(.{ .root_module = lower_mod });
     test_step.dependOn(&b.addRunArtifact(lower_mod_test).step);
 
+    const gc_mod = b.addModule("gc", .{
+        .root_source_file = b.path("runtime/gc.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+
+    const chase_lev_mod = b.addModule("chase_lev", .{
+        .root_source_file = b.path("runtime/chase_lev.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+
+    const thread_mod = b.addModule("thread", .{
+        .root_source_file = b.path("runtime/thread.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "chase_lev", .module = chase_lev_mod },
+        },
+    });
+
+    const sync_mod = b.addModule("sync", .{
+        .root_source_file = b.path("runtime/sync.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "thread", .module = thread_mod },
+            .{ .name = "chase_lev", .module = chase_lev_mod },
+        },
+    });
+
+    const runtime_mod = b.addModule("runtime", .{
+        .root_source_file = b.path("runtime/runtime.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "thread", .module = thread_mod },
+            .{ .name = "chase_lev", .module = chase_lev_mod },
+            .{ .name = "sync", .module = sync_mod },
+        },
+    });
+
+    const class_loader_mod = b.addModule("class_loader", .{
+        .root_source_file = b.path("runtime/class_loader.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "parser",      .module = dex_mod  },
+            .{ .name = "instruction", .module = inst_mod },
+            .{ .name = "runtime",     .module = runtime_mod },
+            .{ .name = "thread",      .module = thread_mod },
+        },
+    });
+    const cl_test = b.addTest(.{ .root_module = class_loader_mod });
+    test_step.dependOn(&b.addRunArtifact(cl_test).step);
+
+    const safepoint_mod = b.addModule("safepoint", .{
+        .root_source_file = b.path("runtime/safepoint.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "runtime", .module = runtime_mod },
+        },
+    });
+    const sp_test = b.addTest(.{ .root_module = safepoint_mod });
+    test_step.dependOn(&b.addRunArtifact(sp_test).step);
+
+
+    const test_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("runtime/test_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "runtime", .module = runtime_mod },
+            .{ .name = "safepoint", .module = safepoint_mod },
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "thread", .module = thread_mod },
+            .{ .name = "chase_lev", .module = chase_lev_mod },
+            .{ .name = "sync", .module = sync_mod },
+        },
+    });
+    const rt_test = b.addTest(.{ .root_module = test_runtime_mod });
+    test_step.dependOn(&b.addRunArtifact(rt_test).step);
+
+
+    const gc_map_mod = b.addModule("gc_map", .{
+        .root_source_file = b.path("runtime/gc_map.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+    const gm_test = b.addTest(.{ .root_module = gc_map_mod });
+    test_step.dependOn(&b.addRunArtifact(gm_test).step);
+
     const regalloc_mod = b.addModule("regalloc", .{
         .root_source_file = b.path("jit/regalloc.zig"),
         .optimize = optimize,
@@ -153,16 +248,74 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ir", .module = ir_mod },
             .{ .name = "x86", .module = x86_mod },
             .{ .name = "cfg", .module = cfg_mod },
+            .{ .name = "parser", .module = dex_mod },
+            .{ .name = "class_loader", .module = class_loader_mod },
+            .{ .name = "runtime", .module = runtime_mod },
+            .{ .name = "gc_map", .module = gc_map_mod },
         },
     });
     const regalloc_mod_test = b.addTest(.{ .root_module = regalloc_mod });
     test_step.dependOn(&b.addRunArtifact(regalloc_mod_test).step);
 
-    const runtime_mod = b.addModule("runtime", .{
-        .root_source_file = b.path("runtime/runtime.zig"),
+
+
+    const exception_mod = b.addModule("exception", .{
+        .root_source_file = b.path("runtime/exception.zig"),
         .optimize = optimize,
         .target = target,
+        .imports = &.{
+            .{ .name = "instruction",  .module = inst_mod         },
+            .{ .name = "class_loader", .module = class_loader_mod },
+        },
     });
+    const ex_test = b.addTest(.{ .root_module = exception_mod });
+    test_step.dependOn(&b.addRunArtifact(ex_test).step);
+
+    const interp_mod = b.addModule("interpreter", .{
+        .root_source_file = b.path("runtime/interpreter.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "parser",       .module = dex_mod         },
+            .{ .name = "instruction",  .module = inst_mod        },
+            .{ .name = "class_loader", .module = class_loader_mod },
+            .{ .name = "runtime",      .module = runtime_mod     },
+            .{ .name = "safepoint",    .module = safepoint_mod   },
+        },
+    });
+
+    const test_interpreter_mod = b.createModule(.{
+        .root_source_file = b.path("runtime/test_interpreter.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "interpreter", .module = interp_mod },
+            .{ .name = "instruction", .module = inst_mod },
+            .{ .name = "class_loader", .module = class_loader_mod },
+            .{ .name = "parser", .module = dex_mod },
+        },
+    });
+    const interp_test = b.addTest(.{ .root_module = test_interpreter_mod });
+    test_step.dependOn(&b.addRunArtifact(interp_test).step);
+
+    const native_mod = b.addModule("native", .{
+        .root_source_file = b.path("runtime/native.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "runtime",      .module = runtime_mod      },
+            .{ .name = "class_loader", .module = class_loader_mod },
+            .{ .name = "safepoint",    .module = safepoint_mod    },
+            .{ .name = "interpreter",  .module = interp_mod       },
+            .{ .name = "parser",       .module = dex_mod          },
+            .{ .name = "thread",       .module = thread_mod       },
+        },
+    });
+    native_mod.link_libc = true;
+    const native_test = b.addTest(.{ .root_module = native_mod });
+    native_test.root_module.link_libc = true;
+    test_step.dependOn(&b.addRunArtifact(native_test).step);
+
 
     const emitter_mod = b.addModule("emitter", .{
         .root_source_file = b.path("jit/emitter.zig"),
@@ -172,6 +325,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ir", .module = ir_mod },
             .{ .name = "x86", .module = x86_mod },
             .{ .name = "runtime", .module = runtime_mod },
+            .{ .name = "parser", .module = dex_mod },
+            .{ .name = "class_loader", .module = class_loader_mod },
+            .{ .name = "gc_map", .module = gc_map_mod },
+            .{ .name = "safepoint", .module = safepoint_mod },
         },
     });
     const emitter_mod_test = b.addTest(.{ .root_module = emitter_mod });
@@ -204,19 +361,26 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "parser", .module = dex_mod },
-                .{ .name = "cfg", .module = cfg_mod },
-                .{ .name = "instruction", .module = inst_mod },
-                .{ .name = "printer", .module = print_mod },
-                .{ .name = "translate", .module = translate_mod },
-                .{ .name = "ir", .module = ir_mod },
-                .{ .name = "opt", .module = opt_mod },
-                .{ .name = "dessa", .module = dessa_mod },
-                .{ .name = "x86", .module = x86_mod },
-                .{ .name = "lower", .module = lower_mod },
-                .{ .name = "regalloc", .module = regalloc_mod },
-                .{ .name = "emitter", .module = emitter_mod },
-                .{ .name = "exec_mem", .module = exec_mem_mod },
+                .{ .name = "parser",       .module = dex_mod          },
+                .{ .name = "cfg",          .module = cfg_mod          },
+                .{ .name = "instruction",  .module = inst_mod         },
+                .{ .name = "printer",      .module = print_mod        },
+                .{ .name = "translate",    .module = translate_mod    },
+                .{ .name = "ir",           .module = ir_mod           },
+                .{ .name = "opt",          .module = opt_mod          },
+                .{ .name = "dessa",        .module = dessa_mod        },
+                .{ .name = "x86",          .module = x86_mod          },
+                .{ .name = "lower",        .module = lower_mod        },
+                .{ .name = "regalloc",     .module = regalloc_mod     },
+                .{ .name = "emitter",      .module = emitter_mod      },
+                .{ .name = "exec_mem",     .module = exec_mem_mod     },
+                .{ .name = "runtime",      .module = runtime_mod      },
+                .{ .name = "interpreter",  .module = interp_mod       },
+                .{ .name = "class_loader", .module = class_loader_mod },
+                .{ .name = "safepoint",    .module = safepoint_mod    },
+                .{ .name = "gc_map",       .module = gc_map_mod       },
+                .{ .name = "exception",    .module = exception_mod    },
+                .{ .name = "native",       .module = native_mod       },
             },
         }),
     });

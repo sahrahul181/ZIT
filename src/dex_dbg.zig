@@ -12,7 +12,19 @@ const lower = @import("lower");
 const regalloc = @import("regalloc");
 const emitter = @import("emitter");
 const exec_mem = @import("exec_mem");
+const interpreter = @import("interpreter");
+const class_loader = @import("class_loader");
+const thread = runtime.thread;
+const native = @import("native");
+const runtime = @import("runtime");
+const safepoint = @import("safepoint");
 const Io = std.Io;
+
+// PrintStream native methods write through libc stdio. To keep a single ordered
+// stream on stdout, the run-main driver routes its own messages through libc
+// printf as well rather than mixing a separate buffered Zig writer on fd 1.
+extern fn fflush(stream: ?*anyopaque) callconv(.c) c_int;
+extern fn printf(format: [*:0]const u8, ...) callconv(.c) c_int;
 
 const c = @cImport({
     @cInclude("pb.h");
@@ -49,7 +61,7 @@ fn decodeKotlinMetadata(arena: std.mem.Allocator, data1: []const []const u8) ![]
                 i += 1;
             } else if ((b & 0xe0) == 0xc0) {
                 if (i + 1 >= s.len) return error.MalformedMutf8;
-                const b2 = s[i+1];
+                const b2 = s[i + 1];
                 const char_val = (@as(u32, b & 0x1f) << 6) | (b2 & 0x3f);
                 if (char_val == 0) {
                     raw[out_idx] = 0;
@@ -60,8 +72,8 @@ fn decodeKotlinMetadata(arena: std.mem.Allocator, data1: []const []const u8) ![]
                 i += 2;
             } else if ((b & 0xf0) == 0xe0) {
                 if (i + 2 >= s.len) return error.MalformedMutf8;
-                const b2 = s[i+1];
-                const b3 = s[i+2];
+                const b2 = s[i + 1];
+                const b3 = s[i + 2];
                 const char_val = (@as(u32, b & 0x0f) << 12) | (@as(u32, b2 & 0x3f) << 6) | (b3 & 0x3f);
                 raw[out_idx] = @intCast(char_val & 0xff);
                 out_idx += 1;
@@ -76,7 +88,7 @@ fn decodeKotlinMetadata(arena: std.mem.Allocator, data1: []const []const u8) ![]
     }
 
     const first_raw = raw_parts[0];
-    
+
     // Check for UtfEncoding (not packed)
     if (first_raw[0] == 0) {
         var total_len: usize = 0;
@@ -208,12 +220,200 @@ fn findClass(dex: *const parser.DexFile, name: []const u8) ?parser.DexClass {
 fn findMethod(class: *const parser.DexClass, name: []const u8) ?parser.DexMethod {
     for (class.methods.items) |m| {
         const arrow = std.mem.indexOf(u8, m.name, "->") orelse continue;
-        const mname = m.name[arrow + 2..];
-        if (std.mem.eql(u8, mname, name) or std.mem.indexOf(u8, mname, name) != null) {
+        const mname = m.name[arrow + 2 ..];
+        if (std.mem.eql(u8, mname, name)) {
+            return m;
+        }
+    }
+    for (class.methods.items) |m| {
+        const arrow = std.mem.indexOf(u8, m.name, "->") orelse continue;
+        const mname = m.name[arrow + 2 ..];
+        if (std.mem.indexOf(u8, mname, name) != null) {
             return m;
         }
     }
     return null;
+}
+
+var jit_compile_mutex = std.Io.Mutex.init;
+
+/// Build SSA form for an already-translated CFG: compute dominance information,
+/// collect the per-register definition sites, insert phi functions at join
+/// points, and rename variables into versioned SSA. This MUST run before
+/// `opt.optimize`, otherwise the optimizer operates on unversioned IR and
+/// miscompiles loop-carried variables (dropping induction increments), which
+/// produces infinite loops in the generated code.
+fn buildSSA(allocator: std.mem.Allocator, cfg: *cfgmod.CFG, registers_size: u16) !void {
+    try cfg.computePredecessors();
+    try cfg.computeDominators();
+    try cfg.computeDominatorChildren();
+    try cfg.computeDominanceFrontiers();
+
+    var def_map = std.AutoHashMap(u16, std.ArrayList(usize)).init(allocator);
+    defer {
+        var it = def_map.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        def_map.deinit();
+    }
+
+    for (cfg.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const dest_reg: ?u16 = switch (inst) {
+                .phi => |v| v.dest.reg,
+                .move => |v| v.dest.reg,
+                .const_int => |v| v.dest.reg,
+                .const_wide => |v| v.dest.reg,
+                .const_string => |v| v.dest.reg,
+                .const_class => |v| v.dest.reg,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int,
+                .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
+                .add_long, .sub_long, .mul_long, .div_long, .rem_long,
+                .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long,
+                .add_float, .sub_float, .mul_float, .div_float, .rem_float,
+                .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide,
+                => |v| v.dest.reg,
+                .un_op => |v| v.dest.reg,
+                .cmp_op => |v| v.dest.reg,
+                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
+                .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                => |v| v.dest.reg,
+                .new_instance => |v| v.dest.reg,
+                .new_array => |v| v.dest.reg,
+                .iget => |v| v.dest_or_src.reg,
+                .sget => |v| v.dest_or_src.reg,
+                .aget => |v| v.dest_or_src.reg,
+                .invoke => |v| if (v.dest) |d| d.reg else null,
+                else => null,
+            };
+
+            if (dest_reg) |reg| {
+                var res = try def_map.getOrPut(reg);
+                if (!res.found_existing) res.value_ptr.* = .empty;
+                var contains = false;
+                for (res.value_ptr.items) |b_id| {
+                    if (b_id == block.id) {
+                        contains = true;
+                        break;
+                    }
+                }
+                if (!contains) try res.value_ptr.append(allocator, block.id);
+            }
+        }
+    }
+
+    // Propagate definers through the CFG to join points to ensure proper phi insertion.
+    var reg_it = def_map.iterator();
+    while (reg_it.next()) |entry| {
+        const definers = entry.value_ptr;
+        var queue = std.ArrayList(usize).empty;
+        defer queue.deinit(allocator);
+        var visited = try std.DynamicBitSet.initEmpty(allocator, cfg.blocks.items.len);
+        defer visited.deinit();
+
+        for (definers.items) |d| {
+            try queue.append(allocator, d);
+            visited.set(d);
+        }
+
+        var q_idx: usize = 0;
+        while (q_idx < queue.items.len) : (q_idx += 1) {
+            const curr_id = queue.items[q_idx];
+            const curr_block = cfg.blocks.items[curr_id];
+            for (curr_block.successors.items) |succ_id| {
+                const succ_block = cfg.blocks.items[succ_id];
+                if (succ_block.predecessors.items.len >= 2) {
+                    var already_def = false;
+                    for (definers.items) |d| {
+                        if (d == curr_id) {
+                            already_def = true;
+                            break;
+                        }
+                    }
+                    if (!already_def) try definers.append(allocator, curr_id);
+                }
+                if (!visited.isSet(succ_id)) {
+                    visited.set(succ_id);
+                    try queue.append(allocator, succ_id);
+                }
+            }
+        }
+    }
+
+    try cfg.insertPhiFunctions(def_map);
+    try cfg.renameVariables(registers_size);
+}
+
+fn jitCompileFn(method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize {
+    jit_compile_mutex.lockUncancelable(runtime.global_io);
+    defer jit_compile_mutex.unlock(runtime.global_io);
+
+    const method = @as(*class_loader.MethodData, @ptrFromInt(method_ptr));
+    // Idempotency: if another thread already compiled this method while we waited
+    // for the lock, return its entry instead of recompiling (which would leak a
+    // second exec page and duplicate all the work).
+    if (method.jitEntry()) |entry| return entry;
+    const registry = @as(*class_loader.ClassRegistry, @ptrFromInt(registry_ptr));
+    const dex = @as(*const parser.DexFile, @ptrFromInt(dex_ptr));
+    const gpa = registry.allocator;
+
+    const arrow = std.mem.indexOf(u8, method.name, "->") orelse 0;
+    const short_name = if (arrow > 0) method.name[arrow + 2 ..] else method.name;
+    const class_desc = findClass(dex, method.class_name) orelse return 0;
+    const dex_method = findMethod(&class_desc, short_name) orelse return 0;
+    const insns = dex.decodeMethod(gpa, dex_method) catch return 0;
+
+    var cfg = cfgmod.buildCFG(gpa, insns) catch return 0;
+    defer cfg.deinit();
+
+    translate.translateCFG(gpa, &cfg, insns) catch return 0;
+    buildSSA(gpa, &cfg, method.registers_size) catch return 0;
+    _ = opt.optimize(gpa, &cfg) catch return 0;
+    dessa.eliminatePhis(gpa, &cfg) catch return 0;
+    while (dessa.propagateCopies(gpa, &cfg) catch false) {}
+
+    var machine = lower.lowerCFG(gpa, &cfg) catch return 0;
+    defer machine.deinit();
+
+    var is_float_param: std.ArrayList(bool) = .empty;
+    defer is_float_param.deinit(gpa);
+    var is_ref_param: std.ArrayList(bool) = .empty;
+    defer is_ref_param.deinit(gpa);
+
+    var it = std.mem.tokenizeAny(u8, method.signature, "()");
+    const param_part = it.next() orelse "";
+    var idx: usize = 0;
+    while (idx < param_part.len) {
+        const char = param_part[idx];
+        if (char == 'L') {
+            is_float_param.append(gpa, false) catch {};
+            is_ref_param.append(gpa, true) catch {};
+            while (idx < param_part.len and param_part[idx] != ';') idx += 1;
+        } else if (char == '[') {
+            is_float_param.append(gpa, false) catch {};
+            is_ref_param.append(gpa, true) catch {};
+            while (idx < param_part.len and param_part[idx] == '[') idx += 1;
+            if (idx < param_part.len and param_part[idx] == 'L') {
+                while (idx < param_part.len and param_part[idx] != ';') idx += 1;
+            }
+        } else if (char == 'F' or char == 'D') {
+            is_float_param.append(gpa, true) catch {};
+            is_ref_param.append(gpa, false) catch {};
+        } else {
+            is_float_param.append(gpa, false) catch {};
+            is_ref_param.append(gpa, false) catch {};
+        }
+        idx += 1;
+    }
+
+    regalloc.allocateRegisters(gpa, &machine, &cfg, is_float_param.items, is_ref_param.items, method.registers_size, method.ins_size, null, dex) catch return 0;
+    const code_bytes = emitter.emitProgram(gpa, &machine, registry, dex) catch return 0;
+
+    const exec_page = exec_mem.allocateExecMemory(code_bytes.len) catch return 0;
+    @memcpy(exec_page, code_bytes);
+
+    const entry = @intFromPtr(exec_page.ptr);
+    method.setJitEntry(entry);
+    return entry;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -562,7 +762,7 @@ pub fn main(init: std.process.Init) !void {
                     var match_method = std.mem.eql(u8, inv.method_name, method.name);
                     if (!match_method) {
                         if (std.mem.indexOf(u8, method.name, "->")) |idx| {
-                            match_method = std.mem.eql(u8, inv.method_name, method.name[idx + 2..]);
+                            match_method = std.mem.eql(u8, inv.method_name, method.name[idx + 2 ..]);
                         }
                     }
                     if (match_class and match_method and std.mem.eql(u8, inv.signature, method.signature)) {
@@ -591,17 +791,52 @@ pub fn main(init: std.process.Init) !void {
                     .const_wide => |v| v.dest.reg,
                     .const_string => |v| v.dest.reg,
                     .const_class => |v| v.dest.reg,
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int,
-                    .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
-                    .add_long, .sub_long, .mul_long, .div_long, .rem_long,
-                    .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long,
-                    .add_float, .sub_float, .mul_float, .div_float, .rem_float,
-                    .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide,
+                    .add_int,
+                    .sub_int,
+                    .mul_int,
+                    .div_int,
+                    .rem_int,
+                    .and_int,
+                    .or_int,
+                    .xor_int,
+                    .shl_int,
+                    .shr_int,
+                    .ushr_int,
+                    .add_long,
+                    .sub_long,
+                    .mul_long,
+                    .div_long,
+                    .rem_long,
+                    .and_long,
+                    .or_long,
+                    .xor_long,
+                    .shl_long,
+                    .shr_long,
+                    .ushr_long,
+                    .add_float,
+                    .sub_float,
+                    .mul_float,
+                    .div_float,
+                    .rem_float,
+                    .add_wide,
+                    .sub_wide,
+                    .mul_wide,
+                    .div_wide,
+                    .rem_wide,
                     => |v| v.dest.reg,
                     .un_op => |v| v.dest.reg,
                     .cmp_op => |v| v.dest.reg,
-                    .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
-                    .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                    .add_lit,
+                    .sub_lit,
+                    .mul_lit,
+                    .div_lit,
+                    .rem_lit,
+                    .and_lit,
+                    .or_lit,
+                    .xor_lit,
+                    .shl_lit,
+                    .shr_lit,
+                    .ushr_lit,
                     => |v| v.dest.reg,
                     .new_instance => |v| v.dest.reg,
                     .new_array => |v| v.dest.reg,
@@ -639,7 +874,7 @@ pub fn main(init: std.process.Init) !void {
             defer queue.deinit(arena);
             var visited = try std.DynamicBitSet.initEmpty(arena, cfg.blocks.items.len);
             defer visited.deinit();
-            
+
             // Add initial definers to queue
             for (definers.items) |d| {
                 try queue.append(arena, d);
@@ -650,7 +885,7 @@ pub fn main(init: std.process.Init) !void {
             while (q_idx < queue.items.len) : (q_idx += 1) {
                 const curr_id = queue.items[q_idx];
                 const curr_block = cfg.blocks.items[curr_id];
-                
+
                 for (curr_block.successors.items) |succ_id| {
                     const succ_block = cfg.blocks.items[succ_id];
                     if (succ_block.predecessors.items.len >= 2) {
@@ -696,6 +931,7 @@ pub fn main(init: std.process.Init) !void {
             var machine = try lower.lowerCFG(arena, &cfg);
             defer machine.deinit();
             var all_types = std.ArrayList(bool).empty;
+            var all_ref_types = std.ArrayList(bool).empty;
             var sig_idx: usize = 0;
             if (sig_idx < method.signature.len and method.signature[sig_idx] == '(') {
                 sig_idx += 1;
@@ -708,13 +944,16 @@ pub fn main(init: std.process.Init) !void {
                 const char = method.signature[sig_idx];
                 if (char == 'F' or char == 'D') {
                     try all_types.append(arena, true);
+                    try all_ref_types.append(arena, false);
                     sig_idx += 1;
                 } else if (char == 'L') {
                     try all_types.append(arena, false);
+                    try all_ref_types.append(arena, true);
                     while (sig_idx < method.signature.len and method.signature[sig_idx] != ';') : (sig_idx += 1) {}
                     if (sig_idx < method.signature.len) sig_idx += 1;
                 } else if (char == '[') {
                     try all_types.append(arena, false);
+                    try all_ref_types.append(arena, true);
                     sig_idx += 1;
                     while (sig_idx < method.signature.len and method.signature[sig_idx] == '[') : (sig_idx += 1) {}
                     if (sig_idx < method.signature.len and method.signature[sig_idx] == 'L') {
@@ -725,6 +964,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 } else {
                     try all_types.append(arena, false);
+                    try all_ref_types.append(arena, false);
                     sig_idx += 1;
                 }
             }
@@ -733,8 +973,16 @@ pub fn main(init: std.process.Init) !void {
             if (all_types.items.len > 1) {
                 try is_float_param.appendSlice(arena, all_types.items[0 .. all_types.items.len - 1]);
             }
+
+            var is_ref_param = std.ArrayList(bool).empty;
+            if (!method.is_static) {
+                try is_ref_param.append(arena, true);
+            }
+            if (all_ref_types.items.len > 1) {
+                try is_ref_param.appendSlice(arena, all_ref_types.items[0 .. all_ref_types.items.len - 1]);
+            }
+
             const is_float_ret = if (all_types.items.len > 0 and all_types.items[all_types.items.len - 1]) true else false;
-            // Wait, we need to inspect double return separately
             var is_double_ret = false;
             if (std.mem.lastIndexOfScalar(u8, method.signature, 'D')) |d_idx| {
                 if (d_idx == method.signature.len - 1) {
@@ -742,12 +990,14 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
-            std.debug.print("Method signature: {s}, is_float_param: {any}, is_float_ret: {}, is_double_ret: {}\n", .{method.signature, is_float_param.items, is_float_ret, is_double_ret});
-
             if (std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
-                try regalloc.allocateRegisters(arena, &machine, &cfg, is_float_param.items, method.registers_size, method.ins_size);
+                try regalloc.allocateRegisters(arena, &machine, &cfg, is_float_param.items, is_ref_param.items, method.registers_size, method.ins_size, null, &dex);
                 if (std.mem.eql(u8, cmd, "run")) {
-                    const code_bytes = try emitter.emitProgram(arena, &machine);
+                    try runtime.initRuntime(std.heap.c_allocator, 0);
+                    defer runtime.deinitRuntime();
+                    safepoint.initSafepointSubsystem();
+
+                    const code_bytes = try emitter.emitProgram(arena, &machine, null, &dex);
                     defer arena.free(code_bytes);
 
                     const exec_page = try exec_mem.allocateExecMemory(code_bytes.len);
@@ -870,6 +1120,83 @@ pub fn main(init: std.process.Init) !void {
         } else {
             try writer.print("  (Empty/No metadata payload)\n", .{});
         }
+    } else if (std.mem.eql(u8, cmd, "run-main")) {
+        if (args.len < 4) {
+            try writer.print("Error: 'run-main' command requires a <class_name> argument.\n", .{});
+            return;
+        }
+        const class_arg = args[3];
+
+        var registry = class_loader.ClassRegistry.init(std.heap.c_allocator);
+        defer registry.deinit();
+        try native.initNativeRegistry(std.heap.c_allocator, &registry);
+        defer native.deinitNativeRegistry();
+
+        try registry.loadDex(&dex);
+
+        native.global_registry = &registry;
+        native.global_dex = &dex;
+
+        class_loader.jit_compile_fn = jitCompileFn;
+
+        try runtime.initRuntime(std.heap.c_allocator, 0);
+        defer runtime.deinitRuntime();
+        safepoint.initSafepointSubsystem();
+
+        runtime.global_io = io;
+        const user_args = args[4..];
+        const arr_size = user_args.len * 8 + 16;
+
+        // Temporarily fake JavaThread for the main thread so gcAlloc works
+        const main_thread = try thread.JavaThread.init(std.heap.c_allocator, 0, undefined);
+        thread.current_thread = main_thread;
+
+        const arr_raw = runtime.gcAlloc(0, arr_size);
+        const arr_body = @intFromPtr(arr_raw);
+        @as(*i32, @ptrFromInt(arr_body)).* = @intCast(user_args.len);
+
+        const StringLayout = struct {
+            value: [*]const u8,
+            length: i32,
+        };
+
+        for (user_args, 0..) |arg, i| {
+            const str_obj = runtime.gcAlloc(0, 24);
+            const layout = @as(*align(4) StringLayout, @ptrCast(@alignCast(str_obj)));
+            layout.value = arg.ptr;
+            layout.length = @intCast(arg.len);
+
+            const p = arr_body + 4 + i * 8;
+            @as(*align(4) u64, @ptrFromInt(p)).* = @intFromPtr(str_obj);
+        }
+
+        var interp = interpreter.Interpreter.init(std.heap.c_allocator, &registry, &dex);
+        const target_class = registry.get(class_arg) orelse {
+            try writer.print("Error: Class '{s}' not found in registry.\n", .{class_arg});
+            return;
+        };
+        const main_method = target_class.findMethod("main", "VL") orelse {
+            try writer.print("Error: main(VL) method not found in class '{s}'.\n", .{class_arg});
+            return;
+        };
+
+        interp.native_lookup_fn = native.lookupNativeMethod;
+        const main_args = [_]u64{arr_body};
+        // Flush any prior Zig-buffered driver output before the program runs, so
+        // it precedes the program's libc output on the same fd.
+        try stdout_file_writer.flush();
+
+        const start_ns = Io.Clock.awake.now(io).nanoseconds;
+        _ = try interp.invoke(main_method, &main_args);
+        const end_ns = Io.Clock.awake.now(io).nanoseconds;
+
+        // Route the summary through libc printf (the same stream the program used)
+        // so output stays in a single, correctly-ordered buffer.
+        const ms = @as(f64, @floatFromInt(end_ns - start_ns)) / 1_000_000.0;
+        _ = printf("\nExecution completed successfully.\n");
+        _ = printf("Total execution time: %.3f ms\n", ms);
+        _ = fflush(null);
+        return;
     } else {
         try writer.print("Error: Unknown command '{s}'.\n\n", .{cmd});
         try usage(writer);
