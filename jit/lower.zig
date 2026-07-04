@@ -7,6 +7,37 @@ inline fn opReg(v: ir.SSAVar) x86.Operand  { return .{ .vreg = v }; }
 inline fn opImm(val: i32) x86.Operand      { return .{ .imm = val }; }
 inline fn opImm64(val: i64) x86.Operand    { return .{ .imm64 = val }; }
 
+/// True when two SSA variables refer to the same virtual register.
+inline fn eqVar(a: ir.SSAVar, b: ir.SSAVar) bool {
+    return a.reg == b.reg and a.version == b.version;
+}
+
+/// Post-lowering peephole: removes any `MOV x, x` (self-moves) that survived
+/// coalescing.  Runs in O(n) per block.
+fn removeDeadMovs(allocator: std.mem.Allocator, program: *x86.MachineProgram) !void {
+    for (program.blocks.items) |*mblock| {
+        var write: usize = 0;
+        for (mblock.instructions.items) |inst| {
+            const is_self_mov = switch (inst) {
+                .mov => |v| switch (v.dest) {
+                    .vreg => |d| switch (v.src) {
+                        .vreg => |s| eqVar(d, s),
+                        else  => false,
+                    },
+                    else => false,
+                },
+                else => false,
+            };
+            if (!is_self_mov) {
+                mblock.instructions.items[write] = inst;
+                write += 1;
+            }
+        }
+        mblock.instructions.shrinkRetainingCapacity(write);
+        _ = allocator; // used by future passes
+    }
+}
+
 /// Lowers the de-SSA 3-Address IR into virtual x86-64 Machine Assembly.
 /// Every IRInst variant is explicitly mapped; none are silently dropped.
 pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProgram {
@@ -45,91 +76,181 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                 },
 
-                // ── Integer Binary (3-Address → 2-Address) ────────────────
+                // ── Integer Binary (3-Address → 2-Address with coalescing) ────
+                //
+                // For COMMUTATIVE ops (add, mul, and, or, xor):
+                //   dest == left  → OP dest, right          (skip leading MOV)
+                //   dest == right → OP dest, left           (commutative swap; also fixes clobber bug)
+                //   otherwise     → MOV dest, left; OP dest, right
+                //
+                // For NON-COMMUTATIVE ops (sub, shl, shr, ushr):
+                //   dest == left  → OP dest, right          (skip leading MOV)
+                //   otherwise     → MOV dest, left; OP dest, right
+                //   (dest == right is rare/impossible post-dessa for shifts; handled by general case)
+                //
+                // For SUB where dest == right:
+                //   dest = left − right − where right IS dest. Emit: NEG dest; ADD dest, left
+                //   because -(right) + left == left − right.
+
                 .add_int => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .sub_int => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        // dest = left - dest → NEG dest; ADD dest, left
+                        try mi.append(allocator, .{ .neg = .{ .dest = opReg(v.dest) } });
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .mul_int => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .div_int => |v| {
-                    // Quotient goes to dest; we allocate a scratch for the remainder
                     const rem_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest),     .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                    }
                 },
                 .rem_int => |v| {
-                    // Remainder goes to dest (maps to RDX after real IDIV)
                     const quot_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
                     try mi.append(allocator, .{ .mov  = .{ .dest = opReg(quot_scratch), .src = opReg(v.left) } });
                     try mi.append(allocator, .{ .irem = .{ .dest = opReg(quot_scratch), .rem = opReg(v.dest), .src = opReg(v.right) } });
                 },
                 .and_int => |v| {
-                    try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .or_int => |v| {
-                    try mi.append(allocator, .{ .mov   = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov   = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .xor_int => |v| {
-                    try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .shl_int => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .shl = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .shl = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .shl = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .shr_int => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .shr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .shr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .shr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .ushr_int => |v| {
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
 
-                // ── Float & Wide Binary (same 2-address expansion as int) ─
+                // ── Float & Wide Binary (same coalescing as int) ────────────
                 .add_float, .add_wide => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .sub_float, .sub_wide => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .neg = .{ .dest = opReg(v.dest) } });
+                        try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .mul_float, .mul_wide => |v| {
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
                 },
                 .div_float, .div_wide => |v| {
                     const rem_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest),     .src = opReg(v.left) } });
-                    try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
+                    }
                 },
 
-                // ── Literal Arithmetic ────────────────────────────────────
+                // ── Literal Arithmetic (skip MOV when dest == src) ─────────
                 .add_lit => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .add = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .sub_lit => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .sub = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .mul_lit => |v| {
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .div_lit => |v| {
                     const rem_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest),     .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opImm(v.lit) } });
                 },
                 .rem_lit => |v| {
@@ -138,27 +259,27 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     try mi.append(allocator, .{ .irem = .{ .dest = opReg(quot_scratch), .rem = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .and_lit => |v| {
-                    try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .or_lit => |v| {
-                    try mi.append(allocator, .{ .mov   = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .xor_lit => |v| {
-                    try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .shl_lit => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .shl = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .shr_lit => |v| {
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .shr = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .ushr_lit => |v| {
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opImm(v.lit) } });
                 },
 
@@ -289,6 +410,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
         });
     }
 
+    try removeDeadMovs(allocator, &program);
     return program;
 }
 
@@ -491,6 +613,166 @@ test "lowerCFG: invoke method call" {
     try std.testing.expectEqual(@as(usize, 1), insts[0].call.arg_count);
     try std.testing.expect(insts[0].call.dest != null);
 }
+
+// ── Optimization tests ────────────────────────────────────────────────────────
+
+test "opt: commutative coalescing - dest == right skips MOV and swaps operands" {
+    // add_wide dest=v3_4, left=v1_1, right=v3_4
+    // Before: MOV v3_4, v1_1; ADD v3_4, v3_4   ← WRONG (clobbers right)
+    // After:  ADD v3_4, v1_1                    ← commutative swap, no MOV
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v1_1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v3_4 = ir.SSAVar{ .reg = 3, .version = 4 };
+    // add_wide v3_4 = v1_1 + v3_4   (dest == right)
+    try block.instructions.append(a, .{ .add_wide = .{ .dest = v3_4, .left = v1_1, .right = v3_4 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    // Should emit exactly 1 × ADD (no MOV)
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(insts[0] == .add);
+    // The ADD should use v1_1 as src (commutative swap)
+    try std.testing.expectEqual(v1_1.reg, insts[0].add.src.vreg.reg);
+    try std.testing.expectEqual(v1_1.version, insts[0].add.src.vreg.version);
+}
+
+test "opt: commutative coalescing - dest == left skips MOV" {
+    // add_int dest=v0, left=v0, right=v1 → ADD v0, v1 (no MOV)
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    try block.instructions.append(a, .{ .add_int = .{ .dest = v0, .left = v0, .right = v1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(insts[0] == .add);
+    // src should be v1 (the right operand)
+    try std.testing.expectEqual(v1.reg, insts[0].add.src.vreg.reg);
+}
+
+test "opt: literal coalescing - dest == src skips MOV" {
+    // add_lit dest=v0, src=v0, lit=1 → ADD v0, #1 (no MOV)
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 4 };
+    // add_lit v0_4 = v0_4 + 1   (dest == src — common in loop increments)
+    try block.instructions.append(a, .{ .add_lit = .{ .dest = v0, .src = v0, .lit = 1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    // Only 1 × ADD (no MOV, no dead self-MOV)
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(insts[0] == .add);
+    try std.testing.expectEqual(@as(i32, 1), insts[0].add.src.imm);
+}
+
+test "opt: removeDeadMovs - self-moves from move instruction removed" {
+    // move v0_1 = v0_1 → MOV v0_1, v0_1 → stripped by removeDeadMovs
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    try block.instructions.append(a, .{ .move = .{ .dest = v0, .src = v0 } }); // self-move → stripped
+    try block.instructions.append(a, .{ .move = .{ .dest = v1, .src = v0 } }); // real move → kept
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(insts[0] == .mov);
+    try std.testing.expectEqual(v0.reg, insts[0].mov.src.vreg.reg);
+}
+
+test "opt: sub dest==right emits NEG+ADD instead of clobbering MOV" {
+    // sub_int dest=v1, left=v0, right=v1   (dest = v0 - v1, but dest IS v1)
+    // Naive: MOV v1, v0; SUB v1, v1  ← wrong (v0-v0 = 0)
+    // Opt:   NEG v1; ADD v1, v0      ← correct: -(v1) + v0 = v0 - v1
+    const a = std.testing.allocator;
+
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = cfgmod.BasicBlock{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    try block.instructions.append(a, .{ .sub_int = .{ .dest = v1, .left = v0, .right = v1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expect(insts[0] == .neg); // NEG v1
+    try std.testing.expect(insts[1] == .add); // ADD v1, v0
+    try std.testing.expectEqual(v0.reg, insts[1].add.src.vreg.reg);
+}
+
 
 
 
