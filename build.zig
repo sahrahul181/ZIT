@@ -123,6 +123,28 @@ pub fn build(b: *std.Build) void {
     const dessa_mod_test = b.addTest(.{ .root_module = dessa_mod });
     test_step.dependOn(&b.addRunArtifact(dessa_mod_test).step);
 
+    const x86_mod = b.addModule("x86", .{
+        .root_source_file = b.path("jit/x86.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "ir", .module = ir_mod },
+        },
+    });
+
+    const lower_mod = b.addModule("lower", .{
+        .root_source_file = b.path("jit/lower.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "ir", .module = ir_mod },
+            .{ .name = "cfg", .module = cfg_mod },
+            .{ .name = "x86", .module = x86_mod },
+        },
+    });
+    const lower_mod_test = b.addTest(.{ .root_module = lower_mod });
+    test_step.dependOn(&b.addRunArtifact(lower_mod_test).step);
+
     const dex_dbg = b.addExecutable(.{
         .name = "dex-dbg",
         .root_module = b.createModule(.{
@@ -138,6 +160,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "ir", .module = ir_mod },
                 .{ .name = "opt", .module = opt_mod },
                 .{ .name = "dessa", .module = dessa_mod },
+                .{ .name = "x86", .module = x86_mod },
+                .{ .name = "lower", .module = lower_mod },
             },
         }),
     });

@@ -7,6 +7,8 @@ const translate = @import("translate");
 const ir = @import("ir");
 const opt = @import("opt");
 const dessa = @import("dessa");
+const x86mod = @import("x86");
+const lower = @import("lower");
 const Io = std.Io;
 
 const c = @cImport({
@@ -175,6 +177,7 @@ fn usage(writer: anytype) !void {
         \\  ssa <class_name> <method_name>           Print SSA IR for a method.
         \\  ssa-opt <class_name> <method_name>       Print Optimized SSA IR (with Dead Code Elimination).
         \\  dessa <class_name> <method_name>         Print SSA IR after Out-of-SSA translation (eliminatePhis + propagateCopies).
+        \\  lower <class_name> <method_name>         Print virtual x86-64 assembly (full pipeline: SSA-opt → de-SSA → lower).
         \\  emit <class_name> <method_name> [f] Dumps method instructions to stdout or a file.
         \\  kotlin <class_name>                 Show Kotlin metadata declarations (decoded using C protobuf lib).
         \\
@@ -502,7 +505,7 @@ pub fn main(init: std.process.Init) !void {
                 try writer.writeByte('\n');
             }
         }
-    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa")) {
+    } else if (std.mem.eql(u8, cmd, "ssa") or std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower")) {
         if (args.len < 5) {
             try writer.print("Error: '{s}' command requires <class_name> and <method_name> arguments.\n", .{cmd});
             return;
@@ -591,23 +594,38 @@ pub fn main(init: std.process.Init) !void {
         try cfg.insertPhiFunctions(def_map);
         try cfg.renameVariables(method.registers_size);
 
-        if (std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa")) {
+        if (std.mem.eql(u8, cmd, "ssa-opt") or std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower")) {
             _ = try opt.optimize(arena, &cfg);
         }
 
-        if (std.mem.eql(u8, cmd, "dessa")) {
+        if (std.mem.eql(u8, cmd, "dessa") or std.mem.eql(u8, cmd, "lower")) {
             try dessa.eliminatePhis(arena, &cfg);
             while (try dessa.propagateCopies(arena, &cfg)) {}
             try writer.print("SSA IR after de-SSA (eliminatePhis + propagateCopies) for method {s}:\n", .{method.name});
         } else {
             try writer.print("SSA IR for method {s}:\n", .{method.name});
         }
-        for (cfg.blocks.items) |block| {
-            try writer.print("  Block {d}:\n", .{block.id});
-            for (block.instructions.items) |inst| {
-                try writer.writeAll("    ");
-                try inst.format(writer);
-                try writer.writeByte('\n');
+        if (std.mem.eql(u8, cmd, "lower")) {
+            // Run full pipeline: ssa-opt + de-SSA is already done above; now lower to virtual x86.
+            var machine = try lower.lowerCFG(arena, &cfg);
+            defer machine.deinit();
+            try writer.print("Virtual x86-64 assembly for method {s}:\n", .{method.name});
+            for (machine.blocks.items) |mblock| {
+                try writer.print("  Block {d}:\n", .{mblock.id});
+                for (mblock.instructions.items) |minst| {
+                    try writer.writeAll("    ");
+                    try minst.format(writer);
+                    try writer.writeByte('\n');
+                }
+            }
+        } else {
+            for (cfg.blocks.items) |block| {
+                try writer.print("  Block {d}:\n", .{block.id});
+                for (block.instructions.items) |inst| {
+                    try writer.writeAll("    ");
+                    try inst.format(writer);
+                    try writer.writeByte('\n');
+                }
             }
         }
     } else if (std.mem.eql(u8, cmd, "kotlin")) {
