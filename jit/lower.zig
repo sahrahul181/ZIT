@@ -193,6 +193,127 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     }
                 },
 
+                // ── Long Binary (values are 64-bit GPRs, same machine ops as int) ──
+                .and_long => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .or_long => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov   = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .xor_long => |v| {
+                    if (eqVar(v.dest, v.left)) {
+                        try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    } else if (eqVar(v.dest, v.right)) {
+                        try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    } else {
+                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                    }
+                },
+                .shl_long => |v| {
+                    if (!eqVar(v.dest, v.left)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .shl = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                },
+                .shr_long => |v| {
+                    if (!eqVar(v.dest, v.left)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .shr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                },
+                .ushr_long => |v| {
+                    if (!eqVar(v.dest, v.left)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                },
+                .rem_long => |v| {
+                    const quot_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
+                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(quot_scratch), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .irem = .{ .dest = opReg(quot_scratch), .rem = opReg(v.dest), .src = opReg(v.right) } });
+                },
+
+                // ── Unary math & type conversions ─────────────────────────
+                .un_op => |v| switch (v.kind) {
+                    .neg_int, .neg_long => {
+                        if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                        try mi.append(allocator, .{ .neg = .{ .dest = opReg(v.dest) } });
+                    },
+                    .not_int, .not_long => {
+                        if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                        try mi.append(allocator, .{ .not = .{ .dest = opReg(v.dest) } });
+                    },
+                    .neg_float => {
+                        if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .movss = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                        try mi.append(allocator, .{ .negss = .{ .dest = opReg(v.dest) } });
+                    },
+                    .neg_double => {
+                        if (!eqVar(v.dest, v.src)) try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                        try mi.append(allocator, .{ .negsd = .{ .dest = opReg(v.dest) } });
+                    },
+                    // Ints are kept sign-extended in 64-bit registers, so widening
+                    // to long is a plain copy.
+                    .int_to_long => {
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    // Narrowing conversions re-canonicalize (sign/zero-extend) the
+                    // low bits into the 64-bit register.
+                    .long_to_int => {
+                        try mi.append(allocator, .{ .movsxd = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .int_to_byte => {
+                        try mi.append(allocator, .{ .movsx8 = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .int_to_short => {
+                        try mi.append(allocator, .{ .movsx16 = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .int_to_char => {
+                        try mi.append(allocator, .{ .movzx16 = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .int_to_float, .long_to_float => {
+                        try mi.append(allocator, .{ .cvtsi2ss = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .int_to_double, .long_to_double => {
+                        try mi.append(allocator, .{ .cvtsi2sd = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    // Known deviation from JLS: NaN converts to INT64_MIN sentinel
+                    // rather than 0, and out-of-range saturation is not clamped.
+                    .float_to_long => {
+                        try mi.append(allocator, .{ .cvttss2si = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .double_to_long => {
+                        try mi.append(allocator, .{ .cvttsd2si = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .float_to_int => {
+                        try mi.append(allocator, .{ .cvttss2si = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                        try mi.append(allocator, .{ .movsxd = .{ .dest = opReg(v.dest), .src = opReg(v.dest) } });
+                    },
+                    .double_to_int => {
+                        try mi.append(allocator, .{ .cvttsd2si = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                        try mi.append(allocator, .{ .movsxd = .{ .dest = opReg(v.dest), .src = opReg(v.dest) } });
+                    },
+                    .float_to_double => {
+                        try mi.append(allocator, .{ .cvtss2sd = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                    .double_to_float => {
+                        try mi.append(allocator, .{ .cvtsd2ss = .{ .dest = opReg(v.dest), .src = opReg(v.src) } });
+                    },
+                },
+
+                // ── Three-way comparisons ─────────────────────────────────
+                .cmp_op => |v| {
+                    try mi.append(allocator, .{ .cmp3 = .{ .kind = v.kind, .dest = opReg(v.dest), .left = opReg(v.left), .right = opReg(v.right) } });
+                },
+
                 // ── Float & Wide Binary (Lowered to native SSE instructions) ──
                 .add_float => |v| {
                     if (eqVar(v.dest, v.left)) {
@@ -301,6 +422,16 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                         try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .divsd = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
+                },
+                // Float remainder lowers to a pseudo-op; emitting it requires an
+                // fmod runtime call, so the emitter rejects it loudly until then.
+                .rem_float => |v| {
+                    if (!eqVar(v.dest, v.left)) try mi.append(allocator, .{ .movss = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .frem32 = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
+                },
+                .rem_wide => |v| {
+                    if (!eqVar(v.dest, v.left)) try mi.append(allocator, .{ .movsd = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .frem64 = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                 },
 
                 // ── Literal Arithmetic (skip MOV when dest == src) ─────────
@@ -449,7 +580,9 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
 
                 // ── Switch ────────────────────────────────────────────────
                 .switch_op => |v| {
-                    try mi.append(allocator, .{ .switch_stub = .{ .src = opReg(v.src), .num_cases = v.keys.len } });
+                    // keys/target_block_ids are arena-owned by the CFG and outlive the
+                    // machine program, so we can alias them directly.
+                    try mi.append(allocator, .{ .switch_stub = .{ .src = opReg(v.src), .keys = v.keys, .targets = v.target_block_ids } });
                 },
 
                 // ── Method calls ─────────────────────────────────────────
@@ -889,6 +1022,130 @@ test "lowerCFG: long math operations" {
     try std.testing.expectEqual(v0.reg, insts[0].mov.src.vreg.reg);
     try std.testing.expectEqual(v2.reg, insts[1].add.dest.vreg.reg);
     try std.testing.expectEqual(v1.reg, insts[1].add.src.vreg.reg);
+}
+
+fn testBlock() cfgmod.BasicBlock {
+    return .{
+        .id = 0, .start_idx = 0, .end_idx = 0,
+        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
+        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
+    };
+}
+
+test "lowerCFG: un_op neg/not lower to mov + neg/not" {
+    const a = std.testing.allocator;
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = testBlock();
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v2 = ir.SSAVar{ .reg = 2, .version = 1 };
+
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .neg_int, .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .not_long, .dest = v2, .src = v1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 4), insts.len);
+    try std.testing.expect(insts[0] == .mov); // dest != src → copy first
+    try std.testing.expect(insts[1] == .neg);
+    try std.testing.expectEqual(v1.reg, insts[1].neg.dest.vreg.reg);
+    try std.testing.expect(insts[2] == .mov);
+    try std.testing.expect(insts[3] == .not);
+    try std.testing.expectEqual(v2.reg, insts[3].not.dest.vreg.reg);
+}
+
+test "lowerCFG: conversions lower to extension and cvt instructions" {
+    const a = std.testing.allocator;
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = testBlock();
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .int_to_byte, .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .int_to_char, .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .long_to_int, .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .int_to_float, .dest = v1, .src = v0 } });
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .float_to_double, .dest = v1, .src = v0 } });
+    // float_to_int truncates then re-sign-extends the low 32 bits
+    try block.instructions.append(a, .{ .un_op = .{ .kind = .float_to_int, .dest = v1, .src = v0 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 7), insts.len);
+    try std.testing.expect(insts[0] == .movsx8);
+    try std.testing.expect(insts[1] == .movzx16);
+    try std.testing.expect(insts[2] == .movsxd);
+    try std.testing.expect(insts[3] == .cvtsi2ss);
+    try std.testing.expect(insts[4] == .cvtss2sd);
+    try std.testing.expect(insts[5] == .cvttss2si);
+    try std.testing.expect(insts[6] == .movsxd);
+}
+
+test "lowerCFG: long logical/shift/rem ops lower to 64-bit machine ops" {
+    const a = std.testing.allocator;
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = testBlock();
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v2 = ir.SSAVar{ .reg = 2, .version = 1 };
+
+    try block.instructions.append(a, .{ .and_long = .{ .dest = v2, .left = v0, .right = v1 } });
+    try block.instructions.append(a, .{ .shl_long = .{ .dest = v2, .left = v2, .right = v1 } });
+    try block.instructions.append(a, .{ .rem_long = .{ .dest = v2, .left = v0, .right = v1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    // and_long: mov + and; shl_long (dest==left): shl; rem_long: mov + irem
+    try std.testing.expectEqual(@as(usize, 5), insts.len);
+    try std.testing.expect(insts[0] == .mov);
+    try std.testing.expect(insts[1] == .and_op);
+    try std.testing.expect(insts[2] == .shl);
+    try std.testing.expect(insts[3] == .mov);
+    try std.testing.expect(insts[4] == .irem);
+    try std.testing.expectEqual(v2.reg, insts[4].irem.rem.vreg.reg);
+}
+
+test "lowerCFG: cmp_op lowers to cmp3 with kind preserved" {
+    const a = std.testing.allocator;
+    var cfg = cfgmod.CFG{ .blocks = std.ArrayList(cfgmod.BasicBlock).empty, .entry_block_id = 0, .allocator = a };
+    defer cfg.deinit();
+
+    var block = testBlock();
+    const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
+    const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
+    const v2 = ir.SSAVar{ .reg = 2, .version = 1 };
+
+    try block.instructions.append(a, .{ .cmp_op = .{ .kind = .cmp_long, .dest = v2, .left = v0, .right = v1 } });
+    try block.instructions.append(a, .{ .cmp_op = .{ .kind = .cmpg_float, .dest = v2, .left = v0, .right = v1 } });
+    try cfg.blocks.append(a, block);
+
+    var prog = try lowerCFG(a, &cfg);
+    defer prog.deinit();
+
+    const insts = prog.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expect(insts[0] == .cmp3);
+    try std.testing.expectEqual(ir.CmpKind.cmp_long, insts[0].cmp3.kind);
+    try std.testing.expect(insts[1] == .cmp3);
+    try std.testing.expectEqual(ir.CmpKind.cmpg_float, insts[1].cmp3.kind);
+    try std.testing.expectEqual(v2.reg, insts[1].cmp3.dest.vreg.reg);
 }
 
 

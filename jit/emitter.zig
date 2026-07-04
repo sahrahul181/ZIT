@@ -113,6 +113,22 @@ fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachinePro
                 .divsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .movsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .ret => |v| { if (v) |op| try checkOp(&used, op); },
+                .not => |v| { try checkOp(&used, v.dest); },
+                .negss => |v| { try checkOp(&used, v.dest); },
+                .negsd => |v| { try checkOp(&used, v.dest); },
+                .movsxd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .movsx8 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .movsx16 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .movzx16 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cvtsi2ss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cvtsi2sd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cvttss2si => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cvttsd2si => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cvtss2sd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cvtsd2ss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .frem32 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .frem64 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .cmp3 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.left); try checkOp(&used, v.right); },
                 else => {},
             }
         }
@@ -267,6 +283,20 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                 std.mem.writeInt(i32, &bytes, offset, .little);
                 try c.appendSlice(&bytes);
             }
+        }
+    }.run;
+
+    // MOV r64, imm32 (sign-extended). Always 7 bytes (REX.W C7 /0 id) — the
+    // fixed size matters for the hand-computed rel8 jumps in cmp3.
+    const emitMovRegImm32 = struct {
+        fn run(c: *CodeWriter, reg: x86.PhysicalReg, val: i32) !void {
+            const d = regCode(reg);
+            try c.append(makeRex(true, 0, d));
+            try c.append(0xC7);
+            try c.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(i32, &bytes, val, .little);
+            try c.appendSlice(&bytes);
         }
     }.run;
 
@@ -520,6 +550,213 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         return EmitterError.UnsupportedOperandCombination;
                     }
                 },
+                .not => |v| {
+                    if (v.dest == .reg) {
+                        // NOT r64 -> REX.W F7 /2
+                        const d = regCode(v.dest.reg);
+                        try code.append(makeRex(true, 0, d));
+                        try code.append(0xF7);
+                        try code.append(makeModRM(0b11, 2, @as(u3, @truncate(d))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- Sign/zero extensions ----
+                .movsxd => |v| {
+                    if (v.dest == .reg and v.src == .reg) {
+                        // MOVSXD r64, r/m32 -> REX.W 63 /r
+                        const d = regCode(v.dest.reg);
+                        const s = regCode(v.src.reg);
+                        try code.append(makeRex(true, d, s));
+                        try code.append(0x63);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                .movsx8 => |v| {
+                    if (v.dest == .reg and v.src == .reg) {
+                        // MOVSX r64, r/m8 -> REX.W 0F BE /r
+                        const d = regCode(v.dest.reg);
+                        const s = regCode(v.src.reg);
+                        try code.append(makeRex(true, d, s));
+                        try code.append(0x0F);
+                        try code.append(0xBE);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                .movsx16 => |v| {
+                    if (v.dest == .reg and v.src == .reg) {
+                        // MOVSX r64, r/m16 -> REX.W 0F BF /r
+                        const d = regCode(v.dest.reg);
+                        const s = regCode(v.src.reg);
+                        try code.append(makeRex(true, d, s));
+                        try code.append(0x0F);
+                        try code.append(0xBF);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                .movzx16 => |v| {
+                    if (v.dest == .reg and v.src == .reg) {
+                        // MOVZX r64, r/m16 -> REX.W 0F B7 /r
+                        const d = regCode(v.dest.reg);
+                        const s = regCode(v.src.reg);
+                        try code.append(makeRex(true, d, s));
+                        try code.append(0x0F);
+                        try code.append(0xB7);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- Int ↔ float conversions ----
+                .cvtsi2ss, .cvtsi2sd, .cvttss2si, .cvttsd2si => {
+                    const parts = switch (inst) {
+                        .cvtsi2ss => .{ inst.cvtsi2ss.dest, inst.cvtsi2ss.src, @as(u8, 0xF3), @as(u8, 0x2A) },
+                        .cvtsi2sd => .{ inst.cvtsi2sd.dest, inst.cvtsi2sd.src, @as(u8, 0xF2), @as(u8, 0x2A) },
+                        .cvttss2si => .{ inst.cvttss2si.dest, inst.cvttss2si.src, @as(u8, 0xF3), @as(u8, 0x2C) },
+                        .cvttsd2si => .{ inst.cvttsd2si.dest, inst.cvttsd2si.src, @as(u8, 0xF2), @as(u8, 0x2C) },
+                        else => unreachable,
+                    };
+                    const dest_op = parts[0];
+                    const src_op = parts[1];
+                    if (dest_op == .reg and src_op == .reg) {
+                        // prefix REX.W 0F 2A/2C /r (dest in reg field, src in rm)
+                        const d = regCode(dest_op.reg);
+                        const s = regCode(src_op.reg);
+                        try code.append(parts[2]);
+                        try code.append(makeRex(true, d, s));
+                        try code.append(0x0F);
+                        try code.append(parts[3]);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                .cvtss2sd, .cvtsd2ss => {
+                    const parts = switch (inst) {
+                        .cvtss2sd => .{ inst.cvtss2sd.dest, inst.cvtss2sd.src, @as(u8, 0xF3) },
+                        .cvtsd2ss => .{ inst.cvtsd2ss.dest, inst.cvtsd2ss.src, @as(u8, 0xF2) },
+                        else => unreachable,
+                    };
+                    const dest_op = parts[0];
+                    const src_op = parts[1];
+                    if (dest_op == .reg and src_op == .reg) {
+                        // prefix 0F 5A /r
+                        const d = regCode(dest_op.reg);
+                        const s = regCode(src_op.reg);
+                        try code.append(parts[2]);
+                        const rex = makeRex(false, d, s);
+                        if (rex != 0x40) try code.append(rex);
+                        try code.append(0x0F);
+                        try code.append(0x5A);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(d)), @as(u3, @truncate(s))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- SSE negation: flip the sign bit via XORPS/XORPD with a
+                //      stack-materialized mask (no scratch register needed) ----
+                .negss => |v| {
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        try emitSubRsp(&code, 16);
+                        // MOV dword [rsp], 0x80000000  -> C7 04 24 imm32
+                        try code.appendSlice(&[_]u8{ 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x80 });
+                        // XORPS dest, [rsp] -> 0F 57 /r (mod=00, rm=100 + SIB rsp)
+                        const rex = makeRex(false, d, 4);
+                        if (rex != 0x40) try code.append(rex);
+                        try code.append(0x0F);
+                        try code.append(0x57);
+                        try code.append(makeModRM(0b00, @as(u3, @truncate(d)), 4));
+                        try code.append(0x24);
+                        try emitAddRsp(&code, 16);
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                .negsd => |v| {
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        try emitSubRsp(&code, 16);
+                        // MOV dword [rsp], 0        -> C7 04 24 imm32
+                        try code.appendSlice(&[_]u8{ 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00 });
+                        // MOV dword [rsp+4], 0x80000000 -> C7 44 24 04 imm32
+                        try code.appendSlice(&[_]u8{ 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x80 });
+                        // XORPD dest, [rsp] -> 66 0F 57 /r
+                        try code.append(0x66);
+                        const rex = makeRex(false, d, 4);
+                        if (rex != 0x40) try code.append(rex);
+                        try code.append(0x0F);
+                        try code.append(0x57);
+                        try code.append(makeModRM(0b00, @as(u3, @truncate(d)), 4));
+                        try code.append(0x24);
+                        try emitAddRsp(&code, 16);
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- Three-way compare: dest = -1/0/1 (branchy but self-contained) ----
+                .cmp3 => |v| {
+                    if (v.dest != .reg or v.left != .reg or v.right != .reg)
+                        return EmitterError.UnsupportedOperandCombination;
+                    const dest_reg = v.dest.reg;
+                    const l = regCode(v.left.reg);
+                    const r = regCode(v.right.reg);
+
+                    if (v.kind == .cmp_long) {
+                        // mov dest, 0            (7 bytes, flags untouched)
+                        // cmp left, right        (REX.W 3B /r, 3 bytes)
+                        // je  end (+16)
+                        // mov dest, 1            (7)
+                        // jg  end (+7)
+                        // mov dest, -1           (7)
+                        try emitMovRegImm32(&code, dest_reg, 0);
+                        try code.append(makeRex(true, l, r));
+                        try code.append(0x3B);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(l)), @as(u3, @truncate(r))));
+                        try code.appendSlice(&[_]u8{ 0x74, 16 }); // JE rel8
+                        try emitMovRegImm32(&code, dest_reg, 1);
+                        try code.appendSlice(&[_]u8{ 0x7F, 7 }); // JG rel8
+                        try emitMovRegImm32(&code, dest_reg, -1);
+                    } else {
+                        // Dalvik NaN bias: cmpl → -1 on NaN, cmpg → +1 on NaN.
+                        // mov dest, bias
+                        // ucomiss/ucomisd left, right   (unordered → ZF=PF=CF=1)
+                        // jp  end (+25)   ; NaN → keep bias
+                        // mov dest, 1
+                        // ja  end (+16)   ; CF=0,ZF=0 → left > right
+                        // mov dest, 0
+                        // je  end (+7)    ; equal
+                        // mov dest, -1    ; less
+                        const bias: i32 = switch (v.kind) {
+                            .cmpg_float, .cmpg_double => 1,
+                            else => -1,
+                        };
+                        const is_double = v.kind == .cmpl_double or v.kind == .cmpg_double;
+                        try emitMovRegImm32(&code, dest_reg, bias);
+                        if (is_double) try code.append(0x66);
+                        const rex = makeRex(false, l, r);
+                        if (rex != 0x40) try code.append(rex);
+                        try code.append(0x0F);
+                        try code.append(0x2E); // UCOMISS/UCOMISD
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(l)), @as(u3, @truncate(r))));
+                        try code.appendSlice(&[_]u8{ 0x7A, 25 }); // JP rel8
+                        try emitMovRegImm32(&code, dest_reg, 1);
+                        try code.appendSlice(&[_]u8{ 0x77, 16 }); // JA rel8
+                        try emitMovRegImm32(&code, dest_reg, 0);
+                        try code.appendSlice(&[_]u8{ 0x74, 7 }); // JE rel8
+                        try emitMovRegImm32(&code, dest_reg, -1);
+                    }
+                },
 
                 // ---- SSE Single-Precision Float ----
                 .addss => |v| {
@@ -674,8 +911,259 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         try code.append(rex);
                         try code.append(0x31);
                         try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                    } else if (v.dest == .reg and v.src == .imm) {
+                        const d = regCode(v.dest.reg);
+                        const val = v.src.imm;
+                        try code.append(makeRex(true, 0, d));
+                        if (val >= -128 and val <= 127) {
+                            try code.append(0x83);
+                            try code.append(makeModRM(0b11, 6, @as(u3, @truncate(d))));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(val)))));
+                        } else {
+                            try code.append(0x81);
+                            try code.append(makeModRM(0b11, 6, @as(u3, @truncate(d))));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, val, .little);
+                            try code.appendSlice(&bytes);
+                        }
                     } else {
                         return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- Bitwise (AND / OR) ----
+                .and_op => |v| {
+                    if (v.dest == .reg and v.src == .reg) {
+                        // AND r/m64, r64 -> REX.W 21 /r
+                        const d = regCode(v.dest.reg);
+                        const s = regCode(v.src.reg);
+                        try code.append(makeRex(true, s, d));
+                        try code.append(0x21);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                    } else if (v.dest == .reg and v.src == .imm) {
+                        // AND r/m64, imm -> REX.W 83 /4 ib  or  81 /4 id
+                        const d = regCode(v.dest.reg);
+                        const val = v.src.imm;
+                        try code.append(makeRex(true, 0, d));
+                        if (val >= -128 and val <= 127) {
+                            try code.append(0x83);
+                            try code.append(makeModRM(0b11, 4, @as(u3, @truncate(d))));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(val)))));
+                        } else {
+                            try code.append(0x81);
+                            try code.append(makeModRM(0b11, 4, @as(u3, @truncate(d))));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, val, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                .or_op => |v| {
+                    if (v.dest == .reg and v.src == .reg) {
+                        // OR r/m64, r64 -> REX.W 09 /r
+                        const d = regCode(v.dest.reg);
+                        const s = regCode(v.src.reg);
+                        try code.append(makeRex(true, s, d));
+                        try code.append(0x09);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(s)), @as(u3, @truncate(d))));
+                    } else if (v.dest == .reg and v.src == .imm) {
+                        // OR r/m64, imm -> REX.W 83 /1 ib  or  81 /1 id
+                        const d = regCode(v.dest.reg);
+                        const val = v.src.imm;
+                        try code.append(makeRex(true, 0, d));
+                        if (val >= -128 and val <= 127) {
+                            try code.append(0x83);
+                            try code.append(makeModRM(0b11, 1, @as(u3, @truncate(d))));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(val)))));
+                        } else {
+                            try code.append(0x81);
+                            try code.append(makeModRM(0b11, 1, @as(u3, @truncate(d))));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, val, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+
+                // ---- Shifts ----
+                // Immediate count → C1 /r ib.  Register count must be in CL → D3 /r,
+                // so the register form materializes MOV rcx, count first.  The RA pass
+                // keeps RCX out of the general pool via the shift-count reservation.
+                .shl, .shr, .ushr => {
+                    const parts = switch (inst) {
+                        .shl => .{ inst.shl.dest, inst.shl.src, @as(u3, 4) },  // /4 SHL
+                        .shr => .{ inst.shr.dest, inst.shr.src, @as(u3, 7) },  // /7 SAR
+                        .ushr => .{ inst.ushr.dest, inst.ushr.src, @as(u3, 5) }, // /5 SHR
+                        else => unreachable,
+                    };
+                    const dest_op = parts[0];
+                    const src_op = parts[1];
+                    const ext = parts[2];
+                    if (dest_op != .reg) return EmitterError.UnsupportedOperandCombination;
+                    const d = regCode(dest_op.reg);
+                    if (src_op == .imm) {
+                        try code.append(makeRex(true, 0, d));
+                        try code.append(0xC1);
+                        try code.append(makeModRM(0b11, ext, @as(u3, @truncate(d))));
+                        try code.append(@as(u8, @truncate(@as(u32, @bitCast(src_op.imm)) & 0x3f)));
+                    } else if (src_op == .reg) {
+                        // Register shift count MUST be in CL. RCX may hold a live value
+                        // (it's allocatable / the 1st param reg), so preserve it: push
+                        // rcx; mov cl-worth via full RCX; shift; pop rcx.
+                        const s = regCode(src_op.reg);
+                        const dest_is_rcx = (d == 1);
+                        const src_is_rcx = (s == 1);
+                        if (!src_is_rcx) {
+                            try code.append(0x51); // push rcx
+                            // MOV rcx, src (REX.W 89 /r, src in reg field, rcx=1 rm)
+                            try code.append(makeRex(true, s, 1));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 1));
+                        }
+                        // If dest is RCX we just overwrote it via push/mov; but dest==rcx
+                        // with a register count is contradictory (dest and count share a
+                        // reg) — the RA hint avoids this; treat as unsupported to be safe.
+                        if (dest_is_rcx and !src_is_rcx) return EmitterError.UnsupportedOperandCombination;
+                        // shift dest by CL: REX.W D3 /ext
+                        try code.append(makeRex(true, 0, d));
+                        try code.append(0xD3);
+                        try code.append(makeModRM(0b11, ext, @as(u3, @truncate(d))));
+                        if (!src_is_rcx) {
+                            try code.append(0x59); // pop rcx
+                        }
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- Integer division / remainder ----
+                // x86 IDIV divides RDX:RAX by the operand: quotient→RAX, remainder→RDX.
+                // The RA pass excludes RAX and RDX from the pool, so they are free scratch.
+                // idiv {dest,rem,src}: dest holds dividend on entry, receives quotient.
+                // irem {dest,rem,src}: dest holds dividend on entry, rem receives remainder.
+                .idiv, .irem => {
+                    const is_rem = inst == .irem;
+                    const dest_op = if (is_rem) inst.irem.dest else inst.idiv.dest;
+                    const src_op = if (is_rem) inst.irem.src else inst.idiv.src;
+                    const rem_op = if (is_rem) inst.irem.rem else inst.idiv.rem;
+                    if (dest_op != .reg) return EmitterError.UnsupportedOperandCombination;
+
+                    // MOV rax, dividend(dest)
+                    {
+                        const s = regCode(dest_op.reg);
+                        if (s != 0) {
+                            try code.append(makeRex(true, s, 0));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 0));
+                        }
+                    }
+                    // CQO  (sign-extend RAX into RDX:RAX) -> REX.W 99
+                    try code.append(0x48);
+                    try code.append(0x99);
+                    // IDIV divisor
+                    if (src_op == .reg) {
+                        // IDIV r/m64 -> REX.W F7 /7
+                        const s = regCode(src_op.reg);
+                        try code.append(makeRex(true, 0, s));
+                        try code.append(0xF7);
+                        try code.append(makeModRM(0b11, 7, @as(u3, @truncate(s))));
+                    } else if (src_op == .imm) {
+                        // No IDIV imm form. Materialize the divisor into RCX, preserving
+                        // whatever RCX held (it is allocatable), then divide by it.
+                        try code.append(0x51); // push rcx
+                        try emitMovRegImm32(&code, .rcx, src_op.imm);
+                        try code.append(makeRex(true, 0, 1)); // rcx=1
+                        try code.append(0xF7);
+                        try code.append(makeModRM(0b11, 7, 1));
+                        // Result is already in RAX(quot)/RDX(rem); restore RCX after we
+                        // move the result out below. Defer the pop by emitting it now is
+                        // wrong (would clobber flags-free RAX? no—pop doesn't touch RAX/RDX).
+                        try code.append(0x59); // pop rcx
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                    // Move result out of RAX (quotient) or RDX (remainder)
+                    if (is_rem) {
+                        if (rem_op != .reg) return EmitterError.UnsupportedOperandCombination;
+                        const r = regCode(rem_op.reg);
+                        if (r != 2) { // RDX is 2
+                            try code.append(makeRex(true, 2, r));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 2, @as(u3, @truncate(r))));
+                        }
+                    } else {
+                        const r = regCode(dest_op.reg);
+                        if (r != 0) {
+                            try code.append(makeRex(true, 0, r));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(r))));
+                        }
+                    }
+                },
+
+                // ---- Float remainder: dest = dest - trunc(dest/src)*src via SSE ----
+                // Uses XMM0 (kept out of the XMM pool) as scratch; no runtime call.
+                .frem32, .frem64 => {
+                    const is64 = inst == .frem64;
+                    const dest_op = if (is64) inst.frem64.dest else inst.frem32.dest;
+                    const src_op = if (is64) inst.frem64.src else inst.frem32.src;
+                    if (dest_op != .reg or src_op != .reg) return EmitterError.UnsupportedOperandCombination;
+                    const d = regCode(dest_op.reg);
+                    const s = regCode(src_op.reg);
+                    const pfx: u8 = if (is64) 0xF2 else 0xF3;
+                    const scratch: u4 = 0; // xmm0
+
+                    // Preserve XMM0 (allocatable / float-return reg) on the stack.
+                    const xmm0_is_operand = (d == 0 or s == 0);
+                    if (!xmm0_is_operand) {
+                        try emitSubRsp(&code, 16);
+                        // movsd [rsp], xmm0 -> F2 0F 11 /r (mod=00 rm=100 SIB rsp)
+                        try code.append(0xF2);
+                        try code.append(0x0F); try code.append(0x11);
+                        try code.append(makeModRM(0b00, 0, 4));
+                        try code.append(0x24);
+                    }
+
+                    // movaps/movsd xmm0, dest    (copy dividend)
+                    try code.append(pfx);
+                    { const rex = makeRex(false, scratch, d); if (rex != 0x40) try code.append(rex); }
+                    try code.append(0x0F); try code.append(0x10);
+                    try code.append(makeModRM(0b11, scratch, @as(u3, @truncate(d))));
+                    // divss/divsd xmm0, src
+                    try code.append(pfx);
+                    { const rex = makeRex(false, scratch, s); if (rex != 0x40) try code.append(rex); }
+                    try code.append(0x0F); try code.append(0x5E);
+                    try code.append(makeModRM(0b11, scratch, @as(u3, @truncate(s))));
+                    // roundss/roundsd xmm0, xmm0, 3 (truncate toward zero) -> 66 0F 3A 0A/0B /r ib
+                    try code.append(0x66);
+                    { const rex = makeRex(false, scratch, scratch); if (rex != 0x40) try code.append(rex); }
+                    try code.append(0x0F); try code.append(0x3A);
+                    try code.append(if (is64) @as(u8, 0x0B) else @as(u8, 0x0A));
+                    try code.append(makeModRM(0b11, scratch, scratch));
+                    try code.append(0x03); // round-toward-zero
+                    // mulss/mulsd xmm0, src
+                    try code.append(pfx);
+                    { const rex = makeRex(false, scratch, s); if (rex != 0x40) try code.append(rex); }
+                    try code.append(0x0F); try code.append(0x59);
+                    try code.append(makeModRM(0b11, scratch, @as(u3, @truncate(s))));
+                    // subss/subsd dest, xmm0    (dest -= trunc(dest/src)*src)
+                    try code.append(pfx);
+                    { const rex = makeRex(false, d, scratch); if (rex != 0x40) try code.append(rex); }
+                    try code.append(0x0F); try code.append(0x5C);
+                    try code.append(makeModRM(0b11, @as(u3, @truncate(d)), scratch));
+
+                    if (!xmm0_is_operand) {
+                        // movsd xmm0, [rsp] -> F2 0F 10 /r
+                        try code.append(0xF2);
+                        try code.append(0x0F); try code.append(0x10);
+                        try code.append(makeModRM(0b00, 0, 4));
+                        try code.append(0x24);
+                        try emitAddRsp(&code, 16);
                     }
                 },
 
@@ -688,8 +1176,68 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                         try code.append(rex);
                         try code.append(0x39);
                         try code.append(makeModRM(0b11, @as(u3, @truncate(r)), @as(u3, @truncate(l))));
+                    } else if (v.left == .reg and v.right == .imm) {
+                        // CMP r/m64, imm -> REX.W 83 /7 ib  or  81 /7 id
+                        const l = regCode(v.left.reg);
+                        const val = v.right.imm;
+                        try code.append(makeRex(true, 0, l));
+                        if (val >= -128 and val <= 127) {
+                            try code.append(0x83);
+                            try code.append(makeModRM(0b11, 7, @as(u3, @truncate(l))));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(val)))));
+                        } else {
+                            try code.append(0x81);
+                            try code.append(makeModRM(0b11, 7, @as(u3, @truncate(l))));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, val, .little);
+                            try code.appendSlice(&bytes);
+                        }
                     } else {
                         return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+                // TEST r/m64, r64 -> REX.W 85 /r  (sets ZF/SF without writing)
+                .test_op => |v| {
+                    if (v.left == .reg and v.right == .reg) {
+                        const l = regCode(v.left.reg);
+                        const r = regCode(v.right.reg);
+                        try code.append(makeRex(true, r, l));
+                        try code.append(0x85);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(r)), @as(u3, @truncate(l))));
+                    } else {
+                        return EmitterError.UnsupportedOperandCombination;
+                    }
+                },
+
+                // ---- Switch: emit a compare/JE chain, one entry per key ----
+                // Falls through past the chain when no key matches, which lands on the
+                // block's default successor (the packed/sparse-switch fall-through).
+                .switch_stub => |v| {
+                    if (v.src != .reg) return EmitterError.UnsupportedOperandCombination;
+                    const sreg = regCode(v.src.reg);
+                    for (v.keys, 0..) |key, i| {
+                        // CMP src, key  -> REX.W 83 /7 ib  or  81 /7 id
+                        try code.append(makeRex(true, 0, sreg));
+                        if (key >= -128 and key <= 127) {
+                            try code.append(0x83);
+                            try code.append(makeModRM(0b11, 7, @as(u3, @truncate(sreg))));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(key)))));
+                        } else {
+                            try code.append(0x81);
+                            try code.append(makeModRM(0b11, 7, @as(u3, @truncate(sreg))));
+                            var bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &bytes, key, .little);
+                            try code.appendSlice(&bytes);
+                        }
+                        // JE target[i]  -> 0F 84 rel32 (patched in pass 2)
+                        try code.append(0x0F);
+                        try code.append(0x84);
+                        try relocations.append(.{
+                            .patch_offset = code.items.len,
+                            .target_block_id = v.targets[i],
+                            .jump_type = .jcc,
+                        });
+                        try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
                     }
                 },
 
@@ -746,6 +1294,36 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                 .jg => |v| {
                     try code.append(0x0F); // JG is 0F 8F
                     try code.append(0x8F);
+                    try relocations.append(.{
+                        .patch_offset = code.items.len,
+                        .target_block_id = v,
+                        .jump_type = .jcc,
+                    });
+                    try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                },
+                .jle => |v| {
+                    try code.append(0x0F); // JLE is 0F 8E
+                    try code.append(0x8E);
+                    try relocations.append(.{
+                        .patch_offset = code.items.len,
+                        .target_block_id = v,
+                        .jump_type = .jcc,
+                    });
+                    try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                },
+                .jz => |v| {
+                    try code.append(0x0F); // JZ == JE -> 0F 84
+                    try code.append(0x84);
+                    try relocations.append(.{
+                        .patch_offset = code.items.len,
+                        .target_block_id = v,
+                        .jump_type = .jcc,
+                    });
+                    try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                },
+                .jnz => |v| {
+                    try code.append(0x0F); // JNZ == JNE -> 0F 85
+                    try code.append(0x85);
                     try relocations.append(.{
                         .patch_offset = code.items.len,
                         .target_block_id = v,
@@ -912,4 +1490,37 @@ test "emitter: callee-saved registers and register-8 immediate load encoding" {
         0xC3,
     };
     try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "emitter: new ops (not, movsxd, shl, cmp3)" {
+    const a = std.testing.allocator;
+
+    var prog = x86.MachineProgram{
+        .blocks = std.ArrayList(x86.MachineBlock).empty,
+        .allocator = a,
+    };
+    defer prog.deinit();
+
+    var mblock = x86.MachineBlock{
+        .id = 0,
+        .instructions = std.ArrayList(x86.Inst).empty,
+    };
+
+    // NOT RAX
+    try mblock.instructions.append(a, .{ .not = .{ .dest = .{ .reg = .rax } } });
+    // MOVSXD RAX, RBX
+    try mblock.instructions.append(a, .{ .movsxd = .{ .dest = .{ .reg = .rax }, .src = .{ .reg = .rbx } } });
+    // SHL RAX, 3
+    try mblock.instructions.append(a, .{ .shl = .{ .dest = .{ .reg = .rax }, .src = .{ .imm = 3 } } });
+    // CMP3 (cmp_long) RAX, RBX, RCX
+    try mblock.instructions.append(a, .{ .cmp3 = .{ .kind = .cmp_long, .dest = .{ .reg = .rax }, .left = .{ .reg = .rbx }, .right = .{ .reg = .rcx } } });
+    // RET
+    try mblock.instructions.append(a, .{ .ret = null });
+
+    try prog.blocks.append(a, mblock);
+
+    const bytes = try emitProgram(a, &prog);
+    defer a.free(bytes);
+
+    try std.testing.expect(bytes.len > 0);
 }

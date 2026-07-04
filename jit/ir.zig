@@ -40,6 +40,43 @@ pub const CondBranch = struct {
 
 pub const CondBranchZ = struct { src: SSAVar, target_block_id: usize };
 
+/// Unary operations: negation, bitwise-not, and all primitive type conversions.
+/// Values live in 64-bit registers; int results are kept sign-extended to 64 bits,
+/// so `int_to_long` is a plain copy while `long_to_int` re-sign-extends the low 32 bits.
+pub const UnOpKind = enum {
+    neg_int,
+    not_int,
+    neg_long,
+    not_long,
+    neg_float,
+    neg_double,
+    int_to_long,
+    int_to_float,
+    int_to_double,
+    long_to_int,
+    long_to_float,
+    long_to_double,
+    float_to_int,
+    float_to_long,
+    float_to_double,
+    double_to_int,
+    double_to_long,
+    double_to_float,
+    int_to_byte,
+    int_to_char,
+    int_to_short,
+};
+
+/// Three-way comparisons producing -1/0/1 in an integer register.
+/// The `l`/`g` variants encode Dalvik's NaN bias: cmpl → -1 on NaN, cmpg → +1 on NaN.
+pub const CmpKind = enum {
+    cmp_long,
+    cmpl_float,
+    cmpg_float,
+    cmpl_double,
+    cmpg_double,
+};
+
 pub const FieldAccess = struct { dest_or_src: SSAVar, obj: SSAVar, field_idx: u32 };
 pub const StaticFieldAccess = struct { dest_or_src: SSAVar, field_idx: u32 };
 pub const ArrayAccess = struct { dest_or_src: SSAVar, array: SSAVar, index: SSAVar };
@@ -55,6 +92,12 @@ pub const IRInst = union(enum) {
 
     // Base
     move: UnOp,
+
+    // Unary math & type conversions
+    un_op: struct { kind: UnOpKind, dest: SSAVar, src: SSAVar },
+
+    // Three-way comparisons (cmp-long, cmpl/cmpg-float/double) → -1/0/1
+    cmp_op: struct { kind: CmpKind, dest: SSAVar, left: SSAVar, right: SSAVar },
 
     // Constants
     const_int: struct { dest: SSAVar, val: i32 },
@@ -93,16 +136,25 @@ pub const IRInst = union(enum) {
     sub_long: BinOp,
     mul_long: BinOp,
     div_long: BinOp,
+    rem_long: BinOp,
+    and_long: BinOp,
+    or_long: BinOp,
+    xor_long: BinOp,
+    shl_long: BinOp,
+    shr_long: BinOp,
+    ushr_long: BinOp,
 
     // Floating Point & Wide Math
     add_float: BinOp,
     sub_float: BinOp,
     mul_float: BinOp,
     div_float: BinOp,
+    rem_float: BinOp,
     add_wide: BinOp,
     sub_wide: BinOp,
     mul_wide: BinOp,
     div_wide: BinOp,
+    rem_wide: BinOp,
 
     // Object & Array Allocation
     new_instance: struct { dest: SSAVar, type_idx: u32 },
@@ -161,6 +213,8 @@ pub const IRInst = union(enum) {
                 try writer.writeAll(")");
             },
             .move => |v| try writer.print("{f} = move {f}", .{ v.dest, v.src }),
+            .un_op => |v| try writer.print("{f} = {s} {f}", .{ v.dest, @tagName(v.kind), v.src }),
+            .cmp_op => |v| try writer.print("{f} = {s} {f}, {f}", .{ v.dest, @tagName(v.kind), v.left, v.right }),
 
             .const_int => |v| try writer.print("{f} = const {d}", .{ v.dest, v.val }),
             .const_wide => |v| try writer.print("{f} = const-wide {d}", .{ v.dest, v.val }),
@@ -195,14 +249,23 @@ pub const IRInst = union(enum) {
             .sub_long => |v| try writer.print("{f} = sub-long {f}, {f}", .{ v.dest, v.left, v.right }),
             .mul_long => |v| try writer.print("{f} = mul-long {f}, {f}", .{ v.dest, v.left, v.right }),
             .div_long => |v| try writer.print("{f} = div-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .rem_long => |v| try writer.print("{f} = rem-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .and_long => |v| try writer.print("{f} = and-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .or_long => |v| try writer.print("{f} = or-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .xor_long => |v| try writer.print("{f} = xor-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .shl_long => |v| try writer.print("{f} = shl-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .shr_long => |v| try writer.print("{f} = shr-long {f}, {f}", .{ v.dest, v.left, v.right }),
+            .ushr_long => |v| try writer.print("{f} = ushr-long {f}, {f}", .{ v.dest, v.left, v.right }),
             .add_float => |v| try writer.print("{f} = add {f}, {f}", .{ v.dest, v.left, v.right }),
             .sub_float => |v| try writer.print("{f} = sub {f}, {f}", .{ v.dest, v.left, v.right }),
             .mul_float => |v| try writer.print("{f} = mul {f}, {f}", .{ v.dest, v.left, v.right }),
             .div_float => |v| try writer.print("{f} = div {f}, {f}", .{ v.dest, v.left, v.right }),
+            .rem_float => |v| try writer.print("{f} = rem {f}, {f}", .{ v.dest, v.left, v.right }),
             .add_wide => |v| try writer.print("{f} = add-wide {f}, {f}", .{ v.dest, v.left, v.right }),
             .sub_wide => |v| try writer.print("{f} = sub-wide {f}, {f}", .{ v.dest, v.left, v.right }),
             .mul_wide => |v| try writer.print("{f} = mul-wide {f}, {f}", .{ v.dest, v.left, v.right }),
             .div_wide => |v| try writer.print("{f} = div-wide {f}, {f}", .{ v.dest, v.left, v.right }),
+            .rem_wide => |v| try writer.print("{f} = rem-wide {f}, {f}", .{ v.dest, v.left, v.right }),
 
             .new_instance => |v| try writer.print("{f} = new-instance @{d}", .{ v.dest, v.type_idx }),
             .new_array => |v| try writer.print("{f} = new-array {f}, @{d}", .{ v.dest, v.size, v.type_idx }),
@@ -306,6 +369,63 @@ test "ir formatting: phi and ret" {
     const inst_ret_void = IRInst{ .ret = .{ .src = null } };
     const s3 = try std.fmt.bufPrint(&buf, "{f}", .{inst_ret_void});
     try std.testing.expectEqualStrings("ret void", s3);
+}
+
+test "ir formatting: un_op and cmp_op" {
+    var buf: [128]u8 = undefined;
+
+    const inst_neg = IRInst{ .un_op = .{
+        .kind = .neg_int,
+        .dest = .{ .reg = 1, .version = 1 },
+        .src = .{ .reg = 0, .version = 1 },
+    } };
+    const s1 = try std.fmt.bufPrint(&buf, "{f}", .{inst_neg});
+    try std.testing.expectEqualStrings("v1_1 = neg_int v0_1", s1);
+
+    const inst_conv = IRInst{ .un_op = .{
+        .kind = .int_to_byte,
+        .dest = .{ .reg = 2, .version = 0 },
+        .src = .{ .reg = 1, .version = 1 },
+    } };
+    const s2 = try std.fmt.bufPrint(&buf, "{f}", .{inst_conv});
+    try std.testing.expectEqualStrings("v2_0 = int_to_byte v1_1", s2);
+
+    const inst_cmp = IRInst{ .cmp_op = .{
+        .kind = .cmpl_float,
+        .dest = .{ .reg = 0, .version = 2 },
+        .left = .{ .reg = 1, .version = 0 },
+        .right = .{ .reg = 2, .version = 0 },
+    } };
+    const s3 = try std.fmt.bufPrint(&buf, "{f}", .{inst_cmp});
+    try std.testing.expectEqualStrings("v0_2 = cmpl_float v1_0, v2_0", s3);
+}
+
+test "ir formatting: new long and rem operations" {
+    var buf: [128]u8 = undefined;
+
+    const inst_rem = IRInst{ .rem_long = .{
+        .dest = .{ .reg = 2, .version = 0 },
+        .left = .{ .reg = 0, .version = 1 },
+        .right = .{ .reg = 1, .version = 2 },
+    } };
+    const s1 = try std.fmt.bufPrint(&buf, "{f}", .{inst_rem});
+    try std.testing.expectEqualStrings("v2_0 = rem-long v0_1, v1_2", s1);
+
+    const inst_xor = IRInst{ .xor_long = .{
+        .dest = .{ .reg = 3, .version = 0 },
+        .left = .{ .reg = 2, .version = 0 },
+        .right = .{ .reg = 1, .version = 2 },
+    } };
+    const s2 = try std.fmt.bufPrint(&buf, "{f}", .{inst_xor});
+    try std.testing.expectEqualStrings("v3_0 = xor-long v2_0, v1_2", s2);
+
+    const inst_remw = IRInst{ .rem_wide = .{
+        .dest = .{ .reg = 4, .version = 0 },
+        .left = .{ .reg = 0, .version = 0 },
+        .right = .{ .reg = 2, .version = 0 },
+    } };
+    const s3 = try std.fmt.bufPrint(&buf, "{f}", .{inst_remw});
+    try std.testing.expectEqualStrings("v4_0 = rem-wide v0_0, v2_0", s3);
 }
 
 test "ir formatting: long operations" {

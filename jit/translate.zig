@@ -72,7 +72,8 @@ pub fn translateCFG(
                     }
                     break :blk .{ .move = .{ .dest = ssa(v.dest), .src = ssa(0) } };
                 },
-                .move_exception => |v| .{ .move = .{ .dest = ssa(v.dest), .src = ssa(0) } },
+                // Exception objects require runtime exception-dispatch support.
+                .move_exception => return error.UnimplementedOpcode,
 
                 // --- Returns ---
                 .return_void => .{ .ret = .{ .src = null } },
@@ -92,15 +93,20 @@ pub fn translateCFG(
                 .monitor_enter, .monitor_exit => null,
 
                 // --- Checks & Casts ---
+                // check_cast is speculatively treated as always succeeding (no runtime
+                // type system yet). It does not alter the value, so a self-move is safe.
                 .check_cast => |v| .{ .move = .{ .dest = ssa(v.src), .src = ssa(v.src) } },
-                .instance_of => |v| .{ .const_int = .{ .dest = ssa(v.dest), .val = 1 } },
+                // instance_of needs runtime class hierarchy info; a constant would
+                // silently produce wrong results.
+                .instance_of => return error.UnimplementedOpcode,
 
                 // --- Allocation & Arrays ---
-                .array_length => |v| .{ .move = .{ .dest = ssa(v.dest), .src = ssa(v.array) } },
+                // array_length needs the runtime array object layout.
+                .array_length => return error.UnimplementedOpcode,
                 .new_instance => |v| .{ .new_instance = .{ .dest = ssa(v.dest), .type_idx = v.type_idx } },
                 .new_array => |v| .{ .new_array = .{ .dest = ssa(v.dest), .size = ssa(v.size), .type_idx = v.type_idx } },
-                .filled_new_array => |v| .{ .new_instance = .{ .dest = ssa(0), .type_idx = v.type_idx } },
-                .fill_array_data => null,
+                .filled_new_array => return error.UnimplementedOpcode,
+                .fill_array_data => return error.UnimplementedOpcode,
 
                 // --- Exceptions ---
                 .throw_ => |v| .{ .throw_op = .{ .src = ssa(v.src) } },
@@ -121,10 +127,12 @@ pub fn translateCFG(
                     };
                 },
 
-                // --- Comparisons ---
-                .cmpl_float, .cmpg_float, .cmpl_double, .cmpg_double, .cmp_long => |v| .{
-                    .sub_int = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) }
-                },
+                // --- Comparisons (three-way, -1/0/1 with Dalvik NaN bias) ---
+                .cmp_long => |v| .{ .cmp_op = .{ .kind = .cmp_long, .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .cmpl_float => |v| .{ .cmp_op = .{ .kind = .cmpl_float, .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .cmpg_float => |v| .{ .cmp_op = .{ .kind = .cmpg_float, .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .cmpl_double => |v| .{ .cmp_op = .{ .kind = .cmpl_double, .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .cmpg_double => |v| .{ .cmp_op = .{ .kind = .cmpg_double, .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
 
                 // --- Conditional Branches ---
                 .if_eq => |v| .{ .if_eq = .{ .left = ssa(v.src1), .right = ssa(v.src2), .target_block_id = resolveBlockId(&start_to_id, inst_idx, v.offset) } },
@@ -182,14 +190,27 @@ pub fn translateCFG(
                 },
 
                 // --- Unary Math & Conversions ---
-                .neg_int, .not_int, .neg_long, .not_long, .neg_float, .neg_double,
-                .int_to_long, .int_to_float, .int_to_double,
-                .long_to_int, .long_to_float, .long_to_double,
-                .float_to_int, .float_to_long, .float_to_double,
-                .double_to_int, .double_to_long, .double_to_float,
-                .int_to_byte, .int_to_char, .int_to_short => |v| .{
-                    .move = .{ .dest = ssa(v.dest), .src = ssa(v.src) }
-                },
+                .neg_int => |v| .{ .un_op = .{ .kind = .neg_int, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .not_int => |v| .{ .un_op = .{ .kind = .not_int, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .neg_long => |v| .{ .un_op = .{ .kind = .neg_long, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .not_long => |v| .{ .un_op = .{ .kind = .not_long, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .neg_float => |v| .{ .un_op = .{ .kind = .neg_float, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .neg_double => |v| .{ .un_op = .{ .kind = .neg_double, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .int_to_long => |v| .{ .un_op = .{ .kind = .int_to_long, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .int_to_float => |v| .{ .un_op = .{ .kind = .int_to_float, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .int_to_double => |v| .{ .un_op = .{ .kind = .int_to_double, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .long_to_int => |v| .{ .un_op = .{ .kind = .long_to_int, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .long_to_float => |v| .{ .un_op = .{ .kind = .long_to_float, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .long_to_double => |v| .{ .un_op = .{ .kind = .long_to_double, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .float_to_int => |v| .{ .un_op = .{ .kind = .float_to_int, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .float_to_long => |v| .{ .un_op = .{ .kind = .float_to_long, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .float_to_double => |v| .{ .un_op = .{ .kind = .float_to_double, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .double_to_int => |v| .{ .un_op = .{ .kind = .double_to_int, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .double_to_long => |v| .{ .un_op = .{ .kind = .double_to_long, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .double_to_float => |v| .{ .un_op = .{ .kind = .double_to_float, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .int_to_byte => |v| .{ .un_op = .{ .kind = .int_to_byte, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .int_to_char => |v| .{ .un_op = .{ .kind = .int_to_char, .dest = ssa(v.dest), .src = ssa(v.src) } },
+                .int_to_short => |v| .{ .un_op = .{ .kind = .int_to_short, .dest = ssa(v.dest), .src = ssa(v.src) } },
 
                 // --- Binary Math ---
                 .add_int => |v| .{ .add_int = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
@@ -208,21 +229,25 @@ pub fn translateCFG(
                 .sub_long => |v| .{ .sub_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .mul_long => |v| .{ .mul_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .div_long => |v| .{ .div_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
-                .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long => |v| .{
-                    .add_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) }
-                },
+                .rem_long => |v| .{ .rem_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .and_long => |v| .{ .and_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .or_long => |v| .{ .or_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .xor_long => |v| .{ .xor_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .shl_long => |v| .{ .shl_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .shr_long => |v| .{ .shr_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .ushr_long => |v| .{ .ushr_long = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
 
                 .add_float => |v| .{ .add_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .sub_float => |v| .{ .sub_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .mul_float => |v| .{ .mul_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .div_float => |v| .{ .div_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
-                .rem_float => |v| .{ .div_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .rem_float => |v| .{ .rem_float = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
 
                 .add_double => |v| .{ .add_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .sub_double => |v| .{ .sub_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .mul_double => |v| .{ .mul_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
                 .div_double => |v| .{ .div_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
-                .rem_double => |v| .{ .div_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
+                .rem_double => |v| .{ .rem_wide = .{ .dest = ssa(v.dest), .left = ssa(v.src1), .right = ssa(v.src2) } },
 
                 // --- Literal Math ---
                 .add_int_lit16 => |v| .{ .add_lit = .{ .dest = ssa(v.dest), .src = ssa(v.src), .lit = v.lit } },
@@ -332,7 +357,6 @@ test "translateCFG: moves, constants, and monitors" {
     const insns = [_]instmod.Instruction{
         .{ .move_wide = .{ .dest = 0, .src = 1 } },
         .{ .move_object = .{ .dest = 2, .src = 3 } },
-        .{ .move_exception = .{ .dest = 4 } },
         .{ .const_wide = .{ .value = 100, .dest = 5 } },
         .{ .const_string = .{ .index = 10, .dest = 6 } },
         .{ .const_class = .{ .type_idx = 20, .dest = 7 } },
@@ -347,29 +371,24 @@ test "translateCFG: moves, constants, and monitors" {
     try translateCFG(a, &cfg, &insns);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    // Monitor enter/exit are skipped, so 11 - 2 = 9 instructions
-    try std.testing.expectEqual(@as(usize, 9), insts.len);
+    // Monitor enter/exit are skipped, so 10 - 2 = 8 instructions
+    try std.testing.expectEqual(@as(usize, 8), insts.len);
     try std.testing.expect(insts[0] == .move);
     try std.testing.expect(insts[1] == .move);
-    try std.testing.expect(insts[2] == .move);
-    try std.testing.expect(insts[3] == .const_wide);
-    try std.testing.expect(insts[4] == .const_string);
-    try std.testing.expect(insts[5] == .const_class);
+    try std.testing.expect(insts[2] == .const_wide);
+    try std.testing.expect(insts[3] == .const_string);
+    try std.testing.expect(insts[4] == .const_class);
+    try std.testing.expect(insts[5] == .const_int);
     try std.testing.expect(insts[6] == .const_int);
-    try std.testing.expect(insts[7] == .const_int);
-    try std.testing.expect(insts[8] == .ret);
+    try std.testing.expect(insts[7] == .ret);
 }
 
 test "translateCFG: checks, casts, allocations, and exceptions" {
     const a = std.testing.allocator;
     const insns = [_]instmod.Instruction{
         .{ .check_cast = .{ .type_idx = 1, .src = 2 } },
-        .{ .instance_of = .{ .type_idx = 2, .dest = 3, .src = 4 } },
-        .{ .array_length = .{ .dest = 5, .array = 6 } },
         .{ .new_instance = .{ .type_idx = 3, .dest = 7 } },
         .{ .new_array = .{ .type_idx = 4, .dest = 8, .size = 9 } },
-        .{ .filled_new_array = .{ .args = &.{}, .type_idx = 5 } },
-        .{ .fill_array_data = .{ .payload_offset = 0, .array = 10 } },
         .{ .throw_ = .{ .src = 11 } },
     };
     var cfg = try cfgmod.buildCFG(a, &insns);
@@ -377,15 +396,32 @@ test "translateCFG: checks, casts, allocations, and exceptions" {
     try translateCFG(a, &cfg, &insns);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    // fill_array_data is skipped, so 8 - 1 = 7 instructions
-    try std.testing.expectEqual(@as(usize, 7), insts.len);
+    try std.testing.expectEqual(@as(usize, 4), insts.len);
     try std.testing.expect(insts[0] == .move);
-    try std.testing.expect(insts[1] == .const_int);
-    try std.testing.expect(insts[2] == .move);
-    try std.testing.expect(insts[3] == .new_instance);
-    try std.testing.expect(insts[4] == .new_array);
-    try std.testing.expect(insts[5] == .new_instance);
-    try std.testing.expect(insts[6] == .throw_op);
+    try std.testing.expect(insts[1] == .new_instance);
+    try std.testing.expect(insts[2] == .new_array);
+    try std.testing.expect(insts[3] == .throw_op);
+}
+
+test "translateCFG: runtime-dependent opcodes are rejected, not miscompiled" {
+    const a = std.testing.allocator;
+
+    // Each of these opcodes needs runtime support (object model, exception
+    // dispatch). Translating them to anything else silently produces wrong
+    // values, so translateCFG must reject the whole method instead.
+    const rejected = [_][]const instmod.Instruction{
+        &.{ .{ .instance_of = .{ .type_idx = 2, .dest = 3, .src = 4 } }, .return_void },
+        &.{ .{ .array_length = .{ .dest = 5, .array = 6 } }, .return_void },
+        &.{ .{ .filled_new_array = .{ .args = &.{}, .type_idx = 5 } }, .return_void },
+        &.{ .{ .fill_array_data = .{ .payload_offset = 0, .array = 10 } }, .return_void },
+        &.{ .{ .move_exception = .{ .dest = 4 } }, .return_void },
+    };
+
+    for (rejected) |insns| {
+        var cfg = try cfgmod.buildCFG(a, insns);
+        defer cfg.deinit();
+        try std.testing.expectError(error.UnimplementedOpcode, translateCFG(a, &cfg, insns));
+    }
 }
 
 test "translateCFG: switches and comparisons" {
@@ -405,11 +441,18 @@ test "translateCFG: switches and comparisons" {
 
     const block0 = cfg.blocks.items[0].instructions.items;
     try std.testing.expectEqual(@as(usize, 6), block0.len);
-    try std.testing.expect(block0[0] == .sub_int);
-    try std.testing.expect(block0[1] == .sub_int);
-    try std.testing.expect(block0[2] == .sub_int);
-    try std.testing.expect(block0[3] == .sub_int);
-    try std.testing.expect(block0[4] == .sub_int);
+    try std.testing.expect(block0[0] == .cmp_op);
+    try std.testing.expectEqual(ir.CmpKind.cmpl_float, block0[0].cmp_op.kind);
+    try std.testing.expect(block0[1] == .cmp_op);
+    try std.testing.expectEqual(ir.CmpKind.cmpg_float, block0[1].cmp_op.kind);
+    try std.testing.expect(block0[2] == .cmp_op);
+    try std.testing.expectEqual(ir.CmpKind.cmpl_double, block0[2].cmp_op.kind);
+    try std.testing.expect(block0[3] == .cmp_op);
+    try std.testing.expectEqual(ir.CmpKind.cmpg_double, block0[3].cmp_op.kind);
+    try std.testing.expect(block0[4] == .cmp_op);
+    try std.testing.expectEqual(ir.CmpKind.cmp_long, block0[4].cmp_op.kind);
+    try std.testing.expectEqual(@as(u16, 13), block0[4].cmp_op.left.reg);
+    try std.testing.expectEqual(@as(u16, 14), block0[4].cmp_op.right.reg);
     try std.testing.expect(block0[5] == .switch_op);
 
     const block1 = cfg.blocks.items[1].instructions.items;
@@ -475,6 +518,8 @@ test "translateCFG: unary math and conversions" {
         .{ .not_int = .{ .dest = 2, .src = 3 } },
         .{ .long_to_int = .{ .dest = 4, .src = 5 } },
         .{ .float_to_double = .{ .dest = 6, .src = 7 } },
+        .{ .int_to_byte = .{ .dest = 8, .src = 9 } },
+        .{ .neg_double = .{ .dest = 10, .src = 12 } },
         .return_void,
     };
     var cfg = try cfgmod.buildCFG(a, &insns);
@@ -482,11 +527,21 @@ test "translateCFG: unary math and conversions" {
     try translateCFG(a, &cfg, &insns);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    try std.testing.expectEqual(@as(usize, 5), insts.len);
-    try std.testing.expect(insts[0] == .move);
-    try std.testing.expect(insts[1] == .move);
-    try std.testing.expect(insts[2] == .move);
-    try std.testing.expect(insts[3] == .move);
+    try std.testing.expectEqual(@as(usize, 7), insts.len);
+
+    const expected_kinds = [_]ir.UnOpKind{
+        .neg_int, .not_int, .long_to_int, .float_to_double, .int_to_byte, .neg_double,
+    };
+    for (expected_kinds, 0..) |kind, i| {
+        try std.testing.expect(insts[i] == .un_op);
+        try std.testing.expectEqual(kind, insts[i].un_op.kind);
+    }
+
+    // Spot-check operands survive the translation
+    try std.testing.expectEqual(@as(u16, 0), insts[0].un_op.dest.reg);
+    try std.testing.expectEqual(@as(u16, 1), insts[0].un_op.src.reg);
+    try std.testing.expectEqual(@as(u16, 8), insts[4].un_op.dest.reg);
+    try std.testing.expectEqual(@as(u16, 9), insts[4].un_op.src.reg);
 }
 
 test "translateCFG: binary math register and literals" {
@@ -511,11 +566,47 @@ test "translateCFG: binary math register and literals" {
     try std.testing.expect(insts[0] == .rem_int);
     try std.testing.expect(insts[1] == .shl_int);
     try std.testing.expect(insts[2] == .sub_long);
-    try std.testing.expect(insts[3] == .add_long);
+    try std.testing.expect(insts[3] == .rem_long);
     try std.testing.expect(insts[4] == .mul_float);
-    try std.testing.expect(insts[5] == .div_wide);
+    try std.testing.expect(insts[5] == .rem_wide);
     try std.testing.expect(insts[6] == .sub_lit);
     try std.testing.expect(insts[7] == .xor_lit);
+}
+
+test "translateCFG: long logical and shift opcodes translate to matching IR ops" {
+    const a = std.testing.allocator;
+    const insns = [_]instmod.Instruction{
+        .{ .and_long = .{ .dest = 0, .src1 = 2, .src2 = 4 } },
+        .{ .or_long = .{ .dest = 6, .src1 = 8, .src2 = 10 } },
+        .{ .xor_long = .{ .dest = 12, .src1 = 14, .src2 = 16 } },
+        .{ .shl_long = .{ .dest = 18, .src1 = 20, .src2 = 22 } },
+        .{ .shr_long = .{ .dest = 24, .src1 = 26, .src2 = 28 } },
+        .{ .ushr_long = .{ .dest = 30, .src1 = 32, .src2 = 34 } },
+        .{ .rem_long = .{ .dest = 36, .src1 = 38, .src2 = 40 } },
+        .{ .rem_float = .{ .dest = 42, .src1 = 43, .src2 = 44 } },
+        .{ .rem_double = .{ .dest = 45, .src1 = 47, .src2 = 49 } },
+        .return_void,
+    };
+    var cfg = try cfgmod.buildCFG(a, &insns);
+    defer cfg.deinit();
+    try translateCFG(a, &cfg, &insns);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 10), insts.len);
+    try std.testing.expect(insts[0] == .and_long);
+    try std.testing.expect(insts[1] == .or_long);
+    try std.testing.expect(insts[2] == .xor_long);
+    try std.testing.expect(insts[3] == .shl_long);
+    try std.testing.expect(insts[4] == .shr_long);
+    try std.testing.expect(insts[5] == .ushr_long);
+    try std.testing.expect(insts[6] == .rem_long);
+    try std.testing.expect(insts[7] == .rem_float);
+    try std.testing.expect(insts[8] == .rem_wide);
+
+    // Operands must map dest/src1/src2 → dest/left/right
+    try std.testing.expectEqual(@as(u16, 36), insts[6].rem_long.dest.reg);
+    try std.testing.expectEqual(@as(u16, 38), insts[6].rem_long.left.reg);
+    try std.testing.expectEqual(@as(u16, 40), insts[6].rem_long.right.reg);
 }
 
 test "translateCFG: all long integer math opcodes" {

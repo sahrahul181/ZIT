@@ -21,7 +21,7 @@ fn maxVersion(cfg: *cfgmod.CFG, reg: u16) u32 {
                 .const_wide => |v| v.dest,
                 .const_string => |v| v.dest,
                 .const_class => |v| v.dest,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                 .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                 .new_instance => |v| v.dest,
                 .new_array => |v| v.dest,
@@ -30,6 +30,8 @@ fn maxVersion(cfg: *cfgmod.CFG, reg: u16) u32 {
                 .aget => |v| v.dest_or_src,
                 .phi => |v| v.dest,
                 .invoke => |v| if (v.dest) |d| d else null,
+                .un_op => |v| v.dest,
+                .cmp_op => |v| v.dest,
                 else => null,
             };
             if (dest) |d| {
@@ -176,7 +178,26 @@ pub fn propagateCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                         changed = true;
                     }
                 },
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                .un_op => |*v| {
+                    const rep = resolve(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .cmp_op => |*v| {
+                    const rep_l = resolve(replacements, v.left);
+                    const rep_r = resolve(replacements, v.right);
+                    if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
+                        v.left = rep_l;
+                        changed = true;
+                    }
+                    if (rep_r.reg != v.right.reg or rep_r.version != v.right.version) {
+                        v.right = rep_r;
+                        changed = true;
+                    }
+                },
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
                     const rep_l = resolve(replacements, v.left);
                     const rep_r = resolve(replacements, v.right);
                     if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {

@@ -439,15 +439,37 @@ pub const CFG = struct {
                 .sub_long,
                 .mul_long,
                 .div_long,
+                .rem_long,
+                .and_long,
+                .or_long,
+                .xor_long,
+                .shl_long,
+                .shr_long,
+                .ushr_long,
                 .add_float,
                 .sub_float,
                 .mul_float,
                 .div_float,
+                .rem_float,
                 .add_wide,
                 .sub_wide,
                 .mul_wide,
                 .div_wide,
+                .rem_wide,
                 => |*v| {
+                    renameUse(stacks, &v.left);
+                    renameUse(stacks, &v.right);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Unary math & conversions
+                .un_op => |*v| {
+                    renameUse(stacks, &v.src);
+                    try renameDef(self.allocator, counters, stacks, &v.dest, &defs);
+                },
+
+                // Three-way comparisons
+                .cmp_op => |*v| {
                     renameUse(stacks, &v.left);
                     renameUse(stacks, &v.right);
                     try renameDef(self.allocator, counters, stacks, &v.dest, &defs);

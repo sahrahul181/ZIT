@@ -83,7 +83,7 @@ pub fn loopInvariantCodeMotion(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !
                 .const_wide => |v| v.dest,
                 .const_string => |v| v.dest,
                 .const_class => |v| v.dest,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                 .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                 .new_instance => |v| v.dest,
                 .new_array => |v| v.dest,
@@ -91,6 +91,8 @@ pub fn loopInvariantCodeMotion(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !
                 .sget => |v| v.dest_or_src,
                 .aget => |v| v.dest_or_src,
                 .phi => |v| v.dest,
+                .un_op => |v| v.dest,
+                .cmp_op => |v| v.dest,
                 else => null,
             };
             if (dest) |d| {
@@ -185,7 +187,7 @@ pub fn loopInvariantCodeMotion(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !
                                     .move => |v| {
                                         if (!is_op_invariant(def_blocks, loop_blocks, v.src)) is_invariant = false;
                                     },
-                                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| {
+                                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| {
                                         if (!is_op_invariant(def_blocks, loop_blocks, v.left) or !is_op_invariant(def_blocks, loop_blocks, v.right)) is_invariant = false;
                                     },
                                     .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| {
@@ -212,7 +214,7 @@ pub fn loopInvariantCodeMotion(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !
                                     .const_wide => |v| v.dest,
                                     .const_string => |v| v.dest,
                                     .const_class => |v| v.dest,
-                                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                                     .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                                     .new_instance => |v| v.dest,
                                     .new_array => |v| v.dest,
@@ -487,7 +489,7 @@ pub fn valueRangePropagation(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bo
                 .const_wide => |v| v.dest,
                 .const_string => |v| v.dest,
                 .const_class => |v| v.dest,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                 .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                 .new_instance => |v| v.dest,
                 .new_array => |v| v.dest,
@@ -495,6 +497,8 @@ pub fn valueRangePropagation(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bo
                 .sget => |v| v.dest_or_src,
                 .aget => |v| v.dest_or_src,
                 .phi => |v| v.dest,
+                .un_op => |v| v.dest,
+                .cmp_op => |v| v.dest,
                 else => null,
             };
             if (dest) |d| {
@@ -723,7 +727,7 @@ fn maxVersion(cfg: *cfgmod.CFG, reg: u16) u32 {
                 .const_wide => |v| v.dest,
                 .const_string => |v| v.dest,
                 .const_class => |v| v.dest,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                 .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                 .new_instance => |v| v.dest,
                 .new_array => |v| v.dest,
@@ -732,6 +736,8 @@ fn maxVersion(cfg: *cfgmod.CFG, reg: u16) u32 {
                 .aget => |v| v.dest_or_src,
                 .phi => |v| v.dest,
                 .invoke => |v| if (v.dest) |d| d else null,
+                .un_op => |v| v.dest,
+                .cmp_op => |v| v.dest,
                 else => null,
             };
             if (dest) |d| {
@@ -924,7 +930,12 @@ pub fn loopUnrolling(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
 
                 switch (dup) {
                     .move => |*v| v.src = getRenamed(rename_map, v.src),
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                    .un_op => |*v| v.src = getRenamed(rename_map, v.src),
+                    .cmp_op => |*v| {
+                        v.left = getRenamed(rename_map, v.left);
+                        v.right = getRenamed(rename_map, v.right);
+                    },
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
                         v.left = getRenamed(rename_map, v.left);
                         v.right = getRenamed(rename_map, v.right);
                     },
@@ -960,13 +971,15 @@ pub fn loopUnrolling(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                     .const_wide => |v| v.dest,
                     .const_string => |v| v.dest,
                     .const_class => |v| v.dest,
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                     .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                     .new_instance => |v| v.dest,
                     .new_array => |v| v.dest,
                     .iget => |v| v.dest_or_src,
                     .sget => |v| v.dest_or_src,
                     .aget => |v| v.dest_or_src,
+                    .un_op => |v| v.dest,
+                    .cmp_op => |v| v.dest,
                     else => null,
                 };
 
@@ -984,13 +997,15 @@ pub fn loopUnrolling(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                         .const_wide => |*v| v.dest = new_dest,
                         .const_string => |*v| v.dest = new_dest,
                         .const_class => |*v| v.dest = new_dest,
-                        .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| v.dest = new_dest,
+                        .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| v.dest = new_dest,
                         .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |*v| v.dest = new_dest,
                         .new_instance => |*v| v.dest = new_dest,
                         .new_array => |*v| v.dest = new_dest,
                         .iget => |*v| v.dest_or_src = new_dest,
                         .sget => |*v| v.dest_or_src = new_dest,
                         .aget => |*v| v.dest_or_src = new_dest,
+                        .un_op => |*v| v.dest = new_dest,
+                        .cmp_op => |*v| v.dest = new_dest,
                         else => unreachable,
                     }
                 }
@@ -1033,7 +1048,12 @@ pub fn loopUnrolling(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
             for (b.instructions.items) |*inst| {
                 switch (inst.*) {
                     .move => |*v| v.src = getRenamed(rename_map, v.src),
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                    .un_op => |*v| v.src = getRenamed(rename_map, v.src),
+                    .cmp_op => |*v| {
+                        v.left = getRenamed(rename_map, v.left);
+                        v.right = getRenamed(rename_map, v.right);
+                    },
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
                         v.left = getRenamed(rename_map, v.left);
                         v.right = getRenamed(rename_map, v.right);
                     },
@@ -1239,7 +1259,12 @@ pub fn loopStrengthReduction(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bo
 
                 switch (other_inst.*) {
                     .move => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) { v.src = phi_dest_ssa; },
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                    .un_op => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) { v.src = phi_dest_ssa; },
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
+                        if (v.left.reg == mul_dest.?.reg and v.left.version == mul_dest.?.version) { v.left = phi_dest_ssa; }
+                        if (v.right.reg == mul_dest.?.reg and v.right.version == mul_dest.?.version) { v.right = phi_dest_ssa; }
+                    },
+                    .cmp_op => |*v| {
                         if (v.left.reg == mul_dest.?.reg and v.left.version == mul_dest.?.version) { v.left = phi_dest_ssa; }
                         if (v.right.reg == mul_dest.?.reg and v.right.version == mul_dest.?.version) { v.right = phi_dest_ssa; }
                     },
@@ -1411,7 +1436,26 @@ pub fn globalRegisterCoalescing(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) 
                         changed = true;
                     }
                 },
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                .un_op => |*v| {
+                    const rep = resolve(coalesced, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .cmp_op => |*v| {
+                    const rep_l = resolve(coalesced, v.left);
+                    const rep_r = resolve(coalesced, v.right);
+                    if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
+                        v.left = rep_l;
+                        changed = true;
+                    }
+                    if (rep_r.reg != v.right.reg or rep_r.version != v.right.version) {
+                        v.right = rep_r;
+                        changed = true;
+                    }
+                },
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
                     const rep_l = resolve(coalesced, v.left);
                     const rep_r = resolve(coalesced, v.right);
                     if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
@@ -1703,7 +1747,26 @@ pub fn globalValueNumbering(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !boo
                         changed = true;
                     }
                 },
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                .un_op => |*v| {
+                    const rep = resolveRepl(replacements, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .cmp_op => |*v| {
+                    const rep_l = resolveRepl(replacements, v.left);
+                    const rep_r = resolveRepl(replacements, v.right);
+                    if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
+                        v.left = rep_l;
+                        changed = true;
+                    }
+                    if (rep_r.reg != v.right.reg or rep_r.version != v.right.version) {
+                        v.right = rep_r;
+                        changed = true;
+                    }
+                },
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
                     const rep_l = resolveRepl(replacements, v.left);
                     const rep_r = resolveRepl(replacements, v.right);
                     if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
@@ -1910,7 +1973,26 @@ pub fn copyPropagateAndFold(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !boo
                         changed = true;
                     }
                 },
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |*v| {
+                .un_op => |*v| {
+                    const rep = resolve(copies, v.src);
+                    if (rep.reg != v.src.reg or rep.version != v.src.version) {
+                        v.src = rep;
+                        changed = true;
+                    }
+                },
+                .cmp_op => |*v| {
+                    const rep_l = resolve(copies, v.left);
+                    const rep_r = resolve(copies, v.right);
+                    if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
+                        v.left = rep_l;
+                        changed = true;
+                    }
+                    if (rep_r.reg != v.right.reg or rep_r.version != v.right.version) {
+                        v.right = rep_r;
+                        changed = true;
+                    }
+                },
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
                     const rep_l = resolve(copies, v.left);
                     const rep_r = resolve(copies, v.right);
                     if (rep_l.reg != v.left.reg or rep_l.version != v.left.version) {
@@ -2203,7 +2285,7 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                 .const_wide => |v| v.dest,
                 .const_string => |v| v.dest,
                 .const_class => |v| v.dest,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                 .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                 .new_instance => |v| v.dest,
                 .new_array => |v| v.dest,
@@ -2212,6 +2294,8 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                 .aget => |v| v.dest_or_src,
                 .invoke => |v| v.dest,
                 .phi => |v| v.dest,
+                .un_op => |v| v.dest,
+                .cmp_op => |v| v.dest,
                 else => null,
             };
             if (dest) |d| {
@@ -2285,7 +2369,12 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                 const inst = cfg.blocks.items[loc.block_id].instructions.items[loc.inst_idx];
                 switch (inst) {
                     .move => |op| try markAlive(allocator, &alive_vars, &worklist, op.src),
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |op| {
+                    .un_op => |op| try markAlive(allocator, &alive_vars, &worklist, op.src),
+                    .cmp_op => |op| {
+                        try markAlive(allocator, &alive_vars, &worklist, op.left);
+                        try markAlive(allocator, &alive_vars, &worklist, op.right);
+                    },
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |op| {
                         try markAlive(allocator, &alive_vars, &worklist, op.left);
                         try markAlive(allocator, &alive_vars, &worklist, op.right);
                     },
@@ -2370,7 +2459,7 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                     .const_wide => |v| v.dest,
                     .const_string => |v| v.dest,
                     .const_class => |v| v.dest,
-                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide => |v| v.dest,
+                    .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |v| v.dest,
                     .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |v| v.dest,
                     .new_instance => |v| v.dest,
                     .new_array => |v| v.dest,
@@ -2378,6 +2467,8 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                     .sget => |v| v.dest_or_src,
                     .aget => |v| v.dest_or_src,
                     .phi => |v| v.dest,
+                    .un_op => |v| v.dest,
+                    .cmp_op => |v| v.dest,
                     else => null,
                 };
                 if (dest) |d| {

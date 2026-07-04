@@ -87,6 +87,33 @@ pub const Inst = union(enum) {
     irem: struct { dest: Operand, rem: Operand, src: Operand },
     /// NEG dest (unary negate)
     neg:  struct { dest: Operand },
+    /// NOT dest (bitwise complement)
+    not:  struct { dest: Operand },
+
+    // ---- Sign/zero extensions (conversions; all extend into a 64-bit dest) ----
+    movsxd:  struct { dest: Operand, src: Operand }, // sign-extend low 32 → 64  (long-to-int re-canonicalization)
+    movsx8:  struct { dest: Operand, src: Operand }, // sign-extend low 8  → 64  (int-to-byte)
+    movsx16: struct { dest: Operand, src: Operand }, // sign-extend low 16 → 64  (int-to-short)
+    movzx16: struct { dest: Operand, src: Operand }, // zero-extend low 16 → 64  (int-to-char)
+
+    // ---- Int ↔ float conversions (SSE scalar) ----
+    cvtsi2ss:  struct { dest: Operand, src: Operand }, // gpr → xmm (f32)
+    cvtsi2sd:  struct { dest: Operand, src: Operand }, // gpr → xmm (f64)
+    cvttss2si: struct { dest: Operand, src: Operand }, // xmm (f32) → gpr, truncated
+    cvttsd2si: struct { dest: Operand, src: Operand }, // xmm (f64) → gpr, truncated
+    cvtss2sd:  struct { dest: Operand, src: Operand }, // f32 → f64
+    cvtsd2ss:  struct { dest: Operand, src: Operand }, // f64 → f32
+
+    // ---- SSE negation (dest = -dest, sign-bit flip) ----
+    negss: struct { dest: Operand },
+    negsd: struct { dest: Operand },
+
+    // ---- Float remainder pseudo-op (needs an fmod runtime call to emit) ----
+    frem32: struct { dest: Operand, src: Operand },
+    frem64: struct { dest: Operand, src: Operand },
+
+    // ---- Three-way compare: dest(gpr) = -1/0/1 with Dalvik NaN bias ----
+    cmp3: struct { kind: ir.CmpKind, dest: Operand, left: Operand, right: Operand },
 
     // ---- Bitwise ----
     and_op: struct { dest: Operand, src: Operand },
@@ -123,8 +150,9 @@ pub const Inst = union(enum) {
     jz:  usize,
     jnz: usize,
 
-    // ---- Switch (jump-table stub) ----
-    switch_stub: struct { src: Operand, num_cases: usize },
+    // ---- Switch: lowered to a compare-and-branch chain by the emitter ----
+    // `keys[i]` matches → jump to block `targets[i]`; fall through if none match.
+    switch_stub: struct { src: Operand, keys: []const i32, targets: []const usize },
 
     // ---- Method call stub ----
     call: struct {
@@ -160,6 +188,22 @@ pub const Inst = union(enum) {
             .idiv    => |v| { try writer.writeAll("IDIV "); try v.dest.format(writer); try writer.writeAll(", "); try v.rem.format(writer); try writer.writeAll(" <- "); try v.src.format(writer); },
             .irem    => |v| { try writer.writeAll("IREM "); try v.dest.format(writer); try writer.writeAll(", "); try v.rem.format(writer); try writer.writeAll(" <- "); try v.src.format(writer); },
             .neg     => |v| { try writer.writeAll("NEG ");  try v.dest.format(writer); },
+            .not     => |v| { try writer.writeAll("NOT ");  try v.dest.format(writer); },
+            .movsxd  => |v| { try writer.writeAll("MOVSXD ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .movsx8  => |v| { try writer.writeAll("MOVSX8 ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .movsx16 => |v| { try writer.writeAll("MOVSX16 "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .movzx16 => |v| { try writer.writeAll("MOVZX16 "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cvtsi2ss  => |v| { try writer.writeAll("CVTSI2SS ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cvtsi2sd  => |v| { try writer.writeAll("CVTSI2SD ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cvttss2si => |v| { try writer.writeAll("CVTTSS2SI "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cvttsd2si => |v| { try writer.writeAll("CVTTSD2SI "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cvtss2sd  => |v| { try writer.writeAll("CVTSS2SD ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cvtsd2ss  => |v| { try writer.writeAll("CVTSD2SS ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .negss => |v| { try writer.writeAll("NEGSS "); try v.dest.format(writer); },
+            .negsd => |v| { try writer.writeAll("NEGSD "); try v.dest.format(writer); },
+            .frem32 => |v| { try writer.writeAll("FREM32 "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .frem64 => |v| { try writer.writeAll("FREM64 "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
+            .cmp3 => |v| { try writer.print("CMP3.{s} ", .{@tagName(v.kind)}); try v.dest.format(writer); try writer.writeAll(", "); try v.left.format(writer); try writer.writeAll(", "); try v.right.format(writer); },
             .and_op  => |v| { try writer.writeAll("AND ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .or_op   => |v| { try writer.writeAll("OR ");   try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .xor_op  => |v| { try writer.writeAll("XOR ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
@@ -189,7 +233,16 @@ pub const Inst = union(enum) {
             .mulsd   => |v| { try writer.writeAll("MULSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .divsd   => |v| { try writer.writeAll("DIVSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .movsd   => |v| { try writer.writeAll("MOVSD "); try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
-            .switch_stub => |v| { try writer.writeAll("SWITCH "); try v.src.format(writer); try writer.print(", {d} cases", .{v.num_cases}); },
+            .switch_stub => |v| {
+                try writer.writeAll("SWITCH ");
+                try v.src.format(writer);
+                try writer.writeAll(" [");
+                for (v.keys, 0..) |k, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.print("{d}->bb{d}", .{ k, v.targets[i] });
+                }
+                try writer.writeAll("]");
+            },
             .call => |v| {
                 if (v.dest) |d| { try d.format(writer); try writer.writeAll(" = "); }
                 try writer.print("CALL method[{d}]", .{v.method_idx});

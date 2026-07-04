@@ -316,6 +316,64 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 .throw_stub => |v| {
                     try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
+                .not => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                },
+                .movsxd, .movsx8, .movsx16, .movzx16 => {
+                    const ops = switch (inst) {
+                        .movsxd => |v| .{ v.dest, v.src },
+                        .movsx8 => |v| .{ v.dest, v.src },
+                        .movsx16 => |v| .{ v.dest, v.src },
+                        .movzx16 => |v| .{ v.dest, v.src },
+                        else => unreachable,
+                    };
+                    try helper.process(&interval_map, ops[0], global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, ops[1], global_inst_idx, false, .gpr);
+                },
+                // GPR → XMM
+                .cvtsi2ss, .cvtsi2sd => {
+                    const ops = switch (inst) {
+                        .cvtsi2ss => |v| .{ v.dest, v.src },
+                        .cvtsi2sd => |v| .{ v.dest, v.src },
+                        else => unreachable,
+                    };
+                    try helper.process(&interval_map, ops[0], global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, ops[1], global_inst_idx, false, .gpr);
+                },
+                // XMM → GPR
+                .cvttss2si, .cvttsd2si => {
+                    const ops = switch (inst) {
+                        .cvttss2si => |v| .{ v.dest, v.src },
+                        .cvttsd2si => |v| .{ v.dest, v.src },
+                        else => unreachable,
+                    };
+                    try helper.process(&interval_map, ops[0], global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, ops[1], global_inst_idx, false, .xmm);
+                },
+                // XMM → XMM
+                .cvtss2sd, .cvtsd2ss, .frem32, .frem64 => {
+                    const ops = switch (inst) {
+                        .cvtss2sd => |v| .{ v.dest, v.src },
+                        .cvtsd2ss => |v| .{ v.dest, v.src },
+                        .frem32 => |v| .{ v.dest, v.src },
+                        .frem64 => |v| .{ v.dest, v.src },
+                        else => unreachable,
+                    };
+                    try helper.process(&interval_map, ops[0], global_inst_idx, true, .xmm);
+                    try helper.process(&interval_map, ops[1], global_inst_idx, false, .xmm);
+                },
+                .negss => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                },
+                .negsd => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .xmm);
+                },
+                .cmp3 => |v| {
+                    const operand_class: RegClass = if (v.kind == .cmp_long) .gpr else .xmm;
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try helper.process(&interval_map, v.left, global_inst_idx, false, operand_class);
+                    try helper.process(&interval_map, v.right, global_inst_idx, false, operand_class);
+                },
                 .jmp, .je, .jne, .jl, .jle, .jg, .jge, .jz, .jnz => {},
             }
             global_inst_idx += 1;
@@ -519,6 +577,50 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     },
                     .ret => |v| {
                         if (v) |op| try collectDefsAndUses(l, op, false);
+                    },
+                    .not => |v| {
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .negss => |v| {
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .negsd => |v| {
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .movsxd, .movsx8, .movsx16, .movzx16, .cvtsi2ss, .cvtsi2sd, .cvttss2si, .cvttsd2si, .cvtss2sd, .cvtsd2ss => {
+                        const ops = switch (inst) {
+                            .movsxd => |v| .{ v.dest, v.src },
+                            .movsx8 => |v| .{ v.dest, v.src },
+                            .movsx16 => |v| .{ v.dest, v.src },
+                            .movzx16 => |v| .{ v.dest, v.src },
+                            .cvtsi2ss => |v| .{ v.dest, v.src },
+                            .cvtsi2sd => |v| .{ v.dest, v.src },
+                            .cvttss2si => |v| .{ v.dest, v.src },
+                            .cvttsd2si => |v| .{ v.dest, v.src },
+                            .cvtss2sd => |v| .{ v.dest, v.src },
+                            .cvtsd2ss => |v| .{ v.dest, v.src },
+                            else => unreachable,
+                        };
+                        try collectDefsAndUses(l, ops[1], false);
+                        try collectDefsAndUses(l, ops[0], true);
+                    },
+                    .frem32 => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .frem64 => |v| {
+                        try collectDefsAndUses(l, v.src, false);
+                        try collectDefsAndUses(l, v.dest, false);
+                        try collectDefsAndUses(l, v.dest, true);
+                    },
+                    .cmp3 => |v| {
+                        try collectDefsAndUses(l, v.left, false);
+                        try collectDefsAndUses(l, v.right, false);
+                        try collectDefsAndUses(l, v.dest, true);
                     },
                     else => {},
                 }
@@ -929,6 +1031,68 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 },
                 .throw_stub => |*v| {
                     v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .not => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                },
+                .negss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                },
+                .negsd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                },
+                .movsxd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .movsx8 => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .movsx16 => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .movzx16 => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cvtsi2ss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cvtsi2sd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cvttss2si => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cvttsd2si => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cvtss2sd => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cvtsd2ss => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .frem32 => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .frem64 => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .cmp3 => |*v| {
+                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.left = rewriteOp.run(&allocation_results, v.left);
+                    v.right = rewriteOp.run(&allocation_results, v.right);
                 },
                 .jmp, .je, .jne, .jl, .jle, .jg, .jge, .jz, .jnz => {},
             }

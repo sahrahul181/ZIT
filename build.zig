@@ -181,6 +181,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lower", .module = lower_mod },
             .{ .name = "regalloc", .module = regalloc_mod },
             .{ .name = "emitter", .module = emitter_mod },
+            .{ .name = "instruction", .module = inst_mod },
+            .{ .name = "translate", .module = translate_mod },
         },
     });
     const exec_mem_mod_test = b.addTest(.{ .root_module = exec_mem_mod });
