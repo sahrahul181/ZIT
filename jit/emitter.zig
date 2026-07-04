@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir");
 const x86 = @import("x86");
+const runtime = @import("runtime");
 
 pub const EmitterError = error{
     UnsupportedInstruction,
@@ -114,6 +115,8 @@ fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachinePro
                 .movsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .ret => |v| { if (v) |op| try checkOp(&used, op); },
                 .call => |v| { if (v.dest) |op| try checkOp(&used, op); },
+                .monitor_enter => |v| { try checkOp(&used, v.src); },
+                .monitor_exit => |v| { try checkOp(&used, v.src); },
                 .not => |v| { try checkOp(&used, v.dest); },
                 .negss => |v| { try checkOp(&used, v.dest); },
                 .negsd => |v| { try checkOp(&used, v.dest); },
@@ -1412,6 +1415,70 @@ pub fn emitProgram(allocator: std.mem.Allocator, program: *x86.MachineProgram) !
                             }
                         }
                     }
+                },
+                .monitor_enter => |v| {
+                    if (v.src == .reg) {
+                        const s = regCode(v.src.reg);
+                        if (s != 1) {
+                            try code.append(makeRex(true, s, 1));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 1));
+                        }
+                    } else if (v.src == .stack) {
+                        const offset = v.src.stack;
+                        try code.append(makeRex(true, 1, 5));
+                        try code.append(0x8B);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 1, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 1, 5));
+                            var offset_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &offset_bytes, -offset, .little);
+                            try code.appendSlice(&offset_bytes);
+                        }
+                    }
+
+                    try code.append(0x48);
+                    try code.append(0xB8);
+                    var addr_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &addr_bytes, @intFromPtr(&runtime.monitorEnter), .little);
+                    try code.appendSlice(&addr_bytes);
+
+                    try code.append(0xFF);
+                    try code.append(0xD0);
+                },
+                .monitor_exit => |v| {
+                    if (v.src == .reg) {
+                        const s = regCode(v.src.reg);
+                        if (s != 1) {
+                            try code.append(makeRex(true, s, 1));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 1));
+                        }
+                    } else if (v.src == .stack) {
+                        const offset = v.src.stack;
+                        try code.append(makeRex(true, 1, 5));
+                        try code.append(0x8B);
+                        if (offset >= -128 and offset <= 127) {
+                            try code.append(makeModRM(0b01, 1, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 1, 5));
+                            var offset_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &offset_bytes, -offset, .little);
+                            try code.appendSlice(&offset_bytes);
+                        }
+                    }
+
+                    try code.append(0x48);
+                    try code.append(0xB8);
+                    var addr_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &addr_bytes, @intFromPtr(&runtime.monitorExit), .little);
+                    try code.appendSlice(&addr_bytes);
+
+                    try code.append(0xFF);
+                    try code.append(0xD0);
                 },
 
                 else => return EmitterError.UnsupportedInstruction,

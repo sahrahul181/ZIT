@@ -158,6 +158,12 @@ pub fn build(b: *std.Build) void {
     const regalloc_mod_test = b.addTest(.{ .root_module = regalloc_mod });
     test_step.dependOn(&b.addRunArtifact(regalloc_mod_test).step);
 
+    const runtime_mod = b.addModule("runtime", .{
+        .root_source_file = b.path("runtime/runtime.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+
     const emitter_mod = b.addModule("emitter", .{
         .root_source_file = b.path("jit/emitter.zig"),
         .optimize = optimize,
@@ -165,6 +171,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ir", .module = ir_mod },
             .{ .name = "x86", .module = x86_mod },
+            .{ .name = "runtime", .module = runtime_mod },
         },
     });
     const emitter_mod_test = b.addTest(.{ .root_module = emitter_mod });
@@ -183,6 +190,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "emitter", .module = emitter_mod },
             .{ .name = "instruction", .module = inst_mod },
             .{ .name = "translate", .module = translate_mod },
+            .{ .name = "runtime", .module = runtime_mod },
         },
     });
     const exec_mem_mod_test = b.addTest(.{ .root_module = exec_mem_mod });

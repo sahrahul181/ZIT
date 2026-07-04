@@ -178,10 +178,14 @@ pub const Inst = union(enum) {
     // ---- Returns & Exceptions ----
     ret:        ?Operand,
     throw_stub: struct { src: Operand },
+    monitor_enter: struct { src: Operand },
+    monitor_exit: struct { src: Operand },
 
     // ---- Pretty printing ----
     pub fn format(self: Inst, writer: *std.Io.Writer) !void {
         switch (self) {
+            .monitor_enter => |v| { try writer.writeAll("MONITOR_ENTER "); try v.src.format(writer); },
+            .monitor_exit => |v| { try writer.writeAll("MONITOR_EXIT "); try v.src.format(writer); },
             .mov     => |v| { try writer.writeAll("MOV ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .add     => |v| { try writer.writeAll("ADD ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },
             .sub     => |v| { try writer.writeAll("SUB ");  try v.dest.format(writer); try writer.writeAll(", "); try v.src.format(writer); },

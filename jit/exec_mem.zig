@@ -6,8 +6,9 @@ const x86 = @import("x86");
 const lower = @import("lower");
 const regalloc = @import("regalloc");
 const emitter = @import("emitter");
-const translate = @import("translate");
 const instmod = @import("instruction");
+const translate = @import("translate");
+const runtime = @import("runtime");
 
 extern "kernel32" fn VirtualAlloc(
     lpAddress: ?windows.LPVOID,
@@ -700,4 +701,50 @@ test "JIT: self-recursive static call (Fibonacci) executes correctly" {
     try std.testing.expectEqual(@as(i64, 13), func(7));
     try std.testing.expectEqual(@as(i64, 21), func(8));
     try std.testing.expectEqual(@as(i64, 55), func(10));
+}
+
+test "JIT: monitor-enter and monitor-exit execution correctness" {
+    const a = std.testing.allocator;
+
+    try runtime.initRuntime(a, 1024 * 1024);
+    defer runtime.deinitRuntime();
+
+    var test_cfg = cfg.CFG{ .blocks = std.ArrayList(cfg.BasicBlock).empty, .allocator = a };
+    defer test_cfg.deinit();
+
+    var block = emptyTestBlock();
+    const x = ir.SSAVar{ .reg = 2, .version = 0 };
+
+    try block.instructions.append(a, .{ .monitor_enter = .{ .src = x } });
+    try block.instructions.append(a, .{ .monitor_exit = .{ .src = x } });
+    try block.instructions.append(a, .{ .ret = .{ .src = null } });
+    try test_cfg.blocks.append(a, block);
+
+    var prog = try lower.lowerCFG(a, &test_cfg);
+    defer prog.deinit();
+
+    try regalloc.allocateRegisters(a, &prog, &test_cfg, null, 4, 1);
+    const code_bytes = try emitter.emitProgram(a, &prog);
+    defer a.free(code_bytes);
+
+    const exec_page = try allocateExecMemory(code_bytes.len);
+    defer freeExecMemory(exec_page);
+
+    @memcpy(exec_page, code_bytes);
+
+    const JITMonitorFn = *const fn (*anyopaque) callconv(.c) void;
+    const func = @as(JITMonitorFn, @ptrCast(exec_page.ptr));
+
+    const raw_mem = try a.alloc(u8, 32);
+    defer a.free(raw_mem);
+
+    const obj_hdr = @as(*runtime.ObjectHeader, @ptrCast(@alignCast(raw_mem.ptr)));
+    obj_hdr.class_ptr = 0xAAAA;
+    obj_hdr.monitor = 0;
+
+    const obj_ptr = @intFromPtr(obj_hdr) + @sizeOf(runtime.ObjectHeader);
+
+    func(@ptrFromInt(obj_ptr));
+
+    try std.testing.expectEqual(@as(usize, 0), obj_hdr.monitor);
 }

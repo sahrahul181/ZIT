@@ -561,6 +561,12 @@ pub const CFG = struct {
                         try renameDef(self.allocator, counters, stacks, d, &defs);
                     }
                 },
+                .monitor_enter => |*v| {
+                    renameUse(stacks, &v.src);
+                },
+                .monitor_exit => |*v| {
+                    renameUse(stacks, &v.src);
+                },
                 .ret => |*v| {
                     if (v.src) |*s| {
                         renameUse(stacks, s);

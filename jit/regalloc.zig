@@ -316,6 +316,12 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                 .throw_stub => |v| {
                     try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
+                .monitor_enter => |v| {
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                },
+                .monitor_exit => |v| {
+                    try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                },
                 .not => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                 },
@@ -1030,6 +1036,12 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
                     }
                 },
                 .throw_stub => |*v| {
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .monitor_enter => |*v| {
+                    v.src = rewriteOp.run(&allocation_results, v.src);
+                },
+                .monitor_exit => |*v| {
                     v.src = rewriteOp.run(&allocation_results, v.src);
                 },
                 .not => |*v| {

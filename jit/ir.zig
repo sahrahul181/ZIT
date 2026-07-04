@@ -194,6 +194,8 @@ pub const IRInst = union(enum) {
         args: []SSAVar,
         is_self_call: bool = false,
     },
+    monitor_enter: struct { src: SSAVar },
+    monitor_exit: struct { src: SSAVar },
     ret: struct { src: ?SSAVar },
     throw_op: struct { src: SSAVar },
 
@@ -315,6 +317,8 @@ pub const IRInst = union(enum) {
                 try writer.writeAll(")");
             },
 
+            .monitor_enter => |v| try writer.print("monitor-enter {f}", .{v.src}),
+            .monitor_exit => |v| try writer.print("monitor-exit {f}", .{v.src}),
             .ret => |v| {
                 if (v.src) |s| {
                     try writer.print("ret {f}", .{s});

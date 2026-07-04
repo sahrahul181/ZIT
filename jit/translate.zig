@@ -90,7 +90,8 @@ pub fn translateCFG(
                 .const_method_type => |v| .{ .const_int = .{ .dest = ssa(v.dest), .val = @intCast(v.index) } },
 
                 // --- Monitors ---
-                .monitor_enter, .monitor_exit => null,
+                .monitor_enter => |v| .{ .monitor_enter = .{ .src = ssa(v.src) } },
+                .monitor_exit => |v| .{ .monitor_exit = .{ .src = ssa(v.src) } },
 
                 // --- Checks & Casts ---
                 // check_cast is speculatively treated as always succeeding (no runtime
@@ -372,8 +373,7 @@ test "translateCFG: moves, constants, and monitors" {
     try translateCFG(a, &cfg, &insns);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    // Monitor enter/exit are skipped, so 10 - 2 = 8 instructions
-    try std.testing.expectEqual(@as(usize, 8), insts.len);
+    try std.testing.expectEqual(@as(usize, 10), insts.len);
     try std.testing.expect(insts[0] == .move);
     try std.testing.expect(insts[1] == .move);
     try std.testing.expect(insts[2] == .const_wide);
@@ -381,7 +381,9 @@ test "translateCFG: moves, constants, and monitors" {
     try std.testing.expect(insts[4] == .const_class);
     try std.testing.expect(insts[5] == .const_int);
     try std.testing.expect(insts[6] == .const_int);
-    try std.testing.expect(insts[7] == .ret);
+    try std.testing.expect(insts[7] == .monitor_enter);
+    try std.testing.expect(insts[8] == .monitor_exit);
+    try std.testing.expect(insts[9] == .ret);
 }
 
 test "translateCFG: checks, casts, allocations, and exceptions" {

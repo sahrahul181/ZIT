@@ -612,6 +612,13 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } });
                 },
 
+                .monitor_enter => |v| {
+                    try mi.append(allocator, .{ .monitor_enter = .{ .src = opReg(v.src) } });
+                },
+                .monitor_exit => |v| {
+                    try mi.append(allocator, .{ .monitor_exit = .{ .src = opReg(v.src) } });
+                },
+
                 // ── Returns & Exceptions ──────────────────────────────────
                 .ret => |v| {
                     if (v.src) |s| {
