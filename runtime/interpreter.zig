@@ -218,6 +218,7 @@ pub const Interpreter = struct {
     // ── Frame execution loop ──────────────────────────────────────────────────
 
     pub fn runFrame(self: *Interpreter, frame: *Frame, instrs: []const Instruction) InterpError!Value {
+        @setRuntimeSafety(false);
         while (true) {
             if (frame.pc >= instrs.len) return InterpError.MethodNotFound;
             const inst = instrs[frame.pc];
