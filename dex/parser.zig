@@ -30,6 +30,7 @@ pub const DexMethod = struct {
     is_static: bool,
     signature: []const u8,
     code_off: usize,
+    tries: []const instmod.TryBlock = &.{},
 };
 
 pub const KotlinMetadata = struct {
@@ -130,6 +131,25 @@ fn readUleb128(bytes: []const u8, cursor: *usize) u32 {
         shift += 7;
     }
     return value;
+}
+
+fn readSleb128(bytes: []const u8, cursor: *usize) i32 {
+    var result: i32 = 0;
+    var shift: u5 = 0;
+    var byte: u8 = 0;
+    while (true) {
+        byte = bytes[cursor.*];
+        cursor.* += 1;
+        result |= @as(i32, byte & 0x7f) << shift;
+        shift += 7;
+        if ((byte & 0x80) == 0) {
+            break;
+        }
+    }
+    if (shift < 32 and (byte & 0x40) != 0) {
+        result |= -(@as(i32, 1) << shift);
+    }
+    return result;
 }
 
 pub const ParseError = error{
@@ -453,6 +473,63 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !DexFile {
     };
 }
 
+fn readTries(
+    arena: std.mem.Allocator,
+    bytes: []const u8,
+    code_off: usize,
+) ![]const instmod.TryBlock {
+    const tries_size = u16At(bytes, code_off + 6);
+    if (tries_size == 0) return &.{};
+
+    const insns_size = u32At(bytes, code_off + 12);
+    var tries_start = code_off + 16 + insns_size * 2;
+    if ((insns_size & 1) != 0) {
+        tries_start += 2;
+    }
+
+    const handlers_start = tries_start + tries_size * 8;
+    const tries = try arena.alloc(instmod.TryBlock, tries_size);
+
+    for (0..tries_size) |i| {
+        const try_off = tries_start + i * 8;
+        const start_addr = u32At(bytes, try_off);
+        const insn_count = u16At(bytes, try_off + 4);
+        const handler_off = u16At(bytes, try_off + 6);
+
+        var cursor = handlers_start + handler_off;
+        const size_val = readSleb128(bytes, &cursor);
+        const abs_size = @abs(size_val);
+
+        const handlers_count = abs_size + (if (size_val <= 0) @as(usize, 1) else @as(usize, 0));
+        const handlers = try arena.alloc(instmod.CatchHandler, handlers_count);
+
+        for (0..abs_size) |j| {
+            const type_idx = readUleb128(bytes, &cursor);
+            const addr = readUleb128(bytes, &cursor);
+            handlers[j] = .{
+                .type_idx = @intCast(type_idx),
+                .target_pc = @intCast(addr),
+            };
+        }
+
+        if (size_val <= 0) {
+            const catch_all_addr = readUleb128(bytes, &cursor);
+            handlers[abs_size] = .{
+                .type_idx = null,
+                .target_pc = @intCast(catch_all_addr),
+            };
+        }
+
+        tries[i] = .{
+            .start_pc = start_addr,
+            .end_pc = start_addr + insn_count,
+            .handlers = handlers,
+        };
+    }
+
+    return tries;
+}
+
 fn readMethod(arena: std.mem.Allocator, bytes: []const u8, info: MethodInfo, access_flags: u32, code_off: usize) DexMethod {
     const name = std.fmt.allocPrint(arena, "{s}->{s}", .{ info.class_name, info.method_name }) catch info.method_name;
     return .{
@@ -463,6 +540,7 @@ fn readMethod(arena: std.mem.Allocator, bytes: []const u8, info: MethodInfo, acc
         .is_static = (access_flags & 0x0008) != 0,
         .signature = info.signature,
         .code_off = code_off,
+        .tries = readTries(arena, bytes, code_off) catch &.{},
     };
 }
 

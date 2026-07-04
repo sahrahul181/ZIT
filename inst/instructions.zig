@@ -17,6 +17,17 @@ const std = @import("std");
 // --- Operand Structures ---
 // Designed for tight memory packing to minimize union bloat.
 
+pub const CatchHandler = struct {
+    type_idx: ?u32, // null for catch-all
+    target_pc: u32,
+};
+
+pub const TryBlock = struct {
+    start_pc: u32,
+    end_pc: u32,
+    handlers: []const CatchHandler,
+};
+
 pub const BinOp = struct { dest: u16, src1: u16, src2: u16 };
 pub const UnOp = struct { dest: u16, src: u16 };
 pub const LitOp = struct { dest: u16, src: u16, lit: i8 };

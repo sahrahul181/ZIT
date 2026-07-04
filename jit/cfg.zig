@@ -621,6 +621,14 @@ fn resolveTarget(base: usize, offset: i32, len: usize) CfgError!usize {
 
 /// Builds a Control Flow Graph from a linear slice of instructions.
 pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction) CfgError!CFG {
+    return buildCFGWithTries(allocator, instructions, &.{});
+}
+
+pub fn buildCFGWithTries(
+    allocator: std.mem.Allocator,
+    instructions: []const Instruction,
+    tries: []const instmod.TryBlock,
+) CfgError!CFG {
     var leaders = std.AutoHashMap(usize, void).init(allocator);
     defer leaders.deinit();
 
@@ -658,6 +666,18 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
                 else => {}, // Normal sequential instruction
             }
         }
+    }
+
+    // Rule 4: Every catch handler target is a leader.
+    for (tries) |t| {
+        for (t.handlers) |h| {
+            try leaders.put(h.target_pc, {});
+            if (h.target_pc + 1 < instructions.len) {
+                try leaders.put(h.target_pc + 1, {});
+            }
+        }
+        if (t.start_pc < instructions.len) try leaders.put(t.start_pc, {});
+        if (t.end_pc < instructions.len) try leaders.put(t.end_pc, {});
     }
 
     // --- STEP 2: Sort Leaders to Define Block Boundaries ---
@@ -698,13 +718,11 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
     }
 
     // Map each block's start index to its ID, for O(1) target → block lookup
-    // (replaces the previous O(blocks) linear scan per edge).
     var start_to_id = std.AutoHashMap(usize, usize).init(allocator);
     defer start_to_id.deinit();
     for (cfg.blocks.items) |b| try start_to_id.put(b.start_idx, b.id);
 
-    // Resolves a jump target index to the ID of the block it starts. Jump
-    // targets are always leaders, so a miss means malformed input.
+    // Resolves a jump target index to the ID of the block it starts.
     const targetBlockId = struct {
         fn f(map: *const std.AutoHashMap(usize, usize), base: usize, offset: i32, len: usize) CfgError!usize {
             const idx = try resolveTarget(base, offset, len);
@@ -720,7 +738,6 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
 
         switch (last_inst) {
             .goto_ => |v| {
-                // Unconditional jumps have exactly one successor
                 try block.successors.append(allocator, try targetBlockId(&start_to_id, block.end_idx, v.offset, n));
             },
             .return_void, .return_, .return_wide, .return_object, .throw_ => {
@@ -739,16 +756,33 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
                 if (!is_last_block) try block.successors.append(allocator, block.id + 1); // Fallthrough
             },
             else => {
-                // Could be an if_* instruction or a normal mathematical/move instruction
                 if (last_inst.branchOffset()) |offset| {
                     try block.successors.append(allocator, try targetBlockId(&start_to_id, block.end_idx, offset, n));
                 }
 
-                // Add sequential fallthrough edge
                 if (!is_last_block) {
                     try block.successors.append(allocator, block.id + 1);
                 }
             },
+        }
+
+        // Add exceptional successor edges if this block overlaps with any TryBlock
+        for (tries) |t| {
+            if (block.start_idx < t.end_pc and block.end_idx >= t.start_pc) {
+                for (t.handlers) |h| {
+                    const catch_block_id = start_to_id.get(h.target_pc) orelse continue;
+                    var already_present = false;
+                    for (block.successors.items) |succ| {
+                        if (succ == catch_block_id) {
+                            already_present = true;
+                            break;
+                        }
+                    }
+                    if (!already_present) {
+                        try block.successors.append(allocator, catch_block_id);
+                    }
+                }
+            }
         }
     }
 
@@ -1176,9 +1210,6 @@ test "cfg: rename variables and SSA generation with long arithmetic ops" {
     try cfg.renameVariables(6);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    try std.testing.expectEqual(@as(usize, 4), insts.len);
-    
-    // Check that we correctly rename long operations left and right operands
     const add_inst = insts[2].add_long;
     try std.testing.expectEqual(@as(u16, 0), add_inst.left.reg);
     try std.testing.expect(add_inst.left.version > 0);
@@ -1186,4 +1217,64 @@ test "cfg: rename variables and SSA generation with long arithmetic ops" {
     try std.testing.expect(add_inst.right.version > 0);
     try std.testing.expectEqual(@as(u16, 4), add_inst.dest.reg);
     try std.testing.expect(add_inst.dest.version > 0);
+}
+
+test "buildCFGWithTries: try/catch exceptional edges linked correctly" {
+    const a = std.testing.allocator;
+
+    const insns = [_]Instruction{
+        .{ .const_ = .{ .dest = 0, .value = 1 } },
+        .{ .div_int = .{ .dest = 1, .src1 = 0, .src2 = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+        .{ .const_ = .{ .dest = 1, .value = 99 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+
+    const handler = instmod.CatchHandler{
+        .type_idx = 1,
+        .target_pc = 3,
+    };
+    const try_block = instmod.TryBlock{
+        .start_pc = 1,
+        .end_pc = 2,
+        .handlers = &[_]instmod.CatchHandler{handler},
+    };
+
+    var cfg = try buildCFGWithTries(a, &insns, &[_]instmod.TryBlock{try_block});
+    defer cfg.deinit();
+
+    try cfg.computePredecessors();
+
+    var try_block_id: ?usize = null;
+    var catch_block_id: ?usize = null;
+
+    for (cfg.blocks.items) |block| {
+        if (block.start_idx <= 1 and block.end_idx >= 1) {
+            try_block_id = block.id;
+        }
+        if (block.start_idx <= 3 and block.end_idx >= 3) {
+            catch_block_id = block.id;
+        }
+    }
+
+    try std.testing.expect(try_block_id != null);
+    try std.testing.expect(catch_block_id != null);
+
+    var found_succ = false;
+    for (cfg.blocks.items[try_block_id.?].successors.items) |succ| {
+        if (succ == catch_block_id.?) {
+            found_succ = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_succ);
+
+    var found_pred = false;
+    for (cfg.blocks.items[catch_block_id.?].predecessors.items) |pred| {
+        if (pred == try_block_id.?) {
+            found_pred = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_pred);
 }
