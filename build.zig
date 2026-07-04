@@ -145,6 +145,19 @@ pub fn build(b: *std.Build) void {
     const lower_mod_test = b.addTest(.{ .root_module = lower_mod });
     test_step.dependOn(&b.addRunArtifact(lower_mod_test).step);
 
+    const regalloc_mod = b.addModule("regalloc", .{
+        .root_source_file = b.path("jit/regalloc.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "ir", .module = ir_mod },
+            .{ .name = "x86", .module = x86_mod },
+        },
+    });
+    const regalloc_mod_test = b.addTest(.{ .root_module = regalloc_mod });
+    test_step.dependOn(&b.addRunArtifact(regalloc_mod_test).step);
+
+
     const dex_dbg = b.addExecutable(.{
         .name = "dex-dbg",
         .root_module = b.createModule(.{
@@ -162,6 +175,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "dessa", .module = dessa_mod },
                 .{ .name = "x86", .module = x86_mod },
                 .{ .name = "lower", .module = lower_mod },
+                .{ .name = "regalloc", .module = regalloc_mod },
             },
         }),
     });

@@ -1,16 +1,27 @@
 const std = @import("std");
 const ir = @import("ir");
 
+pub const PhysicalReg = enum {
+    rax, rcx, rdx, rbx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15,
+
+    pub fn name(self: PhysicalReg) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// Operands for x86 virtual assembly.
-/// Stack/memory operands are added during Register Allocation (not yet).
 pub const Operand = union(enum) {
     vreg:  ir.SSAVar,
+    reg:   PhysicalReg,
+    stack: i32, // Stack offset from RBP/RSP
     imm:   i32,
     imm64: i64,
 
     pub fn format(self: Operand, writer: *std.Io.Writer) !void {
         switch (self) {
             .vreg  => |v| try writer.print("v{d}_{d}", .{ v.reg, v.version }),
+            .reg   => |r| try writer.print("%{s}", .{r.name()}),
+            .stack => |o| try writer.print("[rbp-{d}]", .{o}),
             .imm   => |v| try writer.print("#{d}", .{v}),
             .imm64 => |v| try writer.print("#{d}L", .{v}),
         }
