@@ -190,9 +190,16 @@ fn usage(writer: anytype) !void {
 }
 
 fn findClass(dex: *const parser.DexFile, name: []const u8) ?parser.DexClass {
+    // First pass: exact match
     for (dex.classes.items) |class| {
-        if (std.mem.eql(u8, class.name, name) or std.mem.indexOf(u8, class.name, name) != null) {
-            return class;
+        if (std.mem.eql(u8, class.name, name)) return class;
+    }
+    // Second pass: substring match (for short names like "Main" matching "Main")
+    for (dex.classes.items) |class| {
+        if (std.mem.indexOf(u8, class.name, name) != null) {
+            // Avoid matching "Foo$0" when the user asked for "Foo"
+            const after = class.name[std.mem.indexOf(u8, class.name, name).? + name.len ..];
+            if (after.len == 0 or after[0] == '/') return class;
         }
     }
     return null;
