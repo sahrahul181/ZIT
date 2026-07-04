@@ -714,10 +714,6 @@ pub fn allocateRegisters(allocator: std.mem.Allocator, program: *x86.MachineProg
     }
     std.mem.sort(LiveInterval, intervals.items, {}, compareIntervals);
 
-    for (intervals.items) |interval| {
-        std.debug.print("Interval: v{d}_{d}, start: {d}, end: {d}, class: {any}\n", .{interval.vreg.reg, interval.vreg.version, interval.start, interval.end, interval.class});
-    }
-
     // List of allocatable GPR registers.
     // Excluding RAX and RDX to prevent collision/clobbering by IDIV/IREM easily.
     const gpr_registers = [_]x86.PhysicalReg{
