@@ -157,6 +157,18 @@ pub fn build(b: *std.Build) void {
     const regalloc_mod_test = b.addTest(.{ .root_module = regalloc_mod });
     test_step.dependOn(&b.addRunArtifact(regalloc_mod_test).step);
 
+    const emitter_mod = b.addModule("emitter", .{
+        .root_source_file = b.path("jit/emitter.zig"),
+        .optimize = optimize,
+        .target = target,
+        .imports = &.{
+            .{ .name = "ir", .module = ir_mod },
+            .{ .name = "x86", .module = x86_mod },
+        },
+    });
+    const emitter_mod_test = b.addTest(.{ .root_module = emitter_mod });
+    test_step.dependOn(&b.addRunArtifact(emitter_mod_test).step);
+
 
     const dex_dbg = b.addExecutable(.{
         .name = "dex-dbg",
@@ -176,6 +188,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "x86", .module = x86_mod },
                 .{ .name = "lower", .module = lower_mod },
                 .{ .name = "regalloc", .module = regalloc_mod },
+                .{ .name = "emitter", .module = emitter_mod },
             },
         }),
     });
