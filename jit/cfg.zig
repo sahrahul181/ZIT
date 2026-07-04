@@ -2,6 +2,11 @@ const std = @import("std");
 const instmod = @import("instruction");
 const Instruction = instmod.Instruction;
 
+pub const PhiNode = struct {
+    original_reg: u16,
+    ssa_version: ?u32 = null,
+};
+
 /// A Basic Block represents a straight-line sequence of instructions
 /// with no branches in except to the entry, and no branches out except at the exit.
 pub const BasicBlock = struct {
@@ -18,6 +23,8 @@ pub const BasicBlock = struct {
     idom: ?usize,
     /// The set of block IDs where this block's dominance ends
     dominance_frontier: std.ArrayList(usize),
+    /// Tracks which original registers have a Phi function at the start of this block
+    phi_functions: std.AutoHashMapUnmanaged(u16, PhiNode),
 };
 
 pub const CFG = struct {
@@ -31,6 +38,7 @@ pub const CFG = struct {
             block.successors.deinit(self.allocator);
             block.predecessors.deinit(self.allocator);
             block.dominance_frontier.deinit(self.allocator);
+            block.phi_functions.deinit(self.allocator);
         }
         self.blocks.deinit(self.allocator);
     }
@@ -187,6 +195,58 @@ pub const CFG = struct {
             }
         }
     }
+    pub fn insertPhiFunctions(self: *CFG, def_map: std.AutoHashMap(u16, std.ArrayList(usize))) !void {
+        // Track which blocks have already had a phi inserted for a specific register
+        var has_phi = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.blocks.items.len);
+        defer has_phi.deinit(self.allocator);
+
+        // Track which blocks have already been added to our processing worklist
+        var added_to_worklist = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.blocks.items.len);
+        defer added_to_worklist.deinit(self.allocator);
+
+        var worklist = std.ArrayList(usize).empty;
+        defer worklist.deinit(self.allocator);
+
+        var it = def_map.iterator();
+        while (it.next()) |entry| {
+            const reg = entry.key_ptr.*;
+            const definers = entry.value_ptr.*.items;
+
+            // Reset our tracking sets for this specific register
+            has_phi.setRangeValue(.{ .start = 0, .end = self.blocks.items.len }, false);
+            added_to_worklist.setRangeValue(.{ .start = 0, .end = self.blocks.items.len }, false);
+            worklist.clearRetainingCapacity();
+
+            // Initialize the worklist with every block that natively defines this register
+            for (definers) |def_block_id| {
+                added_to_worklist.set(def_block_id);
+                try worklist.append(self.allocator, def_block_id);
+            }
+
+            // Iterated Dominance Frontier algorithm
+            while (worklist.items.len > 0) {
+                const b_id = worklist.pop().?;
+                const b = &self.blocks.items[b_id];
+
+                // For every block 'd' in the dominance frontier of 'b'
+                for (b.dominance_frontier.items) |d_id| {
+                    if (!has_phi.isSet(d_id)) {
+                        // Insert the Phi function!
+                        var d_block = &self.blocks.items[d_id];
+                        try d_block.phi_functions.put(self.allocator, reg, .{ .original_reg = reg });
+                        has_phi.set(d_id);
+
+                        // A phi function is a NEW definition.
+                        // We must add 'd' to the worklist to check its frontier.
+                        if (!added_to_worklist.isSet(d_id)) {
+                            added_to_worklist.set(d_id);
+                            try worklist.append(self.allocator, d_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
 };
 
 pub const CfgError = error{
@@ -275,6 +335,7 @@ pub fn buildCFG(allocator: std.mem.Allocator, instructions: []const Instruction)
             .predecessors = std.ArrayList(usize).empty,
             .idom = null,
             .dominance_frontier = std.ArrayListUnmanaged(usize).empty,
+            .phi_functions = .empty,
         });
     }
 
@@ -685,3 +746,45 @@ test "computeDominanceFrontiers: loop CFG" {
     try std.testing.expectEqual(@as(usize, 0), cfg.blocks.items[0].dominance_frontier.items.len);
     try std.testing.expectEqual(@as(usize, 0), cfg.blocks.items[2].dominance_frontier.items.len);
 }
+
+test "insertPhiFunctions: diamond CFG" {
+    const a = std.testing.allocator;
+    const insns = [_]Instruction{
+        .{ .if_eqz = .{ .src = 0, .offset = 2 } }, // idx 0
+        .{ .goto_ = .{ .offset = 2 } },              // idx 1
+        .{ .nop = {} },                               // idx 2
+        .return_void,                                 // idx 3
+    };
+    var cfg = try buildCFG(a, &insns);
+    defer cfg.deinit();
+    try cfg.computePredecessors();
+    try cfg.computeDominators();
+    try cfg.computeDominanceFrontiers();
+
+    // Map register v0 definition in block 1
+    var def_map = std.AutoHashMap(u16, std.ArrayList(usize)).init(a);
+    defer {
+        var it = def_map.iterator();
+        while (it.next()) |entry| {
+            var val = entry.value_ptr.*;
+            val.deinit(a);
+        }
+        def_map.deinit();
+    }
+
+    var defs0 = std.ArrayList(usize).empty;
+    try defs0.append(a, 1); // v0 defined in block 1
+    try def_map.put(0, defs0);
+
+    try cfg.insertPhiFunctions(def_map);
+
+    // Block 3 is in DF(1), so it should have a phi function for v0
+    const phi = cfg.blocks.items[3].phi_functions.get(0);
+    try std.testing.expect(phi != null);
+    try std.testing.expectEqual(@as(u16, 0), phi.?.original_reg);
+
+    // Block 1 and 2 should not have a phi function for v0
+    try std.testing.expect(cfg.blocks.items[1].phi_functions.get(0) == null);
+    try std.testing.expect(cfg.blocks.items[2].phi_functions.get(0) == null);
+}
+
