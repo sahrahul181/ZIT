@@ -2174,35 +2174,106 @@ pub fn emitProgram(
                     }
                 },
                 .alloc_obj => |v| {
-                    // Determine object size: 8 bytes per field (conservative estimate)
-                    var obj_size: usize = 8;
-                    if (registry != null and dex != null and v.type_idx < dex.?.type_names.len) {
-                        const tname = dex.?.type_names[v.type_idx];
-                        if (registry.?.get(tname)) |cd| {
-                            obj_size = cd.instance_fields.len * 8;
-                            if (obj_size == 0) obj_size = 8;
+                    if (v.is_stack) {
+                        const emitMovRegToStack = struct {
+                            fn f(c: *CodeWriter, src: u4, off: i32) !void {
+                                const disp = -off;
+                                try c.append(makeRex(true, @intCast(src >> 3), 0));
+                                try c.append(0x89);
+                                const reg_part = @as(u3, @truncate(src));
+                                if (disp >= -128 and disp <= 127) {
+                                    try c.append(makeModRM(0b01, reg_part, 5));
+                                    try c.append(@as(u8, @bitCast(@as(i8, @truncate(disp)))));
+                                } else {
+                                    try c.append(makeModRM(0b10, reg_part, 5));
+                                    var off_bytes: [4]u8 = undefined;
+                                    std.mem.writeInt(i32, &off_bytes, disp, .little);
+                                    try c.appendSlice(&off_bytes);
+                                }
+                            }
+                        }.f;
+
+                        const emitLeaStackToReg = struct {
+                            fn f(c: *CodeWriter, dest: u4, off: i32, adjust: i32) !void {
+                                const disp = -off + adjust;
+                                try c.append(makeRex(true, @intCast(dest >> 3), 0));
+                                try c.append(0x8D);
+                                const reg_part = @as(u3, @truncate(dest));
+                                if (disp >= -128 and disp <= 127) {
+                                    try c.append(makeModRM(0b01, reg_part, 5));
+                                    try c.append(@as(u8, @bitCast(@as(i8, @truncate(disp)))));
+                                } else {
+                                    try c.append(makeModRM(0b10, reg_part, 5));
+                                    var off_bytes: [4]u8 = undefined;
+                                    std.mem.writeInt(i32, &off_bytes, disp, .little);
+                                    try c.appendSlice(&off_bytes);
+                                }
+                            }
+                        }.f;
+
+                        var class_ptr: usize = 0;
+                        if (registry != null and dex != null and v.type_idx < dex.?.type_names.len) {
+                            const tname = dex.?.type_names[v.type_idx];
+                            if (registry.?.get(tname)) |cd| {
+                                class_ptr = @intFromPtr(cd);
+                            }
                         }
+
+                        // 1. mov rax, class_ptr
+                        try code.append(0x48);
+                        try code.append(0xB8);
+                        var class_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &class_bytes, class_ptr, .little);
+                        try code.appendSlice(&class_bytes);
+
+                        // 2. mov [rbp - (v.stack_offset + v.size)], rax (class_ptr)
+                        try emitMovRegToStack(&code, 0, v.stack_offset + @as(i32, @intCast(v.size)));
+
+                        // 3. xor rax, rax
+                        try code.appendSlice(&[_]u8{ 0x48, 0x31, 0xC0 });
+
+                        // 4. mov [rbp - (v.stack_offset + v.size - 8)], rax (monitor = 0)
+                        try emitMovRegToStack(&code, 0, v.stack_offset + @as(i32, @intCast(v.size)) - 8);
+
+                        // 5. Zero out fields (body starts at v.stack_offset + v.size - 16)
+                        var zero_off: i32 = 16;
+                        while (zero_off < v.size) : (zero_off += 8) {
+                            try emitMovRegToStack(&code, 0, v.stack_offset + @as(i32, @intCast(v.size)) - zero_off);
+                        }
+
+                        // 6. lea rax, [rbp - (v.stack_offset + v.size - 16)] (object reference)
+                        try emitLeaStackToReg(&code, 0, v.stack_offset + @as(i32, @intCast(v.size)), 16);
+                    } else {
+                        // Determine object size: 8 bytes per field (conservative estimate)
+                        var obj_size: usize = 8;
+                        if (registry != null and dex != null and v.type_idx < dex.?.type_names.len) {
+                            const tname = dex.?.type_names[v.type_idx];
+                            if (registry.?.get(tname)) |cd| {
+                                obj_size = cd.instance_fields.len * 8;
+                                if (obj_size == 0) obj_size = 8;
+                            }
+                        }
+
+                        // MOV RCX, 0 (class_ptr: no metadata yet)
+                        try code.appendSlice(&[_]u8{ 0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0 });
+
+                        // MOV RDX, obj_size
+                        try code.append(0x48);
+                        try code.append(0xBA);
+                        var sz_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &sz_bytes, obj_size, .little);
+                        try code.appendSlice(&sz_bytes);
+
+                        // MOV RAX, &runtime.gcAllocObj
+                        try code.append(0x48);
+                        try code.append(0xB8);
+                        var fn_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcAllocObj), .little);
+                        try code.appendSlice(&fn_bytes);
+                        // CALL RAX
+                        try code.append(0xFF);
+                        try code.append(0xD0);
                     }
-
-                    // MOV RCX, 0 (class_ptr: no metadata yet)
-                    try code.appendSlice(&[_]u8{ 0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0 });
-
-                    // MOV RDX, obj_size
-                    try code.append(0x48);
-                    try code.append(0xBA);
-                    var sz_bytes: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &sz_bytes, obj_size, .little);
-                    try code.appendSlice(&sz_bytes);
-
-                    // MOV RAX, &runtime.gcAllocObj
-                    try code.append(0x48);
-                    try code.append(0xB8);
-                    var fn_bytes: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcAllocObj), .little);
-                    try code.appendSlice(&fn_bytes);
-                    // CALL RAX
-                    try code.append(0xFF);
-                    try code.append(0xD0);
 
                     // MOV dest, RAX
                     if (v.dest == .reg) {

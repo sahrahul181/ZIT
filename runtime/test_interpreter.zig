@@ -125,3 +125,46 @@ test "Interpreter: Control Flow" {
     
     try testing.expectEqual(@as(u64, 1), frame.regs[2]);
 }
+
+var mock_osr_calls: u32 = 0;
+fn mockJitCompileOSR(method_ptr: usize, loop_pc: u32, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize {
+    _ = method_ptr;
+    _ = loop_pc;
+    _ = registry_ptr;
+    _ = dex_ptr;
+    mock_osr_calls += 1;
+    const target = struct {
+        fn f(regs: *u64) callconv(.c) i64 {
+            _ = regs;
+            return 999;
+        }
+    }.f;
+    return @intFromPtr(&target);
+}
+
+test "Interpreter: OSR Loop Hotness Trigger" {
+    const alloc = testing.allocator;
+    const interp = try setupTest(alloc);
+    defer teardownTest(interp);
+
+    var method = class_loader.MethodData.init(undefined, "OSRTest", false, false);
+    method.registers_size = 3;
+    method.signature = "()I";
+
+    const instrs = [_]Instruction{
+        .{ .const_ = .{ .dest = 0, .value = 0 } },
+        .{ .const_ = .{ .dest = 1, .value = 100 } },
+        .{ .add_int_lit8 = .{ .dest = 0, .src = 0, .lit = 1 } },
+        .{ .if_lt = .{ .src1 = 0, .src2 = 1, .offset = -1 } },
+        .{ .return_ = .{ .src = 0 } },
+    };
+
+    class_loader.jit_compile_osr_fn = mockJitCompileOSR;
+    mock_osr_calls = 0;
+
+    var frame = Frame.init(&method);
+    const val = try interp.runFrame(&frame, &instrs);
+
+    try testing.expect(mock_osr_calls > 0);
+    try testing.expectEqual(@as(i32, 999), val.int);
+}

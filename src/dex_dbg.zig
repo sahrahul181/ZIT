@@ -405,7 +405,7 @@ fn jitCompileFn(method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv
         idx += 1;
     }
 
-    regalloc.allocateRegisters(gpa, &machine, &cfg, is_float_param.items, is_ref_param.items, method.registers_size, method.ins_size, null, dex) catch return 0;
+    regalloc.allocateRegisters(gpa, &machine, &cfg, is_float_param.items, is_ref_param.items, method.registers_size, method.ins_size, null, dex, registry) catch return 0;
     const code_bytes = emitter.emitProgram(gpa, &machine, registry, dex) catch return 0;
 
     const exec_page = exec_mem.allocateExecMemory(code_bytes.len) catch return 0;
@@ -414,6 +414,59 @@ fn jitCompileFn(method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv
     const entry = @intFromPtr(exec_page.ptr);
     method.setJitEntry(entry);
     return entry;
+}
+
+fn jitCompileOSR(method_ptr: usize, loop_pc: u32, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize {
+    jit_compile_mutex.lockUncancelable(runtime.global_io);
+    defer jit_compile_mutex.unlock(runtime.global_io);
+
+    const method = @as(*class_loader.MethodData, @ptrFromInt(method_ptr));
+    const registry = @as(*class_loader.ClassRegistry, @ptrFromInt(registry_ptr));
+    const dex = @as(*const parser.DexFile, @ptrFromInt(dex_ptr));
+    const gpa = registry.allocator;
+
+    const arrow = std.mem.indexOf(u8, method.name, "->") orelse 0;
+    const short_name = if (arrow > 0) method.name[arrow + 2 ..] else method.name;
+    const class_desc = findClass(dex, method.class_name) orelse return 0;
+    const dex_method = findMethod(&class_desc, short_name) orelse return 0;
+    const insns = dex.decodeMethod(gpa, dex_method) catch return 0;
+
+    var cfg = cfgmod.buildCFG(gpa, insns) catch return 0;
+    defer cfg.deinit();
+
+    // Reorder cfg blocks to make the block for loop_pc the first block!
+    var loop_block_idx: ?usize = null;
+    for (cfg.blocks.items, 0..) |block, i| {
+        if (block.start_idx == loop_pc) {
+            loop_block_idx = i;
+            break;
+        }
+    }
+    if (loop_block_idx) |idx| {
+        if (idx > 0) {
+            const tmp = cfg.blocks.items[0];
+            cfg.blocks.items[0] = cfg.blocks.items[idx];
+            cfg.blocks.items[idx] = tmp;
+        }
+    }
+
+    translate.translateCFGWithMethod(gpa, &cfg, insns, method.method_idx) catch return 0;
+    buildSSA(gpa, &cfg, method.registers_size) catch return 0;
+    _ = opt.optimize(gpa, &cfg) catch return 0;
+    dessa.eliminatePhis(gpa, &cfg) catch return 0;
+    while (dessa.propagateCopies(gpa, &cfg) catch false) {}
+
+    var machine = lower.lowerCFG(gpa, &cfg) catch return 0;
+    defer machine.deinit();
+
+    // Pass ins_size = 0xFFFF to signify OSR parameter loading.
+    regalloc.allocateRegisters(gpa, &machine, &cfg, null, null, method.registers_size, 0xFFFF, null, dex, registry) catch return 0;
+    const code_bytes = emitter.emitProgram(gpa, &machine, registry, dex) catch return 0;
+
+    const exec_page = exec_mem.allocateExecMemory(code_bytes.len) catch return 0;
+    @memcpy(exec_page, code_bytes);
+
+    return @intFromPtr(exec_page.ptr);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -991,7 +1044,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             if (std.mem.eql(u8, cmd, "codegen") or std.mem.eql(u8, cmd, "run")) {
-                try regalloc.allocateRegisters(arena, &machine, &cfg, is_float_param.items, is_ref_param.items, method.registers_size, method.ins_size, null, &dex);
+                try regalloc.allocateRegisters(arena, &machine, &cfg, is_float_param.items, is_ref_param.items, method.registers_size, method.ins_size, null, &dex, null);
                 if (std.mem.eql(u8, cmd, "run")) {
                     try runtime.initRuntime(std.heap.c_allocator, 0);
                     defer runtime.deinitRuntime();
@@ -1138,6 +1191,7 @@ pub fn main(init: std.process.Init) !void {
         native.global_dex = &dex;
 
         class_loader.jit_compile_fn = jitCompileFn;
+        class_loader.jit_compile_osr_fn = jitCompileOSR;
 
         try runtime.initRuntime(std.heap.c_allocator, 0);
         defer runtime.deinitRuntime();

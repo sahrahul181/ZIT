@@ -1612,6 +1612,7 @@ pub fn optimize(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
         if (try copyPropagateAndFold(allocator, cfg)) local_changed = true;
         if (try globalRegisterCoalescing(allocator, cfg)) local_changed = true;
         if (try boundsCheckElimination(allocator, cfg)) local_changed = true;
+        if (try escapeAnalysis(allocator, cfg)) local_changed = true;
         if (try eliminateDeadCode(allocator, cfg)) local_changed = true;
         if (!local_changed) break;
         changed = true;
@@ -2564,6 +2565,130 @@ pub fn boundsCheckElimination(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !b
     return changed;
 }
 
+/// Escape Analysis (Stack Allocation) Pass.
+/// Identifies non-escaping objects and flags them for stack allocation.
+pub fn escapeAnalysis(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
+    var changed = false;
+
+    // 1. Find all variables defined by new_instance.
+    const AllocInfo = struct { block_idx: usize, inst_idx: usize };
+    var candidates = std.AutoHashMap(ir.SSAVar, AllocInfo).init(allocator);
+    defer candidates.deinit();
+
+    for (cfg.blocks.items, 0..) |block, b_idx| {
+        for (block.instructions.items, 0..) |inst, i_idx| {
+            if (inst == .new_instance) {
+                const ni = inst.new_instance;
+                if (!ni.is_stack) {
+                    try candidates.put(ni.dest, .{ .block_idx = b_idx, .inst_idx = i_idx });
+                }
+            }
+        }
+    }
+
+    if (candidates.count() == 0) return false;
+
+    // 2. Track escaping uses for each candidate.
+    var iter = candidates.iterator();
+    while (iter.next()) |entry| {
+        const root_var = entry.key_ptr.*;
+        const info = entry.value_ptr.*;
+
+        var visited = std.AutoHashMap(ir.SSAVar, void).init(allocator);
+        defer visited.deinit();
+        var worklist = std.ArrayList(ir.SSAVar).empty;
+        defer worklist.deinit(allocator);
+
+        try worklist.append(allocator, root_var);
+        try visited.put(root_var, {});
+
+        var escapes = false;
+
+        // BFS to find all uses
+        while (worklist.items.len > 0) {
+            const current_var = worklist.pop().?;
+
+            // Scan all instructions in all blocks for uses of current_var
+            for (cfg.blocks.items) |block| {
+                for (block.instructions.items) |inst| {
+                    switch (inst) {
+                        .move => |v| {
+                            if (std.meta.eql(v.src, current_var)) {
+                                if (!visited.contains(v.dest)) {
+                                    try visited.put(v.dest, {});
+                                    try worklist.append(allocator, v.dest);
+                                }
+                            }
+                        },
+                        .phi => |v| {
+                            var uses_in_phi = false;
+                            for (v.args) |arg| {
+                                if (std.meta.eql(arg.val, current_var)) {
+                                    uses_in_phi = true;
+                                    break;
+                                }
+                            }
+                            if (uses_in_phi) {
+                                if (!visited.contains(v.dest)) {
+                                    try visited.put(v.dest, {});
+                                    try worklist.append(allocator, v.dest);
+                                }
+                            }
+                        },
+                        .ret => |v| {
+                            if (v.src) |src| {
+                                if (std.meta.eql(src, current_var)) {
+                                    escapes = true;
+                                }
+                            }
+                        },
+                        .invoke => |v| {
+                            for (v.args) |arg| {
+                                if (std.meta.eql(arg, current_var)) {
+                                    escapes = true;
+                                }
+                            }
+                        },
+                        .iput => |v| {
+                            if (std.meta.eql(v.dest_or_src, current_var)) {
+                                escapes = true;
+                            }
+                        },
+                        .sput => |v| {
+                            if (std.meta.eql(v.dest_or_src, current_var)) {
+                                escapes = true;
+                            }
+                        },
+                        .aput => |v| {
+                            if (std.meta.eql(v.dest_or_src, current_var)) {
+                                escapes = true;
+                            }
+                        },
+                        .throw_op => |v| {
+                            if (std.meta.eql(v.src, current_var)) {
+                                escapes = true;
+                            }
+                        },
+                        else => {},
+                    }
+                    if (escapes) break;
+                }
+                if (escapes) break;
+            }
+            if (escapes) break;
+        }
+
+        if (!escapes) {
+            const block = &cfg.blocks.items[info.block_idx];
+            var inst = &block.instructions.items[info.inst_idx];
+            inst.new_instance.is_stack = true;
+            changed = true;
+        }
+    }
+
+    return changed;
+}
+
 
 test "eliminateDeadCode: basic dead code elimination" {
     const a = std.testing.allocator;
@@ -3220,5 +3345,37 @@ test "boundsCheckElimination: basic constant and redundancy elimination" {
         }
         try std.testing.expectEqual(@as(usize, 0), bc_count);
     }
+}
+
+test "escapeAnalysis: basic stack allocation" {
+    const a = std.testing.allocator;
+    const instmod = @import("instruction");
+    const translate = @import("translate");
+
+    const insns = [_]instmod.Instruction{
+        .{ .new_instance = .{ .dest = 0, .type_idx = 0 } },
+        .{ .const_ = .{ .value = 10, .dest = 1 } },
+        .{ .iput = .{ .dest_or_src = 1, .obj = 0, .field_idx = 0 } },
+        .return_void,
+    };
+
+    var cfg = try cfgmod.buildCFG(a, &insns);
+    defer cfg.deinit();
+
+    try translate.translateCFG(a, &cfg, &insns);
+
+    const changed = try escapeAnalysis(a, &cfg);
+    try std.testing.expect(changed);
+
+    const insts = cfg.blocks.items[0].instructions.items;
+    var found_stack_alloc = false;
+    for (insts) |inst| {
+        if (inst == .new_instance) {
+            if (inst.new_instance.is_stack) {
+                found_stack_alloc = true;
+            }
+        }
+    }
+    try std.testing.expect(found_stack_alloc);
 }
 

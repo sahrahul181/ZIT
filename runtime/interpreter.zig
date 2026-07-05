@@ -77,6 +77,7 @@ pub const Frame = struct {
     result: u64, // return value (raw bits)
     result_tag: ResultTag,
     exception: usize, // ref to pending Throwable, or 0
+    osr_counter: u32,
 
     pub const ResultTag = enum { void_val, int, long, float, double, ref };
 
@@ -89,6 +90,7 @@ pub const Frame = struct {
             .result = 0,
             .result_tag = .void_val,
             .exception = 0,
+            .osr_counter = 0,
         };
     }
 };
@@ -272,6 +274,7 @@ pub const Interpreter = struct {
         @setRuntimeSafety(false);
         while (true) {
             if (frame.pc >= instrs.len) return InterpError.MethodNotFound;
+            const prev_pc = frame.pc;
             const inst = instrs[frame.pc];
             frame.pc += 1;
 
@@ -897,7 +900,37 @@ pub const Interpreter = struct {
                     frame.result = @intFromPtr(arr);
                 },
             }
+
+            if (frame.pc < prev_pc) {
+                frame.osr_counter += 1;
+                if (frame.osr_counter >= 50) {
+                    if (try self.triggerOSR(frame, frame.pc)) |val| return val;
+                }
+            }
         }
+    }
+
+    fn triggerOSR(self: *Interpreter, frame: *Frame, target_pc: u32) !?Value {
+        if (class_loader.jit_compile_osr_fn) |compile_osr| {
+            const entry = compile_osr(@intFromPtr(frame.method), target_pc, @intFromPtr(self.registry), @intFromPtr(self.dex));
+            if (entry != 0) {
+                const osr_fn = @as(*const fn (*u64) callconv(.c) i64, @ptrFromInt(entry));
+                const raw = osr_fn(&frame.regs[0]);
+                const sig = frame.method.signature;
+                const ret_char = if (sig.len > 0) sig[sig.len - 1] else 'V';
+                const raw_u = @as(u64, @bitCast(raw));
+                if (ret_char == 'V') {
+                    return .void_val;
+                } else if (ret_char == 'J' or ret_char == 'D') {
+                    return .{ .long = raw };
+                } else if (ret_char == 'L' or ret_char == '[') {
+                    return .{ .ref = @intCast(raw_u) };
+                } else {
+                    return .{ .int = @as(i32, @bitCast(@as(u32, @truncate(raw_u)))) };
+                }
+            }
+        }
+        return null;
     }
 
     // ── Invoke dispatch ───────────────────────────────────────────────────────

@@ -71,10 +71,23 @@ pub fn allocateRegisters(
     ins_size: u16,
     gc_map_builder: ?*@import("gc_map").GcMapBuilder,
     dex: ?*const parser.DexFile,
+    registry: ?*@import("class_loader").ClassRegistry,
 ) !void {
     _ = gc_map_builder;
     // 0. Prepend parameter mov instructions to the entry block to load parameters from RCX, RDX, R8, R9.
-    if (ins_size > 0 and program.blocks.items.len > 0) {
+    if (ins_size == 0xFFFF) {
+        if (program.blocks.items.len > 0) {
+            const first_block = &program.blocks.items[0];
+            var reg_idx: u16 = 0;
+            while (reg_idx < registers_size) : (reg_idx += 1) {
+                const v = ir.SSAVar{ .reg = reg_idx, .version = 0 };
+                try first_block.instructions.insert(allocator, 0, .{ .mov = .{
+                    .dest = .{ .vreg = v },
+                    .src = .{ .mem = .{ .base = .{ .reg = .rcx }, .disp = @intCast(reg_idx * 8) } },
+                } });
+            }
+        }
+    } else if (ins_size > 0 and program.blocks.items.len > 0) {
         const first_block = &program.blocks.items[0];
         const arg_regs = [_]x86.PhysicalReg{ .rcx, .rdx, .r8, .r9 };
         const float_arg_regs = [_]x86.PhysicalReg{ .xmm0, .xmm1, .xmm2, .xmm3 };
@@ -122,14 +135,16 @@ pub fn allocateRegisters(
     defer var_types.deinit();
 
     if (cfg_opt) |cfg| {
-        if (is_ref_param) |ref_params| {
-            var i: usize = 0;
-            while (i < ins_size) : (i += 1) {
-                if (i < ref_params.len and ref_params[i]) {
-                    const param_reg = registers_size - ins_size + @as(u16, @intCast(i));
-                    const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
-                    try reference_vars.put(v, {});
-                    try var_types.put(v, "Ljava/lang/Object;");
+        if (ins_size != 0xFFFF) {
+            if (is_ref_param) |ref_params| {
+                var i: usize = 0;
+                while (i < ins_size) : (i += 1) {
+                    if (i < ref_params.len and ref_params[i]) {
+                        const param_reg = registers_size - ins_size + @as(u16, @intCast(i));
+                        const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
+                        try reference_vars.put(v, {});
+                        try var_types.put(v, "Ljava/lang/Object;");
+                    }
                 }
             }
         }
@@ -960,6 +975,29 @@ pub fn allocateRegisters(
     defer active.deinit(allocator);
 
     var next_stack_offset: i32 = 8;
+    // Pre-scan for stack-allocated objects to reserve stack space for them
+    for (program.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            if (inst.* == .alloc_obj) {
+                if (inst.alloc_obj.is_stack) {
+                    var obj_size: usize = 8;
+                    if (registry != null and dex != null and inst.alloc_obj.type_idx < dex.?.type_names.len) {
+                        const tname = dex.?.type_names[inst.alloc_obj.type_idx];
+                        if (registry.?.get(tname)) |cd| {
+                            obj_size = cd.instance_fields.len * 8;
+                            if (obj_size == 0) obj_size = 8;
+                        }
+                    }
+                    const aligned_size = std.mem.alignForward(usize, obj_size, 8);
+                    const total_size = aligned_size + 16;
+                    
+                    inst.alloc_obj.stack_offset = next_stack_offset;
+                    inst.alloc_obj.size = @intCast(total_size);
+                    next_stack_offset += @intCast(total_size);
+                }
+            }
+        }
+    }
     var allocation_results = std.AutoHashMap(ir.SSAVar, LiveInterval).init(allocator);
     defer allocation_results.deinit();
 
@@ -1274,6 +1312,9 @@ pub fn allocateRegisters(
                 },
                 .alloc_obj => |*v| {
                     v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    if (v.is_stack) {
+                        v.stack_offset += save_space;
+                    }
                 },
                 .alloc_arr => |*v| {
                     v.dest = rewriteOp.run(rw_ctx, v.dest);
@@ -1484,7 +1525,7 @@ test "regalloc: basic linear scan" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null);
+    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null, null);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -1518,7 +1559,7 @@ test "regalloc: float register allocation" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null);
+    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null, null);
 
     const insts = prog.blocks.items[0].instructions.items;
     // Verify that the float variables are allocated to XMM registers!
@@ -1561,7 +1602,7 @@ test "regalloc: SIB array indexing rewrite" {
 
     try prog.blocks.append(a, mblock);
 
-    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null);
+    try allocateRegisters(a, &prog, null, null, null, 0, 0, null, null, null);
 
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
@@ -1658,7 +1699,7 @@ test "regalloc: loop liveness analysis" {
     try prog.blocks.append(a, mb1);
 
     // Test that variable v0_2 is live across the back-edge, so its interval doesn't terminate prematurely
-    try allocateRegisters(a, &prog, &test_cfg, null, null, 2, 0, null, null);
+    try allocateRegisters(a, &prog, &test_cfg, null, null, 2, 0, null, null, null);
 
     // Let's assert that the allocations succeeded and registers were assigned
     const mb1_insts = prog.blocks.items[1].instructions.items;

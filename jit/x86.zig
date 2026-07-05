@@ -171,7 +171,7 @@ pub const Inst = union(enum) {
 
 
     // ---- Allocation stubs ----
-    alloc_obj: struct { dest: Operand, type_idx: u32 },
+    alloc_obj: struct { dest: Operand, type_idx: u32, is_stack: bool = false, stack_offset: i32 = 0, size: u32 = 0 },
     alloc_arr: struct { dest: Operand, size: Operand, type_idx: u32 },
     filled_new_array: struct { dest: Operand, type_idx: u32, args: [5]?Operand },
     instance_of: struct { dest: Operand, obj: Operand, type_idx: u32 },

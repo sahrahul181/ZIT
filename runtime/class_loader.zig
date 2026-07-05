@@ -9,6 +9,11 @@ const std = @import("std");
 const parser = @import("parser");
 const instmod = @import("instruction");
 const runtime = @import("runtime");
+pub const InlineCache = struct {
+    cached_class: usize = 0,
+    cached_target: usize = 0,
+    method_idx: u32,
+};
 
 // ── Field Descriptor ─────────────────────────────────────────────────────────
 
@@ -641,6 +646,7 @@ test "vtable slot assignment: child overrides parent" {
 
 
 pub var jit_compile_fn: ?*const fn (method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize = null;
+pub var jit_compile_osr_fn: ?*const fn (method_ptr: usize, loop_pc: u32, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize = null;
 
 pub fn resolveMethodVirtual(receiver: usize, method_idx: u32, dex_ptr: usize, registry_ptr: usize) callconv(.c) usize {
     const dex = @as(*const parser.DexFile, @ptrFromInt(dex_ptr));
@@ -720,6 +726,17 @@ pub fn resolveMethodVirtual(receiver: usize, method_idx: u32, dex_ptr: usize, re
     }
 
     std.debug.panic("JIT compiler function not initialized", .{});
+}
+
+pub fn resolveMethodVirtualIC(receiver: usize, method_idx: u32, dex_ptr: usize, registry_ptr: usize, ic_ptr: usize) callconv(.c) usize {
+    const target = resolveMethodVirtual(receiver, method_idx, dex_ptr, registry_ptr);
+    if (receiver != 0) {
+        const obj = @as(*const runtime.ObjectHeader, @ptrFromInt(receiver - 16));
+        const ic = @as(*InlineCache, @ptrFromInt(ic_ptr));
+        ic.cached_class = obj.class_ptr;
+        ic.cached_target = target;
+    }
+    return target;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

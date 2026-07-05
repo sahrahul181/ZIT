@@ -157,7 +157,7 @@ pub const IRInst = union(enum) {
     rem_wide: BinOp,
 
     // Object & Array Allocation
-    new_instance: struct { dest: SSAVar, type_idx: u32 },
+    new_instance: struct { dest: SSAVar, type_idx: u32, is_stack: bool = false, stack_offset: i32 = 0 },
     new_array: struct { dest: SSAVar, size: SSAVar, type_idx: u32 },
     array_length: struct { dest: SSAVar, array: SSAVar },
     instance_of: struct { dest: SSAVar, obj: SSAVar, type_idx: u32 },

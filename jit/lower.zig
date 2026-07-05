@@ -484,7 +484,13 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
 
                 // ── Object & Array Allocation ─────────────────────────────
                 .new_instance => |v| {
-                    try mi.append(allocator, .{ .alloc_obj = .{ .dest = opReg(v.dest), .type_idx = v.type_idx } });
+                    try mi.append(allocator, .{ .alloc_obj = .{
+                        .dest = opReg(v.dest),
+                        .type_idx = v.type_idx,
+                        .is_stack = v.is_stack,
+                        .stack_offset = v.stack_offset,
+                        .size = 0,
+                    } });
                 },
                 .new_array => |v| {
                     try mi.append(allocator, .{ .alloc_arr = .{ .dest = opReg(v.dest), .size = opReg(v.size), .type_idx = v.type_idx } });
