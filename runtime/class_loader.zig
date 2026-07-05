@@ -73,16 +73,16 @@ pub const FieldDescriptor = struct {
 
 // ── Static Field Storage ──────────────────────────────────────────────────────
 
-pub const FieldSlot = union(FieldKind) {
+pub const FieldSlot = extern union {
     int: i32,
     long: i64,
     float: f32,
     double: f64,
     boolean: bool,
     byte: i8,
-    short: i16,
     char: u16,
-    reference: usize, // tagged pointer to object body
+    short: i16,
+    reference: usize,
 };
 
 // ── Method Data ───────────────────────────────────────────────────────────────
@@ -113,6 +113,12 @@ pub const MethodData = struct {
     /// threads to interpret a hot method forever.
     jit_entry_atomic: std.atomic.Value(usize),
     gc_map_table: ?usize = null, // absolute address of GcMapTable in exec memory
+    /// For native methods: the raw C function pointer
+    /// (fn(args: [*]const u64, n: usize) callconv(.c) u64). null for bytecode methods.
+    native_fn: ?usize = null,
+    /// Lazily-generated per-method trampoline that adapts the JIT call ABI to the
+    /// native fn. 0 = not yet generated. Atomic (see jit_entry_atomic rationale).
+    native_trampoline: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// Returns the published JIT entry, or null if not yet compiled.
     pub inline fn jitEntry(self: *const MethodData) ?usize {
@@ -269,20 +275,37 @@ pub const ClassRegistry = struct {
     pub fn defineNativeClass(self: *ClassRegistry, class_def: anytype) !void {
         self.mutex.lockUncancelable(runtime.global_io);
         defer self.mutex.unlock(runtime.global_io);
-        
+
         if (self.map.contains(class_def.name)) return;
 
         const cd = try self.allocator.create(ClassData);
         const super_class = if (class_def.super_name) |sn| self.map.get(sn) else null;
-        
+
+        const sfields = try self.allocator.alloc(FieldDescriptor, class_def.static_fields.len);
+        for (class_def.static_fields, 0..) |sf, i| {
+            sfields[i] = .{
+                // Field name/class_name here are comptime string literals with
+                // static lifetime (from NativeClassDef), so borrow rather than dupe.
+                // FieldDescriptor names are not freed in ClassData.deinit; duping
+                // them leaks. This matches the DEX-loaded static-field path.
+                .name = sf.name,
+                .kind = FieldDescriptor.kindFromDesc(sf.signature),
+                .offset = 0,
+                .is_static = true,
+                .class_name = class_def.name,
+            };
+        }
+        const svalues = try self.allocator.alloc(FieldSlot, class_def.static_fields.len);
+        @memset(svalues, .{ .reference = 0 });
+
         cd.* = ClassData{
             .name = try self.allocator.dupe(u8, class_def.name),
             .super = super_class,
             .interfaces = &.{},
             .instance_size = class_def.instance_size,
             .instance_fields = &.{},
-            .static_fields = &.{},
-            .static_values = &.{},
+            .static_fields = sfields,
+            .static_values = svalues,
             .vtable = &.{},
             .methods = &.{},
             .init_state = std.atomic.Value(u32).init(2),
@@ -310,11 +333,12 @@ pub const ClassRegistry = struct {
                 .tries = &.{},
                 .invocation_count = std.atomic.Value(u32).init(0),
                 .jit_entry_atomic = std.atomic.Value(usize).init(0),
+                .native_fn = if (md_def.func_ptr) |fp| @intFromPtr(fp) else null,
             };
             try methods.append(self.allocator, md);
         }
         cd.methods = try methods.toOwnedSlice(self.allocator);
-        
+
         try buildVtable(self.allocator, cd);
         try self.map.put(cd.name, cd);
     }
@@ -374,7 +398,7 @@ pub const ClassRegistry = struct {
         for (dex.field_items, 0..) |fi, fi_idx| {
             if (!std.mem.eql(u8, fi.class_name, dc.name)) continue;
             const kind = FieldDescriptor.kindFromDesc(fi.type_name);
-            
+
             var is_static = false;
             for (dc.static_field_indices.items) |sfi| {
                 if (sfi == fi_idx) {
@@ -415,6 +439,7 @@ pub const ClassRegistry = struct {
         cd.instance_fields = try self.allocator.dupe(FieldDescriptor, ifields.items);
         cd.static_fields = try self.allocator.dupe(FieldDescriptor, sfields.items);
         cd.static_values = try self.allocator.alloc(FieldSlot, sfields.items.len);
+        @memset(std.mem.sliceAsBytes(cd.static_values), 0);
         for (cd.static_values) |*sv| sv.* = .{ .int = 0 };
 
         // ── Method list ─────────────────────────────────────────────────────
@@ -516,7 +541,7 @@ fn buildItable(allocator: std.mem.Allocator, cd: *ClassData) !void {
         for (itf.methods, 0..) |m, j| {
             const name_arrow = std.mem.indexOf(u8, m.name, "->") orelse 0;
             const short_name = if (name_arrow > 0) m.name[name_arrow + 2 ..] else m.name;
-            
+
             var found: ?*MethodData = null;
             var search_curr: ?*ClassData = cd;
             while (search_curr) |sc| : (search_curr = sc.super) {
@@ -644,7 +669,6 @@ test "vtable slot assignment: child overrides parent" {
 
 // bootstrapStdLib has been completely removed in favor of dynamic resolution
 
-
 pub var jit_compile_fn: ?*const fn (method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize = null;
 pub var jit_compile_osr_fn: ?*const fn (method_ptr: usize, loop_pc: u32, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize = null;
 
@@ -654,11 +678,14 @@ pub fn resolveMethodVirtual(receiver: usize, method_idx: u32, dex_ptr: usize, re
 
     // Find matching MethodData in ClassData vtable/itable hierarchy
     var target_method: ?*MethodData = null;
-    
+
     const name_arrow = std.mem.indexOf(u8, itf_method_info.method_name, "->") orelse 0;
     const short_name = if (name_arrow > 0) itf_method_info.method_name[name_arrow + 2 ..] else itf_method_info.method_name;
 
-    if (receiver != 0) {
+    // Only attempt receiver-class dispatch when the object actually carries a
+    // class pointer. Objects allocated without one (class_ptr == 0) fall through
+    // to the global lookup below rather than dereferencing a null ClassData.
+    if (receiver != 0 and @as(*const runtime.ObjectHeader, @ptrFromInt(receiver - 16)).class_ptr != 0) {
         const obj = @as(*const runtime.ObjectHeader, @ptrFromInt(receiver - 16));
         const cd = @as(*const ClassData, @ptrFromInt(obj.class_ptr));
 
@@ -712,11 +739,41 @@ pub fn resolveMethodVirtual(receiver: usize, method_idx: u32, dex_ptr: usize, re
         }
     }
 
+    // Fallback: if receiver-class dispatch found nothing (e.g. the object had a
+    // null class pointer), resolve via the method's declaring class by name. This
+    // covers JIT-allocated objects whose header class_ptr was not populated.
+    if (target_method == null) {
+        const registry = @as(*ClassRegistry, @ptrFromInt(registry_ptr));
+        if (registry.get(itf_method_info.class_name)) |decl_cd| {
+            var search_cd: ?*const ClassData = decl_cd;
+            while (search_cd) |sc| : (search_cd = sc.super) {
+                if (sc.findMethod(short_name, itf_method_info.signature)) |m| {
+                    target_method = m;
+                    break;
+                }
+            }
+        }
+    }
+
     const method = target_method orelse {
         std.debug.panic("NoSuchMethodError: {s}.{s}{s}", .{
             itf_method_info.class_name, itf_method_info.method_name, itf_method_info.signature,
         });
     };
+
+    // Native methods have no bytecode to JIT. Return a per-method marshalling
+    // trampoline that converts the JIT register-arg ABI (args in RCX/RDX/R8/R9)
+    // into the native ABI (RCX = &args[], RDX = count) and calls the native fn.
+    // The trampoline is generated once per method with the native fn baked in as
+    // an immediate — it must NOT depend on any shared/thread-local state, because
+    // the monomorphic inline cache stores the trampoline address and calls it on
+    // subsequent hits without re-running this resolver.
+    if (method.is_native) {
+        if (method.native_fn) |nfn| {
+            return getNativeTrampoline(method, nfn);
+        }
+        return 0; // native method with no implementation: skip (guarded call)
+    }
 
     if (method.jitEntry()) |entry| {
         return entry;
@@ -726,6 +783,64 @@ pub fn resolveMethodVirtual(receiver: usize, method_idx: u32, dex_ptr: usize, re
     }
 
     std.debug.panic("JIT compiler function not initialized", .{});
+}
+
+/// Hook installed by the driver so this module can allocate executable memory
+/// for native trampolines without depending on the JIT backend directly.
+pub var alloc_exec_fn: ?*const fn (usize) callconv(.c) usize = null;
+var native_tramp_mutex: runtime.SpinLock = .{};
+
+/// Return (creating on first use) a marshalling trampoline for `method` that
+/// spills RCX/RDX/R8/R9 into a stack array and calls `nfn(&array, 4)`. The
+/// native fn pointer is embedded directly, so the trampoline is self-contained
+/// and safe to cache in the inline cache. The trampoline address is memoized in
+/// `method.native_trampoline`.
+fn getNativeTrampoline(method: *MethodData, nfn: usize) usize {
+    const existing = method.native_trampoline.load(.acquire);
+    if (existing != 0) return existing;
+    native_tramp_mutex.lock();
+    defer native_tramp_mutex.unlock();
+    const again = method.native_trampoline.load(.acquire);
+    if (again != 0) return again; // lost the race
+
+    const alloc = alloc_exec_fn orelse return 0;
+    // Machine code (Windows x64), RSP%16==8 on entry:
+    //   sub  rsp, 0x48
+    //   mov  [rsp+0x20], rcx / rdx / r8 / r9
+    //   lea  rcx, [rsp+0x20]
+    //   mov  rdx, 4
+    //   movabs rax, nfn
+    //   call rax
+    //   add  rsp, 0x48
+    //   ret
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    const put = struct {
+        fn f(b: []u8, i: *usize, bytes: []const u8) void {
+            @memcpy(b[i.*..][0..bytes.len], bytes);
+            i.* += bytes.len;
+        }
+    }.f;
+    put(&buf, &n, &[_]u8{ 0x48, 0x83, 0xEC, 0x48 });       // sub rsp, 0x48
+    put(&buf, &n, &[_]u8{ 0x48, 0x89, 0x4C, 0x24, 0x20 }); // mov [rsp+0x20], rcx
+    put(&buf, &n, &[_]u8{ 0x48, 0x89, 0x54, 0x24, 0x28 }); // mov [rsp+0x28], rdx
+    put(&buf, &n, &[_]u8{ 0x4C, 0x89, 0x44, 0x24, 0x30 }); // mov [rsp+0x30], r8
+    put(&buf, &n, &[_]u8{ 0x4C, 0x89, 0x4C, 0x24, 0x38 }); // mov [rsp+0x38], r9
+    put(&buf, &n, &[_]u8{ 0x48, 0x8D, 0x4C, 0x24, 0x20 }); // lea rcx, [rsp+0x20]
+    put(&buf, &n, &[_]u8{ 0x48, 0xC7, 0xC2, 0x04, 0x00, 0x00, 0x00 }); // mov rdx, 4
+    put(&buf, &n, &[_]u8{ 0x48, 0xB8 });                   // movabs rax, imm64
+    var nfn_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nfn_bytes, nfn, .little);
+    put(&buf, &n, &nfn_bytes);
+    put(&buf, &n, &[_]u8{ 0xFF, 0xD0 });                   // call rax
+    put(&buf, &n, &[_]u8{ 0x48, 0x83, 0xC4, 0x48 });       // add rsp, 0x48
+    put(&buf, &n, &[_]u8{ 0xC3 });                         // ret
+
+    const page = alloc(n);
+    if (page == 0) return 0;
+    @memcpy(@as([*]u8, @ptrFromInt(page))[0..n], buf[0..n]);
+    method.native_trampoline.store(page, .release);
+    return page;
 }
 
 pub fn resolveMethodVirtualIC(receiver: usize, method_idx: u32, dex_ptr: usize, registry_ptr: usize, ic_ptr: usize) callconv(.c) usize {
@@ -755,8 +870,9 @@ test "ClassRegistry defineNativeClass basic" {
             is_static: bool,
             func_ptr: ?*const fn ([*]const u64, usize) callconv(.c) u64,
         },
+        static_fields: []const struct { name: []const u8, signature: []const u8 } = &.{},
     };
-    
+
     var reg = ClassRegistry.init(testing.allocator);
     defer reg.deinit();
 
@@ -772,7 +888,7 @@ test "ClassRegistry defineNativeClass basic" {
     };
 
     try reg.defineNativeClass(dummy_class_def);
-    
+
     // Verify it is found
     const cd = reg.get("java/lang/DummyObject");
     try testing.expect(cd != null);
@@ -785,10 +901,10 @@ test "ClassRegistry defineNativeClass basic" {
     try testing.expect(m_hash != null);
     try testing.expectEqualStrings("java/lang/DummyObject->hashCode", m_hash.?.name);
     try testing.expectEqualStrings("()I", m_hash.?.signature);
-    
+
     const m_clone = cd.?.findMethod("clone", "()Ljava/lang/Object;");
     try testing.expect(m_clone != null);
-    
+
     // Should not find non-existent method
     try testing.expect(cd.?.findMethod("nonExistent", "()V") == null);
 }
@@ -804,8 +920,9 @@ test "ClassRegistry defineNativeClass inheritance and vtable" {
             is_static: bool,
             func_ptr: ?*const fn ([*]const u64, usize) callconv(.c) u64,
         },
+        static_fields: []const struct { name: []const u8, signature: []const u8 } = &.{},
     };
-    
+
     var reg = ClassRegistry.init(testing.allocator);
     defer reg.deinit();
 
@@ -835,27 +952,27 @@ test "ClassRegistry defineNativeClass inheritance and vtable" {
 
     const child_cd = reg.get("Child").?;
     const parent_cd = reg.get("Parent").?;
-    
+
     // Check inheritance
     try testing.expect(child_cd.super == parent_cd);
-    
+
     // Check vtable
     // Parent has 2 virtual methods, so its vtable should be size 2.
     // Child inherits parentMethod and overrides overrideMe, plus adds childMethod.
     // Vtable length should be 3.
     try testing.expectEqual(@as(usize, 2), parent_cd.vtable.len);
     try testing.expectEqual(@as(usize, 3), child_cd.vtable.len);
-    
+
     const child_override = child_cd.findMethod("overrideMe", "()V").?;
     const parent_override = parent_cd.findMethod("overrideMe", "()V").?;
-    
+
     // overrideMe should be at the same vtable slot in both child and parent
     try testing.expect(child_override.vtable_slot == parent_override.vtable_slot);
-    
+
     // child's vtable should point to its own overrideMe method
     try testing.expect(child_cd.vtable[child_override.vtable_slot] == child_override);
     try testing.expect(parent_cd.vtable[parent_override.vtable_slot] == parent_override);
-    
+
     // parentMethod should be inherited exactly
     const parent_method = parent_cd.findMethod("parentMethod", "()I").?;
     try testing.expect(child_cd.vtable[parent_method.vtable_slot] == parent_method);

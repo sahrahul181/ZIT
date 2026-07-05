@@ -70,9 +70,9 @@ typedef uint64_t (*JitFn4)(uint64_t, uint64_t, uint64_t, uint64_t);
  * Thread-local pointer to the active jump buffer.
  */
 #ifdef _WIN64
-static uint64_t *g_jmp_env = NULL;
+static __thread uint64_t *g_jmp_env = NULL;
 #else
-static jmp_buf *g_jmp_env = NULL;
+static __thread jmp_buf *g_jmp_env = NULL;
 #endif
 
 /*
@@ -95,7 +95,7 @@ void jit_longjmp_if_guarded(void) {
 #endif
 }
 
-static int *g_exception_out = NULL;
+static __thread int *g_exception_out = NULL;
 
 /*
  * Called by interpreter.zig instead of callJitCode when a JavaThread is

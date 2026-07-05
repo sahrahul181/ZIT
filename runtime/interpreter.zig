@@ -42,7 +42,7 @@ extern fn jit_guarded_call(
 ) callconv(.c) u64;
 
 // ── JIT threshold ─────────────────────────────────────────────────────────────
-pub const JIT_THRESHOLD: u32 = 1000000;
+pub const JIT_THRESHOLD: u32 = 0;
 
 // ── Execution result ──────────────────────────────────────────────────────────
 pub const Value = union(enum) {
@@ -101,6 +101,8 @@ pub const Interpreter = struct {
     registry: *class_loader.ClassRegistry,
     dex: *const parser.DexFile,
     allocator: std.mem.Allocator,
+    initializing_classes: [16]*class_loader.ClassData = undefined,
+    initializing_count: usize = 0,
     native_lookup_fn: ?*const fn (class_name: []const u8, name: []const u8, sig: []const u8) ?*const fn (args: [*]const u64, n_args: usize) callconv(.c) u64 = null,
 
     pub fn init(
@@ -113,7 +115,46 @@ pub const Interpreter = struct {
             .dex = dex,
             .allocator = allocator,
             .native_lookup_fn = null,
+            .initializing_count = 0,
         };
+    }
+
+    pub fn initializeClass(self: *Interpreter, cd: *class_loader.ClassData) InterpError!void {
+        // Check reentrancy (already initializing on this thread/interpreter)
+        var i: usize = 0;
+        while (i < self.initializing_count) : (i += 1) {
+            if (self.initializing_classes[i] == cd) return;
+        }
+
+        // Fast path: already initialized
+        if (cd.init_state.load(.acquire) == 2) return;
+
+        cd.clinit_mutex.lockUncancelable(runtime.global_io);
+        defer cd.clinit_mutex.unlock(runtime.global_io);
+
+        // Double check
+        const state = cd.init_state.load(.acquire);
+        if (state == 2) return;
+
+        if (self.initializing_count >= 16) return InterpError.OutOfMemory;
+        self.initializing_classes[self.initializing_count] = cd;
+        self.initializing_count += 1;
+        defer self.initializing_count -= 1;
+
+        cd.init_state.store(1, .release);
+
+        // Run superclass clinit first
+        if (cd.super) |super| {
+            try self.initializeClass(super);
+        }
+
+        // Find <clinit> method
+        if (cd.findMethod("<clinit>", "V")) |clinit| {
+            const val_args = [_]u64{};
+            _ = try self.invoke(clinit, &val_args);
+        }
+
+        cd.init_state.store(2, .release);
     }
 
     // ── Public entry point ────────────────────────────────────────────────────
@@ -149,6 +190,13 @@ pub const Interpreter = struct {
             return .void_val;
         }
 
+        // Never JIT class initializers. They run exactly once, are not hot, and
+        // must execute with the interpreter's class-init and object-allocation
+        // semantics (static-final `new Object()` fields must be populated
+        // correctly). JIT-compiling <clinit> left such fields null and crashed
+        // downstream monitor_enter / virtual dispatch. Keep them interpreted.
+        const is_clinit = std.mem.indexOf(u8, method.name, "<clinit>") != null;
+
         // Invocation counting for tier-up.
         const count = method.invocation_count.fetchAdd(1, .monotonic);
 
@@ -160,7 +208,7 @@ pub const Interpreter = struct {
         // the not-yet-published jit_entry, silently interpreting the whole method
         // (catastrophically slow for hot loops). The compile hook is mutex-guarded
         // and idempotent, so the loser blocks briefly then reads the winner's entry.
-        if (count >= JIT_THRESHOLD and method.jitEntry() == null) {
+        if (!is_clinit and count >= JIT_THRESHOLD and method.jitEntry() == null) {
             if (class_loader.jit_compile_fn) |compile_fn| {
                 const jit_fn_ptr = compile_fn(@intFromPtr(method), @intFromPtr(self.registry), @intFromPtr(self.dex));
                 if (jit_fn_ptr != 0) {
@@ -362,6 +410,7 @@ pub const Interpreter = struct {
                         frame.regs[v.dest] = @intFromPtr(obj);
                         continue;
                     };
+                    try self.initializeClass(cd);
                     const obj = runtime.gcAlloc(@intFromPtr(cd), cd.instance_size);
                     frame.regs[v.dest] = @intFromPtr(obj);
                 },
@@ -487,17 +536,16 @@ pub const Interpreter = struct {
                         continue;
                     };
                     if (self.registry.get(fi.class_name)) |cd| {
+                        try self.initializeClass(cd);
                         if (cd.staticSlot(fi.field_name)) |slot| {
-                            const val: u64 = switch (slot.*) {
-                                .int => |i| @bitCast(@as(i64, i)),
-                                .long => |l| @bitCast(l),
-                                .float => |f| @bitCast(@as(i64, @bitCast(@as(f64, f)))),
-                                .double => |d| @bitCast(d),
-                                .boolean => |b| if (b) @as(u64, 1) else 0,
-                                .byte => |by| @bitCast(@as(i64, by)),
-                                .short => |s| @bitCast(@as(i64, s)),
-                                .char => |ch| @as(u64, ch),
-                                .reference => |r| r,
+                            const val: u64 = switch (inst) {
+                                .sget_wide => @bitCast(slot.long),
+                                .sget_object => slot.reference,
+                                .sget_boolean => if (slot.boolean) 1 else 0,
+                                .sget_byte => @bitCast(@as(i64, slot.byte)),
+                                .sget_char => slot.char,
+                                .sget_short => @bitCast(@as(i64, slot.short)),
+                                else => @bitCast(@as(i64, slot.int)),
                             };
                             frame.regs[v.dest_or_src] = val;
                             continue;
@@ -508,17 +556,18 @@ pub const Interpreter = struct {
                 .sput, .sput_boolean, .sput_byte, .sput_char, .sput_short, .sput_wide, .sput_object => |v| {
                     const fi = if (v.field_idx < self.dex.field_items.len) self.dex.field_items[v.field_idx] else continue;
                     if (self.registry.get(fi.class_name)) |cd| {
+                        try self.initializeClass(cd);
                         if (cd.staticSlot(fi.field_name)) |slot| {
                             const val = frame.regs[v.dest_or_src];
-                            slot.* = switch (inst) {
-                                .sput_wide => .{ .long = @bitCast(val) },
-                                .sput_object => .{ .reference = val },
-                                .sput_boolean => .{ .boolean = (val & 1) != 0 },
-                                .sput_byte => .{ .byte = @intCast(@as(i8, @bitCast(@as(u8, @truncate(val))))) },
-                                .sput_char => .{ .char = @truncate(val) },
-                                .sput_short => .{ .short = @intCast(@as(i16, @bitCast(@as(u16, @truncate(val))))) },
-                                else => .{ .int = @intCast(@as(i32, @bitCast(@as(u32, @truncate(val))))) },
-                            };
+                            switch (inst) {
+                                .sput_wide => slot.long = @bitCast(val),
+                                .sput_object => slot.reference = val,
+                                .sput_boolean => slot.boolean = (val & 1) != 0,
+                                .sput_byte => slot.byte = @intCast(@as(i8, @bitCast(@as(u8, @truncate(val))))),
+                                .sput_char => slot.char = @truncate(val),
+                                .sput_short => slot.short = @intCast(@as(i16, @bitCast(@as(u16, @truncate(val))))),
+                                else => slot.int = @intCast(@as(i32, @bitCast(@as(u32, @truncate(val))))),
+                            }
                         }
                     }
                 },
@@ -974,6 +1023,10 @@ pub const Interpreter = struct {
             });
             return .void_val;
         };
+
+        if (self.registry.get(method.class_name)) |cd| {
+            try self.initializeClass(cd);
+        }
 
         // If the method already has JIT-compiled code, jump into it
         if (method.jitEntry()) |entry| {

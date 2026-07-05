@@ -57,15 +57,14 @@ fn printf_native(args: [*]const u64, _: usize) callconv(.c) u64 {
     const fmt_layout = @as(*align(4) const StringLayout, @ptrFromInt(fmt_obj));
     const fmt_slice = fmt_layout.value[0..@intCast(fmt_layout.length)];
     const has_array = args[2] != 0;
-    const arr_ptr = if (has_array) @as([*]const u32, @ptrFromInt(args[2] + 4)) else undefined;
+    const arr_ptr = if (has_array) @as([*]const u64, @ptrFromInt(args[2] + 8)) else undefined;
     const arr_len = if (has_array) @as(*const i32, @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(args[2]))))).* else 0;
     
     const getArgValue = struct {
-        fn run(idx: usize, ap: [*]const u32, has_ap: bool, al: i32, raw_args: [*]const u64) u64 {
+        fn run(idx: usize, ap: [*]const u64, has_ap: bool, al: i32, raw_args: [*]const u64) u64 {
             if (!has_ap) return raw_args[idx];
             if (@as(i32, @intCast(idx - 2)) < al) {
-                const ap64 = @as([*]align(4) const u64, @ptrCast(@alignCast(ap)));
-                return ap64[idx - 2];
+                return ap[idx - 2];
             }
             return 0;
         }

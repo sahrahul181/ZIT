@@ -60,7 +60,6 @@ fn regCode(reg: x86.PhysicalReg) u4 {
     };
 }
 
-
 pub fn allocateRegisters(
     allocator: std.mem.Allocator,
     program: *x86.MachineProgram,
@@ -74,31 +73,18 @@ pub fn allocateRegisters(
     registry: ?*@import("class_loader").ClassRegistry,
 ) !void {
     _ = gc_map_builder;
-    // 0. Prepend parameter mov instructions to the entry block to load parameters from RCX, RDX, R8, R9.
-    if (ins_size == 0xFFFF) {
-        if (program.blocks.items.len > 0) {
-            const first_block = &program.blocks.items[0];
-            var reg_idx: u16 = 0;
-            while (reg_idx < registers_size) : (reg_idx += 1) {
-                const v = ir.SSAVar{ .reg = reg_idx, .version = 0 };
-                try first_block.instructions.insert(allocator, 0, .{ .mov = .{
-                    .dest = .{ .vreg = v },
-                    .src = .{ .mem = .{ .base = .{ .reg = .rcx }, .disp = @intCast(reg_idx * 8) } },
-                } });
-            }
-        }
-    } else if (ins_size > 0 and program.blocks.items.len > 0) {
+    if (ins_size > 0 and ins_size != 0xFFFF and program.blocks.items.len > 0) {
         const first_block = &program.blocks.items[0];
         const arg_regs = [_]x86.PhysicalReg{ .rcx, .rdx, .r8, .r9 };
         const float_arg_regs = [_]x86.PhysicalReg{ .xmm0, .xmm1, .xmm2, .xmm3 };
-        
+
         var i: i32 = @intCast(ins_size);
         while (i > 0) {
             i -= 1;
             const param_reg = registers_size - ins_size + @as(u16, @intCast(i));
             const v = ir.SSAVar{ .reg = param_reg, .version = 0 };
             const is_float = if (is_float_param) |list| (i < list.len and list[@intCast(i)]) else false;
-            
+
             if (i < 4) {
                 const src_reg = if (is_float) float_arg_regs[@intCast(i)] else arg_regs[@intCast(i)];
                 if (is_float) {
@@ -500,20 +486,28 @@ pub fn allocateRegisters(
                 },
                 .alloc_obj => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .alloc_arr => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                     try helper.process(&interval_map, v.size, global_inst_idx, false, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
+                },
+                .new_string => |v| {
+                    try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .instance_of => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                     try helper.process(&interval_map, v.obj, global_inst_idx, false, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .filled_new_array => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
                     for (v.args) |a| {
                         if (a) |arg| try helper.process(&interval_map, arg, global_inst_idx, false, .gpr);
                     }
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .fill_array_data => |v| {
                     try helper.process(&interval_map, v.array, global_inst_idx, false, .gpr);
@@ -548,12 +542,15 @@ pub fn allocateRegisters(
                 .bounds_check => |v| {
                     try helper.process(&interval_map, v.index, global_inst_idx, false, .gpr);
                     try helper.process(&interval_map, v.array, global_inst_idx, false, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .monitor_enter => |v| {
                     try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .monitor_exit => |v| {
                     try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
+                    try call_indices.append(allocator, global_inst_idx);
                 },
                 .not => |v| {
                     try helper.process(&interval_map, v.dest, global_inst_idx, true, .gpr);
@@ -625,7 +622,7 @@ pub fn allocateRegisters(
         for (cfg.blocks.items) |b| {
             if (b.id > max_block_id) max_block_id = b.id;
         }
-        
+
         const BlockLiveness = struct {
             def: std.AutoHashMap(ir.SSAVar, void),
             use: std.AutoHashMap(ir.SSAVar, void),
@@ -875,13 +872,13 @@ pub fn allocateRegisters(
         var liveness_changed = true;
         while (liveness_changed) {
             liveness_changed = false;
-            
+
             var b_idx = cfg.blocks.items.len;
             while (b_idx > 0) {
                 b_idx -= 1;
                 const b = cfg.blocks.items[b_idx];
                 const l = &liveness_table[b.id];
-                
+
                 for (b.successors.items) |succ_id| {
                     const succ_l = &liveness_table[succ_id];
                     var succ_it = succ_l.live_in.keyIterator();
@@ -893,7 +890,7 @@ pub fn allocateRegisters(
                         }
                     }
                 }
-                
+
                 var use_it = l.use.keyIterator();
                 while (use_it.next()) |var_ptr| {
                     const variable = var_ptr.*;
@@ -953,15 +950,10 @@ pub fn allocateRegisters(
 
     // List of allocatable GPR registers.
     // Excluding RAX and RDX to prevent collision/clobbering by IDIV/IREM easily.
-    const gpr_registers = [_]x86.PhysicalReg{
-        .rbx, .rsi, .rdi, .r10, .r11, .r12, .r13, .r14, .r15, .rcx, .r8, .r9
-    };
+    const gpr_registers = [_]x86.PhysicalReg{ .rbx, .rsi, .rdi, .r10, .r12, .r13, .r14, .r15, .rcx, .r8, .r9 };
 
     // List of SSE XMM registers.
-    const xmm_registers = [_]x86.PhysicalReg{
-        .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7,
-        .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15
-    };
+    const xmm_registers = [_]x86.PhysicalReg{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 };
 
     var free_gprs = std.ArrayList(x86.PhysicalReg).empty;
     defer free_gprs.deinit(allocator);
@@ -990,7 +982,7 @@ pub fn allocateRegisters(
                     }
                     const aligned_size = std.mem.alignForward(usize, obj_size, 8);
                     const total_size = aligned_size + 16;
-                    
+
                     inst.alloc_obj.stack_offset = next_stack_offset;
                     inst.alloc_obj.size = @intCast(total_size);
                     next_stack_offset += @intCast(total_size);
@@ -1030,10 +1022,13 @@ pub fn allocateRegisters(
                 if (allocation_results.get(hint_v)) |hint_res| {
                     if (hint_res.reg) |hr| {
                         // Check if the hinted register is actually currently free in this pool
-                        for (pool.items, 0..) |fr, fri| {
-                            if (fr == hr) {
-                                selected_reg = pool.orderedRemove(fri);
-                                break;
+                        const is_callee = isCalleeSaved(hr);
+                        if (!interval.live_across_call or is_callee) {
+                            for (pool.items, 0..) |fr, fri| {
+                                if (fr == hr) {
+                                    selected_reg = pool.orderedRemove(fri);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1054,11 +1049,20 @@ pub fn allocateRegisters(
                         break :blk pool.orderedRemove(fi);
                     }
                 }
+                if (interval.live_across_call) {
+                    break :blk null;
+                }
                 break :blk pool.pop();
             };
-            interval.reg = reg;
-            try active.append(allocator, interval);
-            std.mem.sort(*LiveInterval, active.items, {}, compareActive);
+
+            if (reg) |r| {
+                interval.reg = r;
+                try active.append(allocator, interval);
+                std.mem.sort(*LiveInterval, active.items, {}, compareActive);
+            } else {
+                interval.stack_offset = next_stack_offset;
+                next_stack_offset += 8;
+            }
         } else {
             // Spill: Find the active interval of the SAME class that ends furthest
             var victim_idx: ?usize = null;
@@ -1084,7 +1088,6 @@ pub fn allocateRegisters(
                 next_stack_offset += 8;
             }
         }
-
     }
 
     for (intervals.items) |interval| {
@@ -1097,8 +1100,7 @@ pub fn allocateRegisters(
     while (used_iter.next()) |interval| {
         if (interval.reg) |r| {
             const is_callee = switch (r) {
-                .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15,
-                .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 => true,
+                .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15, .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 => true,
                 else => false,
             };
             if (is_callee) try used_callee.put(r, {});
@@ -1320,6 +1322,9 @@ pub fn allocateRegisters(
                     v.dest = rewriteOp.run(rw_ctx, v.dest);
                     v.size = rewriteOp.run(rw_ctx, v.size);
                 },
+                .new_string => |*v| {
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                },
                 .instance_of => |*v| {
                     v.dest = rewriteOp.run(rw_ctx, v.dest);
                     v.obj = rewriteOp.run(rw_ctx, v.obj);
@@ -1491,7 +1496,109 @@ pub fn allocateRegisters(
         block.instructions.deinit(allocator);
         block.instructions = rewritten_insts;
     }
-    
+
+    if (ins_size == 0xFFFF) {
+        var max_id: usize = 0;
+        var loop_block_id: usize = 0;
+        if (cfg_opt) |cfg| {
+            for (cfg.blocks.items) |b| {
+                if (b.id > max_id) max_id = b.id;
+            }
+            if (cfg.osr_loop_block_id) |id| {
+                loop_block_id = id;
+            }
+        }
+
+        // Find the global instruction index of the loop block header
+        var loop_start_idx: usize = 0;
+        {
+            var idx: usize = 0;
+            for (program.blocks.items) |block| {
+                if (block.id == loop_block_id) {
+                    loop_start_idx = idx;
+                    break;
+                }
+                idx += block.instructions.items.len;
+            }
+        }
+
+        var osr_entry_block = x86.MachineBlock{
+            .id = max_id + 1,
+            .instructions = .empty,
+        };
+        errdefer osr_entry_block.instructions.deinit(allocator);
+
+        try osr_entry_block.instructions.append(allocator, .{ .mov = .{
+            .dest = .{ .reg = .rax },
+            .src = .{ .reg = .rcx },
+        } });
+
+        // Pass 1: Load all variables not mapped to RAX
+        var reg_idx: u16 = 0;
+        while (reg_idx < registers_size) : (reg_idx += 1) {
+            // Find live interval for reg_idx covering loop_start_idx
+            var live_interval: ?LiveInterval = null;
+            var iter = allocation_results.valueIterator();
+            while (iter.next()) |interval| {
+                if (interval.vreg.reg == reg_idx) {
+                    if (loop_start_idx >= interval.start and loop_start_idx <= interval.end) {
+                        live_interval = interval.*;
+                        break;
+                    }
+                }
+            }
+
+            if (live_interval) |alloc_res| {
+                if (alloc_res.reg) |r| {
+                    if (r == .rax) continue; // load rax in Pass 2
+                    try osr_entry_block.instructions.append(allocator, .{ .mov = .{
+                        .dest = .{ .reg = r },
+                        .src = .{ .mem = .{ .base = .{ .reg = .rax }, .disp = @intCast(reg_idx * 8) } },
+                    } });
+                } else if (alloc_res.stack_offset) |offset| {
+                    try osr_entry_block.instructions.append(allocator, .{ .mov = .{
+                        .dest = .{ .reg = .r11 },
+                        .src = .{ .mem = .{ .base = .{ .reg = .rax }, .disp = @intCast(reg_idx * 8) } },
+                    } });
+                    try osr_entry_block.instructions.append(allocator, .{ .mov = .{
+                        .dest = .{ .stack = offset + save_space },
+                        .src = .{ .reg = .r11 },
+                    } });
+                }
+            }
+        }
+
+        // Pass 2: Load variable mapped to RAX (if any)
+        reg_idx = 0;
+        while (reg_idx < registers_size) : (reg_idx += 1) {
+            var live_interval: ?LiveInterval = null;
+            var iter = allocation_results.valueIterator();
+            while (iter.next()) |interval| {
+                if (interval.vreg.reg == reg_idx) {
+                    if (loop_start_idx >= interval.start and loop_start_idx <= interval.end) {
+                        live_interval = interval.*;
+                        break;
+                    }
+                }
+            }
+
+            if (live_interval) |alloc_res| {
+                if (alloc_res.reg) |r| {
+                    if (r == .rax) {
+                        try osr_entry_block.instructions.append(allocator, .{ .mov = .{
+                            .dest = .{ .reg = .rax },
+                            .src = .{ .mem = .{ .base = .{ .reg = .rax }, .disp = @intCast(reg_idx * 8) } },
+                        } });
+                        break;
+                    }
+                }
+            }
+        }
+
+        try osr_entry_block.instructions.append(allocator, .{ .jmp = loop_block_id });
+        try program.blocks.insert(allocator, 0, osr_entry_block);
+    }
+
     program.stack_space = next_stack_offset;
 }
 
@@ -1565,7 +1672,7 @@ test "regalloc: float register allocation" {
     // Verify that the float variables are allocated to XMM registers!
     try std.testing.expect(insts[0].movss.dest == .reg);
     try std.testing.expect(insts[0].movss.src == .reg);
-    
+
     // Check they belong to the XMM register class (starts with xmm0 name or equivalent)
     const dest_name = insts[0].movss.dest.reg.name();
     const src_name = insts[0].movss.src.reg.name();
@@ -1589,7 +1696,7 @@ test "regalloc: SIB array indexing rewrite" {
 
     const v_array = ir.SSAVar{ .reg = 0, .version = 1 };
     const v_index = ir.SSAVar{ .reg = 1, .version = 1 };
-    const v_dest  = ir.SSAVar{ .reg = 2, .version = 1 };
+    const v_dest = ir.SSAVar{ .reg = 2, .version = 1 };
 
     // MOV v_dest, [v_array + v_index * 4 + 16]
     const mem_op = x86.Operand{ .mem = .{
@@ -1607,12 +1714,12 @@ test "regalloc: SIB array indexing rewrite" {
     const insts = prog.blocks.items[0].instructions.items;
     try std.testing.expect(insts[0].mov.dest == .reg);
     try std.testing.expect(insts[0].mov.src == .mem);
-    
+
     // Verify that the memory operand's base and index have been rewritten to physical GPR registers
     const rewritten_mem = insts[0].mov.src.mem;
     try std.testing.expect(rewritten_mem.base == .reg);
     try std.testing.expect(rewritten_mem.index.? == .reg);
-    
+
     // GPRs should not be XMM
     try std.testing.expect(!std.mem.startsWith(u8, rewritten_mem.base.reg.name(), "xmm"));
     try std.testing.expect(!std.mem.startsWith(u8, rewritten_mem.index.?.reg.name(), "xmm"));
@@ -1628,7 +1735,7 @@ test "regalloc: loop liveness analysis" {
     //   v0_2 = phi([bb0: v0_1], [bb1: v0_3])
     //   v0_3 = add v0_2, 1
     //   if v0_3 < 10 goto bb1
-    
+
     var test_cfg = cfgmod.CFG{
         .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
         .allocator = a,
@@ -1679,7 +1786,7 @@ test "regalloc: loop liveness analysis" {
     try b1.predecessors.append(a, 0);
     try b1.predecessors.append(a, 1);
     try test_cfg.blocks.append(a, b1);
-    
+
     test_cfg.blocks.items[0].successors.items[0] = 1;
 
     var prog = x86.MachineProgram{
@@ -1706,4 +1813,3 @@ test "regalloc: loop liveness analysis" {
     try std.testing.expect(mb1_insts[0].mov.dest == .reg);
     try std.testing.expect(mb1_insts[0].mov.src == .reg);
 }
-

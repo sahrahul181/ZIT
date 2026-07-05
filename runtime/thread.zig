@@ -46,7 +46,7 @@ pub const JavaThread = struct {
             .tls = .{ .allocator = gc.immix.allocator.MutatorAllocator.init(dummyBlockSupplier) },
             .entry = entry,
         };
-        jt.fiber_handle = CreateFiber(1024 * 1024, fiberEntry, jt);
+        jt.fiber_handle = CreateFiber(16 * 1024 * 1024, fiberEntry, jt);
         if (jt.fiber_handle == null) @panic("Failed to create Fiber for JavaThread");
         return jt;
     }
@@ -68,16 +68,16 @@ pub const JavaThread = struct {
 
     pub fn yield(self: *JavaThread) void {
         self.state.store(.runnable, .release);
-        const w = current_worker orelse @panic("Yield outside of worker thread");
-        w.deque.push(.{ .run = @ptrCast(self.entry), .arg = self }) catch @panic("Yield failed: deque full");
-        SwitchToFiber(w.primary_fiber.?);
+        std.Thread.yield() catch {};
     }
 
     pub fn park(self: *JavaThread) void {
         self.state.store(.parked, .release);
-        const w = current_worker orelse @panic("Park outside of worker thread");
-        SwitchToFiber(w.primary_fiber.?);
+        while (self.state.load(.acquire) == .parked) {
+            std.Thread.yield() catch {};
+        }
     }
+
 
     pub fn unpark(self: *JavaThread) void {
         if (self.state.cmpxchgStrong(.parked, .runnable, .release, .monotonic) == null) {
@@ -186,24 +186,79 @@ pub const WorkerPool = struct {
     }
 };
 
-pub threadlocal var current_thread: ?*JavaThread = null;
-pub threadlocal var current_worker: ?*Worker = null;
+// Simple OS thread ID maps to prevent TLS corruption issues in Fiber contexts on Windows.
+var active_threads: [128]struct { os_id: std.Thread.Id, thread: ?*JavaThread } = undefined;
+var active_threads_len: usize = 0;
+var active_workers: [128]struct { os_id: std.Thread.Id, worker: *Worker } = undefined;
+var active_workers_len: usize = 0;
+var thread_map_mutex: Spinlock = .{};
+
+pub fn registerThread(jt: ?*JavaThread) void {
+    thread_map_mutex.lock();
+    defer thread_map_mutex.unlock();
+    const tid = std.Thread.getCurrentId();
+    for (active_threads[0..active_threads_len]) |*t| {
+        if (t.os_id == tid) {
+            t.thread = jt;
+            return;
+        }
+    }
+    if (active_threads_len < 128) {
+        active_threads[active_threads_len] = .{ .os_id = tid, .thread = jt };
+        active_threads_len += 1;
+    }
+}
+
+pub fn registerWorker(w: *Worker) void {
+    thread_map_mutex.lock();
+    defer thread_map_mutex.unlock();
+    const tid = std.Thread.getCurrentId();
+    for (active_workers[0..active_workers_len]) |*wk| {
+        if (wk.os_id == tid) {
+            wk.worker = w;
+            return;
+        }
+    }
+    if (active_workers_len < 128) {
+        active_workers[active_workers_len] = .{ .os_id = tid, .worker = w };
+        active_workers_len += 1;
+    }
+}
 
 pub fn getCurrent() ?*JavaThread {
-    return current_thread;
+    thread_map_mutex.lock();
+    defer thread_map_mutex.unlock();
+    const tid = std.Thread.getCurrentId();
+    for (active_threads[0..active_threads_len]) |t| {
+        if (t.os_id == tid) return t.thread;
+    }
+    return null;
 }
+
+pub fn getCurrentWorker() ?*Worker {
+    thread_map_mutex.lock();
+    defer thread_map_mutex.unlock();
+    const tid = std.Thread.getCurrentId();
+    for (active_workers[0..active_workers_len]) |w| {
+        if (w.os_id == tid) return w.worker;
+    }
+    return null;
+}
+
 
 fn fiberEntry(lpParameter: ?*anyopaque) callconv(.c) void {
     const fiber = @as(*JavaThread, @ptrCast(@alignCast(lpParameter.?)));
     fiber.state.store(.running, .release);
+    registerThread(fiber);
 
     // Call the actual java thread code
     fiber.entry(fiber);
 
     // Terminate
     fiber.state.store(.terminated, .release);
-    const w = current_worker orelse @panic("JavaThread finished without a worker");
-    current_thread = null;
+    const w = getCurrentWorker() orelse @panic("JavaThread finished without a worker");
+    // Clear registration
+    registerThread(null);
     SwitchToFiber(w.primary_fiber.?);
 }
 
@@ -211,7 +266,7 @@ fn workerLoop(worker: *Worker) void {
     worker.primary_fiber = ConvertThreadToFiber(null);
     if (worker.primary_fiber == null) @panic("Failed to convert OS thread to fiber");
     
-    current_worker = worker;
+    registerWorker(worker);
     const pool = worker.pool;
 
     while (pool.running.load(.acquire)) {
@@ -247,7 +302,7 @@ fn workerLoop(worker: *Worker) void {
         if (task) |t| {
             if (t.arg) |arg| {
                 const fiber = @as(*JavaThread, @ptrCast(@alignCast(arg)));
-                current_thread = fiber;
+                registerThread(fiber);
                 worker.last_fiber = fiber;
                 SwitchToFiber(fiber.fiber_handle.?);
             }
@@ -257,6 +312,7 @@ fn workerLoop(worker: *Worker) void {
         }
     }
 }
+
 
 // ── Thread Subsystem ──────────────────────────────────────────────────────────
 pub var global_worker_pool: ?*WorkerPool = null;

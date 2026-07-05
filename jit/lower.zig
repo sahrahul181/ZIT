@@ -3,9 +3,15 @@ const ir = @import("ir");
 const cfgmod = @import("cfg");
 const x86 = @import("x86");
 
-inline fn opReg(v: ir.SSAVar) x86.Operand  { return .{ .vreg = v }; }
-inline fn opImm(val: i32) x86.Operand      { return .{ .imm = val }; }
-inline fn opImm64(val: i64) x86.Operand    { return .{ .imm64 = val }; }
+inline fn opReg(v: ir.SSAVar) x86.Operand {
+    return .{ .vreg = v };
+}
+inline fn opImm(val: i32) x86.Operand {
+    return .{ .imm = val };
+}
+inline fn opImm64(val: i64) x86.Operand {
+    return .{ .imm64 = val };
+}
 
 /// True when two SSA variables refer to the same virtual register.
 inline fn eqVar(a: ir.SSAVar, b: ir.SSAVar) bool {
@@ -22,7 +28,7 @@ fn removeDeadMovs(allocator: std.mem.Allocator, program: *x86.MachineProgram) !v
                 .mov => |v| switch (v.dest) {
                     .vreg => |d| switch (v.src) {
                         .vreg => |s| eqVar(d, s),
-                        else  => false,
+                        else => false,
                     },
                     else => false,
                 },
@@ -63,8 +69,10 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opImm64(v.val) } });
                 },
                 .const_string => |v| {
-                    // Address of string literal resolved at link time → stub as imm 0
-                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opImm(@intCast(v.str_idx)) } });
+                    // Resolve the string-pool index to a real heap String object at
+                    // runtime (via gcNewString) — passing the raw index would make it
+                    // look like a misaligned object pointer to any consumer.
+                    try mi.append(allocator, .{ .new_string = .{ .dest = opReg(v.dest), .str_idx = v.str_idx } });
                 },
                 .const_class => |v| {
                     // Class object pointer resolved at link time → stub as imm
@@ -120,7 +128,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .imul = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -129,13 +137,13 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     if (eqVar(v.dest, v.left)) {
                         try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
                     } else {
-                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .idiv = .{ .dest = opReg(v.dest), .rem = opReg(rem_scratch), .src = opReg(v.right) } });
                     }
                 },
                 .rem_int => |v| {
                     const quot_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(quot_scratch), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(quot_scratch), .src = opReg(v.left) } });
                     try mi.append(allocator, .{ .irem = .{ .dest = opReg(quot_scratch), .rem = opReg(v.dest), .src = opReg(v.right) } });
                 },
                 .and_int => |v| {
@@ -144,7 +152,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -154,7 +162,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov   = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -164,7 +172,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -188,7 +196,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     if (eqVar(v.dest, v.left)) {
                         try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     } else {
-                        try mi.append(allocator, .{ .mov  = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .ushr = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -200,7 +208,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .and_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -210,7 +218,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov   = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .or_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -220,7 +228,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     } else if (eqVar(v.dest, v.right)) {
                         try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                     } else {
-                        try mi.append(allocator, .{ .mov    = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
+                        try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest), .src = opReg(v.left) } });
                         try mi.append(allocator, .{ .xor_op = .{ .dest = opReg(v.dest), .src = opReg(v.right) } });
                     }
                 },
@@ -238,7 +246,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                 },
                 .rem_long => |v| {
                     const quot_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(quot_scratch), .src = opReg(v.left) } });
+                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(quot_scratch), .src = opReg(v.left) } });
                     try mi.append(allocator, .{ .irem = .{ .dest = opReg(quot_scratch), .rem = opReg(v.dest), .src = opReg(v.right) } });
                 },
 
@@ -454,7 +462,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                 },
                 .rem_lit => |v| {
                     const quot_scratch = ir.SSAVar{ .reg = v.dest.reg, .version = v.dest.version +% 0x8000 };
-                    try mi.append(allocator, .{ .mov  = .{ .dest = opReg(quot_scratch), .src = opReg(v.src) } });
+                    try mi.append(allocator, .{ .mov = .{ .dest = opReg(quot_scratch), .src = opReg(v.src) } });
                     try mi.append(allocator, .{ .irem = .{ .dest = opReg(quot_scratch), .rem = opReg(v.dest), .src = opImm(v.lit) } });
                 },
                 .and_lit => |v| {
@@ -508,12 +516,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     }
                 },
                 .fill_array_data => |v| {
-                    try mi.append(allocator, .{ .fill_array_data = .{ 
-                        .array = opReg(v.array), 
-                        .data_ptr = v.data_ptr, 
-                        .data_len = v.data_len, 
-                        .elem_width = v.elem_width 
-                    } });
+                    try mi.append(allocator, .{ .fill_array_data = .{ .array = opReg(v.array), .data_ptr = v.data_ptr, .data_len = v.data_len, .elem_width = v.elem_width } });
                 },
                 .move_exception => |v| {
                     try mi.append(allocator, .{ .move_exception = .{ .dest = opReg(v.dest) } });
@@ -645,10 +648,10 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     }
                     const dest_op: ?x86.Operand = if (v.dest) |d| opReg(d) else null;
                     try mi.append(allocator, .{ .call = .{
-                        .dest       = dest_op,
+                        .dest = dest_op,
                         .method_idx = v.method_idx,
-                        .is_static  = v.is_static,
-                        .arg_count  = v.args.len,
+                        .is_static = v.is_static,
+                        .arg_count = v.args.len,
                         .is_self_call = v.is_self_call,
                     } });
                 },
@@ -682,7 +685,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
         }
 
         try program.blocks.append(allocator, .{
-            .id           = block.id,
+            .id = block.id,
             .instructions = mi,
         });
     }
@@ -697,27 +700,29 @@ test "lowerCFG: const + add_lit + ret" {
     const a = std.testing.allocator;
 
     var cfg = cfgmod.CFG{
-        .blocks    = std.ArrayList(cfgmod.BasicBlock).empty,
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
         .entry_block_id = 0,
         .allocator = a,
     };
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 2,
-        .successors        = std.ArrayList(usize).empty,
-        .predecessors      = std.ArrayList(usize).empty,
-        .idom              = null,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 2,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
         .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children      = std.ArrayList(usize).empty,
-        .phi_functions     = std.ArrayList(cfgmod.PhiNode).empty,
-        .instructions      = std.ArrayList(ir.IRInst).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
     const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
     const v1 = ir.SSAVar{ .reg = 1, .version = 1 };
     try block.instructions.append(a, .{ .const_int = .{ .dest = v0, .val = 10 } });
-    try block.instructions.append(a, .{ .add_lit   = .{ .dest = v1, .src = v0, .lit = 5 } });
+    try block.instructions.append(a, .{ .add_lit = .{ .dest = v1, .src = v0, .lit = 5 } });
     try block.instructions.append(a, .{ .ret = .{ .src = v1 } });
     try cfg.blocks.append(a, block);
 
@@ -730,31 +735,33 @@ test "lowerCFG: const + add_lit + ret" {
     // ret        → 1 × RET
     // Total = 4
     try std.testing.expectEqual(@as(usize, 4), insts.len);
-    try std.testing.expect(insts[0] == .mov);   // const_int → MOV v1, #10
-    try std.testing.expect(insts[1] == .mov);   // add_lit:  MOV v2, v1
-    try std.testing.expect(insts[2] == .add);   // add_lit:  ADD v2, #5
-    try std.testing.expect(insts[3] == .ret);   // ret v2
+    try std.testing.expect(insts[0] == .mov); // const_int → MOV v1, #10
+    try std.testing.expect(insts[1] == .mov); // add_lit:  MOV v2, v1
+    try std.testing.expect(insts[2] == .add); // add_lit:  ADD v2, #5
+    try std.testing.expect(insts[3] == .ret); // ret v2
 }
 
 test "lowerCFG: conditional branch if_lt" {
     const a = std.testing.allocator;
 
     var cfg = cfgmod.CFG{
-        .blocks    = std.ArrayList(cfgmod.BasicBlock).empty,
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
         .entry_block_id = 0,
         .allocator = a,
     };
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 1,
-        .successors        = std.ArrayList(usize).empty,
-        .predecessors      = std.ArrayList(usize).empty,
-        .idom              = null,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 1,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
         .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children      = std.ArrayList(usize).empty,
-        .phi_functions     = std.ArrayList(cfgmod.PhiNode).empty,
-        .instructions      = std.ArrayList(ir.IRInst).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
     const va = ir.SSAVar{ .reg = 0, .version = 1 };
@@ -777,21 +784,23 @@ test "lowerCFG: zero-comparison if_eqz" {
     const a = std.testing.allocator;
 
     var cfg = cfgmod.CFG{
-        .blocks    = std.ArrayList(cfgmod.BasicBlock).empty,
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
         .entry_block_id = 0,
         .allocator = a,
     };
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors        = std.ArrayList(usize).empty,
-        .predecessors      = std.ArrayList(usize).empty,
-        .idom              = null,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
         .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children      = std.ArrayList(usize).empty,
-        .phi_functions     = std.ArrayList(cfgmod.PhiNode).empty,
-        .instructions      = std.ArrayList(ir.IRInst).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
     const v0 = ir.SSAVar{ .reg = 0, .version = 1 };
@@ -812,24 +821,26 @@ test "lowerCFG: iget and iput field access" {
     const a = std.testing.allocator;
 
     var cfg = cfgmod.CFG{
-        .blocks    = std.ArrayList(cfgmod.BasicBlock).empty,
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
         .entry_block_id = 0,
         .allocator = a,
     };
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 1,
-        .successors        = std.ArrayList(usize).empty,
-        .predecessors      = std.ArrayList(usize).empty,
-        .idom              = null,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 1,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
         .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children      = std.ArrayList(usize).empty,
-        .phi_functions     = std.ArrayList(cfgmod.PhiNode).empty,
-        .instructions      = std.ArrayList(ir.IRInst).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
-    const obj  = ir.SSAVar{ .reg = 0, .version = 1 };
+    const obj = ir.SSAVar{ .reg = 0, .version = 1 };
     const dest = ir.SSAVar{ .reg = 1, .version = 1 };
     try block.instructions.append(a, .{ .iget = .{ .dest_or_src = dest, .obj = obj, .field_idx = 7 } });
     try block.instructions.append(a, .{ .iput = .{ .dest_or_src = dest, .obj = obj, .field_idx = 7 } });
@@ -849,21 +860,23 @@ test "lowerCFG: invoke method call" {
     const a = std.testing.allocator;
 
     var cfg = cfgmod.CFG{
-        .blocks    = std.ArrayList(cfgmod.BasicBlock).empty,
+        .blocks = std.ArrayList(cfgmod.BasicBlock).empty,
         .entry_block_id = 0,
         .allocator = a,
     };
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors        = std.ArrayList(usize).empty,
-        .predecessors      = std.ArrayList(usize).empty,
-        .idom              = null,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
         .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children      = std.ArrayList(usize).empty,
-        .phi_functions     = std.ArrayList(cfgmod.PhiNode).empty,
-        .instructions      = std.ArrayList(ir.IRInst).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
     const arg0 = ir.SSAVar{ .reg = 0, .version = 1 };
@@ -873,10 +886,10 @@ test "lowerCFG: invoke method call" {
 
     const dest_v = ir.SSAVar{ .reg = 1, .version = 1 };
     try block.instructions.append(a, .{ .invoke = .{
-        .dest       = dest_v,
+        .dest = dest_v,
         .method_idx = 42,
-        .is_static  = true,
-        .args       = args,
+        .is_static = true,
+        .args = args,
     } });
     try cfg.blocks.append(a, block);
 
@@ -904,10 +917,15 @@ test "opt: commutative coalescing - dest == right skips MOV and swaps operands" 
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
@@ -937,10 +955,15 @@ test "opt: commutative coalescing - dest == left skips MOV" {
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
@@ -967,10 +990,15 @@ test "opt: literal coalescing - dest == src skips MOV" {
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
@@ -997,10 +1025,15 @@ test "opt: removeDeadMovs - self-moves from move instruction removed" {
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
@@ -1029,10 +1062,15 @@ test "opt: sub dest==right emits NEG+ADD instead of clobbering MOV" {
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
@@ -1058,10 +1096,15 @@ test "lowerCFG: long math operations" {
     defer cfg.deinit();
 
     var block = cfgmod.BasicBlock{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 
@@ -1076,7 +1119,7 @@ test "lowerCFG: long math operations" {
     defer prog.deinit();
 
     const insts = prog.blocks.items[0].instructions.items;
-    
+
     // add_long lower should result in:
     //   MOV dest, left
     //   ADD dest, right
@@ -1091,10 +1134,15 @@ test "lowerCFG: long math operations" {
 
 fn testBlock() cfgmod.BasicBlock {
     return .{
-        .id = 0, .start_idx = 0, .end_idx = 0,
-        .successors = std.ArrayList(usize).empty, .predecessors = std.ArrayList(usize).empty,
-        .idom = null, .dominance_frontier = std.ArrayList(usize).empty,
-        .dom_children = std.ArrayList(usize).empty, .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
+        .id = 0,
+        .start_idx = 0,
+        .end_idx = 0,
+        .successors = std.ArrayList(usize).empty,
+        .predecessors = std.ArrayList(usize).empty,
+        .idom = null,
+        .dominance_frontier = std.ArrayList(usize).empty,
+        .dom_children = std.ArrayList(usize).empty,
+        .phi_functions = std.ArrayList(cfgmod.PhiNode).empty,
         .instructions = std.ArrayList(ir.IRInst).empty,
     };
 }
@@ -1212,7 +1260,3 @@ test "lowerCFG: cmp_op lowers to cmp3 with kind preserved" {
     try std.testing.expectEqual(ir.CmpKind.cmpg_float, insts[1].cmp3.kind);
     try std.testing.expectEqual(v2.reg, insts[1].cmp3.dest.vreg.reg);
 }
-
-
-
-

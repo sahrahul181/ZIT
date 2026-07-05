@@ -20,4 +20,7 @@ pub const class_def = registry.NativeClassDef{
         .{ .name = "currentTimeMillis", .signature = "J", .is_static = true, .func_ptr = &currentTimeMillis },
         .{ .name = "nanoTime", .signature = "J", .is_static = true, .func_ptr = &nanoTime },
     },
+    .static_fields = &.{
+        .{ .name = "out", .signature = "Ljava/io/PrintStream;" },
+    },
 };

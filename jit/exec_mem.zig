@@ -713,7 +713,7 @@ test "JIT: monitor-enter and monitor-exit execution correctness" {
     defer test_cfg.deinit();
 
     var block = emptyTestBlock();
-    const x = ir.SSAVar{ .reg = 2, .version = 0 };
+    const x = ir.SSAVar{ .reg = 3, .version = 0 };
 
     try block.instructions.append(a, .{ .monitor_enter = .{ .src = x } });
     try block.instructions.append(a, .{ .monitor_exit = .{ .src = x } });
@@ -734,8 +734,8 @@ test "JIT: monitor-enter and monitor-exit execution correctness" {
 
     var dummy_thread: runtime.thread.JavaThread = undefined;
     dummy_thread.id = 1;
-    runtime.thread.current_thread = &dummy_thread;
-    defer runtime.thread.current_thread = null;
+    runtime.thread.registerThread(&dummy_thread);
+    defer runtime.thread.registerThread(null);
 
     const JITMonitorFn = *const fn (*anyopaque) callconv(.c) void;
     const func = @as(JITMonitorFn, @ptrCast(exec_page.ptr));

@@ -265,17 +265,52 @@ fn buildSSA(allocator: std.mem.Allocator, cfg: *cfgmod.CFG, registers_size: u16)
                 .const_wide => |v| v.dest.reg,
                 .const_string => |v| v.dest.reg,
                 .const_class => |v| v.dest.reg,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int,
-                .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
-                .add_long, .sub_long, .mul_long, .div_long, .rem_long,
-                .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long,
-                .add_float, .sub_float, .mul_float, .div_float, .rem_float,
-                .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide,
+                .add_int,
+                .sub_int,
+                .mul_int,
+                .div_int,
+                .rem_int,
+                .and_int,
+                .or_int,
+                .xor_int,
+                .shl_int,
+                .shr_int,
+                .ushr_int,
+                .add_long,
+                .sub_long,
+                .mul_long,
+                .div_long,
+                .rem_long,
+                .and_long,
+                .or_long,
+                .xor_long,
+                .shl_long,
+                .shr_long,
+                .ushr_long,
+                .add_float,
+                .sub_float,
+                .mul_float,
+                .div_float,
+                .rem_float,
+                .add_wide,
+                .sub_wide,
+                .mul_wide,
+                .div_wide,
+                .rem_wide,
                 => |v| v.dest.reg,
                 .un_op => |v| v.dest.reg,
                 .cmp_op => |v| v.dest.reg,
-                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
-                .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                .add_lit,
+                .sub_lit,
+                .mul_lit,
+                .div_lit,
+                .rem_lit,
+                .and_lit,
+                .or_lit,
+                .xor_lit,
+                .shl_lit,
+                .shr_lit,
+                .ushr_lit,
                 => |v| v.dest.reg,
                 .new_instance => |v| v.dest.reg,
                 .new_array => |v| v.dest.reg,
@@ -416,6 +451,12 @@ fn jitCompileFn(method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv
     return entry;
 }
 
+/// Executable-memory allocator hook for native trampolines (see class_loader).
+fn allocExecForTrampoline(size: usize) callconv(.c) usize {
+    const page = exec_mem.allocateExecMemory(size) catch return 0;
+    return @intFromPtr(page.ptr);
+}
+
 fn jitCompileOSR(method_ptr: usize, loop_pc: u32, registry_ptr: usize, dex_ptr: usize) callconv(.c) usize {
     jit_compile_mutex.lockUncancelable(runtime.global_io);
     defer jit_compile_mutex.unlock(runtime.global_io);
@@ -427,41 +468,88 @@ fn jitCompileOSR(method_ptr: usize, loop_pc: u32, registry_ptr: usize, dex_ptr: 
 
     const arrow = std.mem.indexOf(u8, method.name, "->") orelse 0;
     const short_name = if (arrow > 0) method.name[arrow + 2 ..] else method.name;
-    const class_desc = findClass(dex, method.class_name) orelse return 0;
-    const dex_method = findMethod(&class_desc, short_name) orelse return 0;
-    const insns = dex.decodeMethod(gpa, dex_method) catch return 0;
+    const decl_cd = findClass(dex, method.class_name) orelse {
+        std.debug.print("JIT error: Class not found {s}\n", .{method.class_name});
+        return 0;
+    };
+    const dex_method = findMethod(&decl_cd, short_name) orelse {
+        std.debug.print("JIT error: Method not found {s}\n", .{short_name});
+        return 0;
+    };
+    const insns = dex.decodeMethod(gpa, dex_method) catch |err| {
+        std.debug.print("JIT error decodeMethod: {s}\n", .{@errorName(err)});
+        return 0;
+    };
 
-    var cfg = cfgmod.buildCFG(gpa, insns) catch return 0;
+    // The OSR register-loading model reconstructs live registers from frame.regs
+    // at the loop entry, but mishandles object references created *after* the loop
+    // (e.g. `new StringBuilder()` in a post-loop block): the destination register
+    // ends up holding a stale/zero loop value, so the object pointer is lost and
+    // the subsequent virtual dispatch reads [null-16] and segfaults. Until the OSR
+    // liveness model is fixed, decline to OSR-compile methods that allocate objects
+    // or arrays; they keep running in the (correct) interpreter.
+    // OSR reconstructs loop-live registers from frame.regs at loop entry, but the
+    // current model mishandles methods that allocate objects — object references
+    // created post-loop are lost and loop-carried counters can be corrupted. Until
+    // the OSR liveness/reload model is fixed, decline to OSR-compile allocating
+    // methods; they keep running correctly in the interpreter. (The non-OSR JIT
+    // path handles them fine — see the per-method native trampoline and
+    // const-string resolution fixes.)
+    for (insns) |inst| {
+        switch (inst) {
+            .new_instance, .new_array, .filled_new_array => return 0,
+            else => {},
+        }
+    }
+
+    var cfg = cfgmod.buildCFG(gpa, insns) catch |err| {
+        std.debug.print("JIT error buildCFG: {s}\n", .{@errorName(err)});
+        return 0;
+    };
     defer cfg.deinit();
 
-    // Reorder cfg blocks to make the block for loop_pc the first block!
-    var loop_block_idx: ?usize = null;
-    for (cfg.blocks.items, 0..) |block, i| {
+    // Set osr_loop_block_id in CFG to track where OSR entry block should jump
+    for (cfg.blocks.items) |block| {
         if (block.start_idx == loop_pc) {
-            loop_block_idx = i;
+            cfg.osr_loop_block_id = block.id;
             break;
         }
     }
-    if (loop_block_idx) |idx| {
-        if (idx > 0) {
-            const tmp = cfg.blocks.items[0];
-            cfg.blocks.items[0] = cfg.blocks.items[idx];
-            cfg.blocks.items[idx] = tmp;
-        }
-    }
 
-    translate.translateCFGWithMethod(gpa, &cfg, insns, method.method_idx) catch return 0;
-    buildSSA(gpa, &cfg, method.registers_size) catch return 0;
-    _ = opt.optimize(gpa, &cfg) catch return 0;
-    dessa.eliminatePhis(gpa, &cfg) catch return 0;
+    translate.translateCFGWithMethod(gpa, &cfg, insns, method.method_idx) catch |err| {
+        std.debug.print("JIT error translateCFG: {s}\n", .{@errorName(err)});
+        return 0;
+    };
+    buildSSA(gpa, &cfg, method.registers_size) catch |err| {
+        std.debug.print("JIT error buildSSA: {s}\n", .{@errorName(err)});
+        return 0;
+    };
+    _ = opt.optimize(gpa, &cfg) catch |err| {
+        std.debug.print("JIT error optimize: {s}\n", .{@errorName(err)});
+        return 0;
+    };
+    dessa.eliminatePhis(gpa, &cfg) catch |err| {
+        std.debug.print("JIT error eliminatePhis: {s}\n", .{@errorName(err)});
+        return 0;
+    };
     while (dessa.propagateCopies(gpa, &cfg) catch false) {}
 
-    var machine = lower.lowerCFG(gpa, &cfg) catch return 0;
+    var machine = lower.lowerCFG(gpa, &cfg) catch |err| {
+        std.debug.print("JIT error lowerCFG: {s}\n", .{@errorName(err)});
+        return 0;
+    };
     defer machine.deinit();
 
     // Pass ins_size = 0xFFFF to signify OSR parameter loading.
-    regalloc.allocateRegisters(gpa, &machine, &cfg, null, null, method.registers_size, 0xFFFF, null, dex, registry) catch return 0;
-    const code_bytes = emitter.emitProgram(gpa, &machine, registry, dex) catch return 0;
+    regalloc.allocateRegisters(gpa, &machine, &cfg, null, null, method.registers_size, 0xFFFF, null, dex, registry) catch |err| {
+        std.debug.print("JIT error allocateRegisters: {s}\n", .{@errorName(err)});
+        return 0;
+    };
+
+    const code_bytes = emitter.emitProgram(gpa, &machine, registry, dex) catch |err| {
+        std.debug.print("JIT error emitProgram: {s}\n", .{@errorName(err)});
+        return 0;
+    };
 
     const exec_page = exec_mem.allocateExecMemory(code_bytes.len) catch return 0;
     @memcpy(exec_page, code_bytes);
@@ -1192,6 +1280,7 @@ pub fn main(init: std.process.Init) !void {
 
         class_loader.jit_compile_fn = jitCompileFn;
         class_loader.jit_compile_osr_fn = jitCompileOSR;
+        class_loader.alloc_exec_fn = allocExecForTrampoline;
 
         try runtime.initRuntime(std.heap.c_allocator, 0);
         defer runtime.deinitRuntime();
@@ -1203,7 +1292,22 @@ pub fn main(init: std.process.Init) !void {
 
         // Temporarily fake JavaThread for the main thread so gcAlloc works
         const main_thread = try thread.JavaThread.init(std.heap.c_allocator, 0, undefined);
-        thread.current_thread = main_thread;
+        thread.registerThread(main_thread);
+
+        // Initialize java.lang.System.out to a real PrintStream instance. Without
+        // this the static field is null; the interpreter tolerates a null receiver
+        // for the native println/printf, but JIT-compiled code performs a real
+        // virtual dispatch that dereferences the receiver's class pointer and
+        // segfaults. Allocate a PrintStream object (class ptr in its header) and
+        // publish it into System.out's static slot.
+        if (registry.get("java/lang/System")) |system_cd| {
+            if (system_cd.staticSlot("out")) |out_slot| {
+                if (registry.get("java/io/PrintStream")) |ps_cd| {
+                    const ps_obj = runtime.gcAlloc(@intFromPtr(ps_cd), ps_cd.instance_size);
+                    out_slot.* = .{ .reference = @intFromPtr(ps_obj) };
+                }
+            }
+        }
 
         const arr_raw = runtime.gcAlloc(0, arr_size);
         const arr_body = @intFromPtr(arr_raw);
@@ -1220,7 +1324,7 @@ pub fn main(init: std.process.Init) !void {
             layout.value = arg.ptr;
             layout.length = @intCast(arg.len);
 
-            const p = arr_body + 4 + i * 8;
+            const p = arr_body + 8 + i * 8;
             @as(*align(4) u64, @ptrFromInt(p)).* = @intFromPtr(str_obj);
         }
 
@@ -1235,6 +1339,17 @@ pub fn main(init: std.process.Init) !void {
         };
 
         interp.native_lookup_fn = native.lookupNativeMethod;
+
+        // Run the class's static initializer (<clinit>) before main. This must run
+        // interpreted so that `new Object()` for static-final fields (e.g. lock
+        // objects) is populated before any JIT-compiled method reads them — JIT'd
+        // static accesses do not emit a class-init barrier, so a lazily-triggered
+        // clinit could leave those fields null and crash monitor_enter/dispatch.
+        interp.initializeClass(target_class) catch |err| {
+            try writer.print("Error initializing class '{s}': {s}\n", .{ class_arg, @errorName(err) });
+            return;
+        };
+
         const main_args = [_]u64{arr_body};
         // Flush any prior Zig-buffered driver output before the program runs, so
         // it precedes the program's libc output on the same fd.

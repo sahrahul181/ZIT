@@ -147,7 +147,7 @@ pub fn loopInvariantCodeMotion(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !
 
                 // Hoist loop invariant instructions
                 const ph_id = pre_header_id.?;
-                
+
                 // We will iteratively find and hoist loop invariant instructions
                 var loop_changed = true;
                 while (loop_changed) {
@@ -162,11 +162,7 @@ pub fn loopInvariantCodeMotion(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !
 
                             // Only hoist pure operations
                             switch (inst) {
-                                .move, .const_int, .const_wide, .const_string, .const_class,
-                                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
-                                .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide,
-                                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
-                                .new_instance, .new_array, .iget, .sget, .aget => {
+                                .move, .const_int, .const_wide, .const_string, .const_class, .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit, .new_instance, .new_array, .iget, .sget, .aget => {
                                     is_invariant = true;
                                 },
                                 else => {},
@@ -608,7 +604,7 @@ pub fn valueRangePropagation(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bo
             .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le => |v| {
                 const r_l = ranges.get(v.left) orelse Range{};
                 const r_r = ranges.get(v.right) orelse Range{};
-                
+
                 var evaluated: ?bool = null;
                 switch (inst.*) {
                     .if_lt => {
@@ -1258,39 +1254,77 @@ pub fn loopStrengthReduction(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bo
                 if (other_inst == &block.instructions.items[adjusted_idx]) continue;
 
                 switch (other_inst.*) {
-                    .move => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) { v.src = phi_dest_ssa; },
-                    .un_op => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) { v.src = phi_dest_ssa; },
+                    .move => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) {
+                        v.src = phi_dest_ssa;
+                    },
+                    .un_op => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) {
+                        v.src = phi_dest_ssa;
+                    },
                     .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_float, .sub_float, .mul_float, .div_float, .rem_float, .add_wide, .sub_wide, .mul_wide, .div_wide, .rem_wide => |*v| {
-                        if (v.left.reg == mul_dest.?.reg and v.left.version == mul_dest.?.version) { v.left = phi_dest_ssa; }
-                        if (v.right.reg == mul_dest.?.reg and v.right.version == mul_dest.?.version) { v.right = phi_dest_ssa; }
+                        if (v.left.reg == mul_dest.?.reg and v.left.version == mul_dest.?.version) {
+                            v.left = phi_dest_ssa;
+                        }
+                        if (v.right.reg == mul_dest.?.reg and v.right.version == mul_dest.?.version) {
+                            v.right = phi_dest_ssa;
+                        }
                     },
                     .cmp_op => |*v| {
-                        if (v.left.reg == mul_dest.?.reg and v.left.version == mul_dest.?.version) { v.left = phi_dest_ssa; }
-                        if (v.right.reg == mul_dest.?.reg and v.right.version == mul_dest.?.version) { v.right = phi_dest_ssa; }
+                        if (v.left.reg == mul_dest.?.reg and v.left.version == mul_dest.?.version) {
+                            v.left = phi_dest_ssa;
+                        }
+                        if (v.right.reg == mul_dest.?.reg and v.right.version == mul_dest.?.version) {
+                            v.right = phi_dest_ssa;
+                        }
                     },
                     .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit, .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit => |*v| {
-                        if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) { v.src = phi_dest_ssa; }
+                        if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) {
+                            v.src = phi_dest_ssa;
+                        }
                     },
-                    .new_array => |*v| if (v.size.reg == mul_dest.?.reg and v.size.version == mul_dest.?.version) { v.size = phi_dest_ssa; },
-                    .iget => |*v| if (v.obj.reg == mul_dest.?.reg and v.obj.version == mul_dest.?.version) { v.obj = phi_dest_ssa; },
+                    .new_array => |*v| if (v.size.reg == mul_dest.?.reg and v.size.version == mul_dest.?.version) {
+                        v.size = phi_dest_ssa;
+                    },
+                    .iget => |*v| if (v.obj.reg == mul_dest.?.reg and v.obj.version == mul_dest.?.version) {
+                        v.obj = phi_dest_ssa;
+                    },
                     .iput => |*v| {
-                        if (v.dest_or_src.reg == mul_dest.?.reg and v.dest_or_src.version == mul_dest.?.version) { v.dest_or_src = phi_dest_ssa; }
-                        if (v.obj.reg == mul_dest.?.reg and v.obj.version == mul_dest.?.version) { v.obj = phi_dest_ssa; }
+                        if (v.dest_or_src.reg == mul_dest.?.reg and v.dest_or_src.version == mul_dest.?.version) {
+                            v.dest_or_src = phi_dest_ssa;
+                        }
+                        if (v.obj.reg == mul_dest.?.reg and v.obj.version == mul_dest.?.version) {
+                            v.obj = phi_dest_ssa;
+                        }
                     },
-                    .sput => |*v| if (v.dest_or_src.reg == mul_dest.?.reg and v.dest_or_src.version == mul_dest.?.version) { v.dest_or_src = phi_dest_ssa; },
+                    .sput => |*v| if (v.dest_or_src.reg == mul_dest.?.reg and v.dest_or_src.version == mul_dest.?.version) {
+                        v.dest_or_src = phi_dest_ssa;
+                    },
                     .aget => |*v| {
-                        if (v.array.reg == mul_dest.?.reg and v.array.version == mul_dest.?.version) { v.array = phi_dest_ssa; }
-                        if (v.index.reg == mul_dest.?.reg and v.index.version == mul_dest.?.version) { v.index = phi_dest_ssa; }
+                        if (v.array.reg == mul_dest.?.reg and v.array.version == mul_dest.?.version) {
+                            v.array = phi_dest_ssa;
+                        }
+                        if (v.index.reg == mul_dest.?.reg and v.index.version == mul_dest.?.version) {
+                            v.index = phi_dest_ssa;
+                        }
                     },
                     .aput => |*v| {
-                        if (v.dest_or_src.reg == mul_dest.?.reg and v.dest_or_src.version == mul_dest.?.version) { v.dest_or_src = phi_dest_ssa; }
-                        if (v.array.reg == mul_dest.?.reg and v.array.version == mul_dest.?.version) { v.array = phi_dest_ssa; }
-                        if (v.index.reg == mul_dest.?.reg and v.index.version == mul_dest.?.version) { v.index = phi_dest_ssa; }
+                        if (v.dest_or_src.reg == mul_dest.?.reg and v.dest_or_src.version == mul_dest.?.version) {
+                            v.dest_or_src = phi_dest_ssa;
+                        }
+                        if (v.array.reg == mul_dest.?.reg and v.array.version == mul_dest.?.version) {
+                            v.array = phi_dest_ssa;
+                        }
+                        if (v.index.reg == mul_dest.?.reg and v.index.version == mul_dest.?.version) {
+                            v.index = phi_dest_ssa;
+                        }
                     },
                     .ret => |*v| {
-                        if (v.src) |*s| if (s.reg == mul_dest.?.reg and s.version == mul_dest.?.version) { s.* = phi_dest_ssa; };
+                        if (v.src) |*s| if (s.reg == mul_dest.?.reg and s.version == mul_dest.?.version) {
+                            s.* = phi_dest_ssa;
+                        };
                     },
-                    .throw_op => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) { v.src = phi_dest_ssa; },
+                    .throw_op => |*v| if (v.src.reg == mul_dest.?.reg and v.src.version == mul_dest.?.version) {
+                        v.src = phi_dest_ssa;
+                    },
                     else => {},
                 }
             }
@@ -1409,7 +1443,7 @@ pub fn globalRegisterCoalescing(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) 
         var i: usize = 0;
         while (i < block.instructions.items.len) {
             const inst = &block.instructions.items[i];
-            
+
             if (inst.* == .move) {
                 const dest = inst.move.dest;
                 if (coalesced.contains(dest)) {
@@ -2530,7 +2564,7 @@ pub fn boundsCheckElimination(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !b
             var keep = true;
             if (inst == .bounds_check) {
                 const bc = inst.bounds_check;
-                
+
                 // 1. Redundant check elimination
                 const pair = CheckedPair{ .array = bc.array, .index = bc.index };
                 if (checked_pairs.contains(pair)) {
@@ -2689,7 +2723,6 @@ pub fn escapeAnalysis(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
     return changed;
 }
 
-
 test "eliminateDeadCode: basic dead code elimination" {
     const a = std.testing.allocator;
     const instmod = @import("instruction");
@@ -2721,11 +2754,11 @@ test "eliminateDeadCode: copy propagation and constant folding" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 10, .dest = 0 } },  // v0 = 10
-        .{ .const_ = .{ .value = 20, .dest = 1 } },  // v1 = 20
+        .{ .const_ = .{ .value = 10, .dest = 0 } }, // v0 = 10
+        .{ .const_ = .{ .value = 20, .dest = 1 } }, // v1 = 20
         .{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } }, // v2 = v0 + v1 = 30 (folded!)
-        .{ .move = .{ .dest = 3, .src = 2 } },        // v3 = v2 (propagated!)
-        .{ .return_ = .{ .src = 3 } },                // return v3
+        .{ .move = .{ .dest = 3, .src = 2 } }, // v3 = v2 (propagated!)
+        .{ .return_ = .{ .src = 3 } }, // return v3
     };
 
     var cfg = try cfgmod.buildCFG(a, &insns);
@@ -2755,7 +2788,7 @@ test "eliminateDeadCode: global value numbering" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 5, .dest = 0 } },  // v0 = 5
+        .{ .const_ = .{ .value = 5, .dest = 0 } }, // v0 = 5
         .{ .const_ = .{ .value = 10, .dest = 1 } }, // v1 = 10
         .{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } }, // v2 = v0 + v1
         .{ .add_int = .{ .dest = 3, .src1 = 0, .src2 = 1 } }, // v3 = v0 + v1 (duplicate!)
@@ -2786,8 +2819,8 @@ test "eliminateDeadCode: loop invariant code motion" {
     const translate = @import("translate");
 
     const loop_insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 10, .dest = 0 } },  // Block 0: v0 = 10
-        .{ .const_ = .{ .value = 20, .dest = 1 } },  // v1 = 20
+        .{ .const_ = .{ .value = 10, .dest = 0 } }, // Block 0: v0 = 10
+        .{ .const_ = .{ .value = 20, .dest = 1 } }, // v1 = 20
         // Block 1 (header): starts at index 2
         .{ .add_int = .{ .dest = 4, .src1 = 0, .src2 = 1 } }, // v4 = v0 + v1 (invariant!)
         .{ .add_int = .{ .dest = 3, .src1 = 2, .src2 = 4 } }, // v3 = v2 + v4
@@ -2825,10 +2858,10 @@ test "eliminateDeadCode: algebraic simplifications and strength reduction" {
 
     const insns = [_]instmod.Instruction{
         .{ .const_ = .{ .value = 10, .dest = 0 } }, // v0 = 10
-        .{ .const_ = .{ .value = 0, .dest = 1 } },  // v1 = 0
+        .{ .const_ = .{ .value = 0, .dest = 1 } }, // v1 = 0
         .{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } }, // v2 = v0 + v1 -> v0 + 0 -> move v0 -> 10
         .{ .sub_int = .{ .dest = 3, .src1 = 0, .src2 = 0 } }, // v3 = v0 - v0 -> const 0
-        .{ .mul_int_lit8 = .{ .dest = 4, .src = 0, .lit = 4 } },  // v4 = v0 * 4 -> v0 << 2 (shl_lit) -> 40
+        .{ .mul_int_lit8 = .{ .dest = 4, .src = 0, .lit = 4 } }, // v4 = v0 * 4 -> v0 << 2 (shl_lit) -> 40
         .{ .iput = .{ .dest_or_src = 3, .obj = 0, .field_idx = 1 } },
         .{ .iput = .{ .dest_or_src = 4, .obj = 0, .field_idx = 2 } },
         .return_void,
@@ -2866,11 +2899,11 @@ test "eliminateDeadCode: cfg simplification and dead branch elimination" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 10, .dest = 0 } },  // Block 0: v0 = 10
-        .{ .const_ = .{ .value = 10, .dest = 1 } },  // v1 = 10
+        .{ .const_ = .{ .value = 10, .dest = 0 } }, // Block 0: v0 = 10
+        .{ .const_ = .{ .value = 10, .dest = 1 } }, // v1 = 10
         .{ .if_eq = .{ .offset = 3, .src1 = 0, .src2 = 1 } }, // if v0 == v1 goto Block 2 (offset 3 to index 5)
         // Block 1 (dead fallthrough):
-        .{ .const_ = .{ .value = 999, .dest = 2 } }, 
+        .{ .const_ = .{ .value = 999, .dest = 2 } },
         .{ .return_ = .{ .src = 2 } },
         // Block 2 (always taken): target of if_eq
         .{ .return_ = .{ .src = 0 } },
@@ -2904,12 +2937,12 @@ test "eliminateDeadCode: value range propagation" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 10, .dest = 0 } },  // Block 0: v0 = 10
-        .{ .const_ = .{ .value = 5, .dest = 1 } },   // v1 = 5
+        .{ .const_ = .{ .value = 10, .dest = 0 } }, // Block 0: v0 = 10
+        .{ .const_ = .{ .value = 5, .dest = 1 } }, // v1 = 5
         .{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } }, // v2 = 15
         .{ .if_gez = .{ .offset = 3, .src = 2 } }, // if v2 >= 0 goto Block 2 (offset 3 to index 6)
         // Block 1 (dead fallthrough):
-        .{ .const_ = .{ .value = 999, .dest = 3 } }, 
+        .{ .const_ = .{ .value = 999, .dest = 3 } },
         .{ .return_ = .{ .src = 3 } },
         // Block 2 (always taken):
         .{ .return_ = .{ .src = 2 } },
@@ -2943,9 +2976,9 @@ test "eliminateDeadCode: loop unrolling" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 0, .dest = 0 } },  // Block 0: v0 = 0
+        .{ .const_ = .{ .value = 0, .dest = 0 } }, // Block 0: v0 = 0
         .{ .const_ = .{ .value = 10, .dest = 1 } }, // v1 = 10
-        .{ .const_ = .{ .value = 3, .dest = 9 } },  // v9 = 3 (limit)
+        .{ .const_ = .{ .value = 3, .dest = 9 } }, // v9 = 3 (limit)
         // Block 1 (header): starts at index 3
         .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = 5 } }, // v1_next = v1_phi + 5
         .{ .add_int_lit8 = .{ .dest = 0, .src = 0, .lit = 1 } }, // v0_next = v0_phi + 1
@@ -2980,13 +3013,37 @@ test "eliminateDeadCode: loop unrolling" {
                 .const_wide => |v| v.dest.reg,
                 .const_string => |v| v.dest.reg,
                 .const_class => |v| v.dest.reg,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int,
-                .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
-                .add_float, .sub_float, .mul_float, .div_float,
-                .add_wide, .sub_wide, .mul_wide, .div_wide,
+                .add_int,
+                .sub_int,
+                .mul_int,
+                .div_int,
+                .rem_int,
+                .and_int,
+                .or_int,
+                .xor_int,
+                .shl_int,
+                .shr_int,
+                .ushr_int,
+                .add_float,
+                .sub_float,
+                .mul_float,
+                .div_float,
+                .add_wide,
+                .sub_wide,
+                .mul_wide,
+                .div_wide,
                 => |v| v.dest.reg,
-                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
-                .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                .add_lit,
+                .sub_lit,
+                .mul_lit,
+                .div_lit,
+                .rem_lit,
+                .and_lit,
+                .or_lit,
+                .xor_lit,
+                .shl_lit,
+                .shr_lit,
+                .ushr_lit,
                 => |v| v.dest.reg,
                 .new_instance => |v| v.dest.reg,
                 .new_array => |v| v.dest.reg,
@@ -3060,7 +3117,7 @@ test "eliminateDeadCode: loop strength reduction" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 0, .dest = 0 } },  // Block 0: v0 = 0
+        .{ .const_ = .{ .value = 0, .dest = 0 } }, // Block 0: v0 = 0
         .{ .const_ = .{ .value = 100, .dest = 9 } }, // v9 = 100 (limit)
         .{ .mul_int_lit8 = .{ .dest = 1, .src = 0, .lit = 4 } }, // v1 = v0 * 4
         .{ .add_int_lit8 = .{ .dest = 0, .src = 0, .lit = 1 } }, // v0_next = v0 + 1
@@ -3095,13 +3152,37 @@ test "eliminateDeadCode: loop strength reduction" {
                 .const_wide => |v| v.dest.reg,
                 .const_string => |v| v.dest.reg,
                 .const_class => |v| v.dest.reg,
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int,
-                .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
-                .add_float, .sub_float, .mul_float, .div_float,
-                .add_wide, .sub_wide, .mul_wide, .div_wide,
+                .add_int,
+                .sub_int,
+                .mul_int,
+                .div_int,
+                .rem_int,
+                .and_int,
+                .or_int,
+                .xor_int,
+                .shl_int,
+                .shr_int,
+                .ushr_int,
+                .add_float,
+                .sub_float,
+                .mul_float,
+                .div_float,
+                .add_wide,
+                .sub_wide,
+                .mul_wide,
+                .div_wide,
                 => |v| v.dest.reg,
-                .add_lit, .sub_lit, .mul_lit, .div_lit, .rem_lit,
-                .and_lit, .or_lit, .xor_lit, .shl_lit, .shr_lit, .ushr_lit,
+                .add_lit,
+                .sub_lit,
+                .mul_lit,
+                .div_lit,
+                .rem_lit,
+                .and_lit,
+                .or_lit,
+                .xor_lit,
+                .shl_lit,
+                .shr_lit,
+                .ushr_lit,
                 => |v| v.dest.reg,
                 .new_instance => |v| v.dest.reg,
                 .new_array => |v| v.dest.reg,
@@ -3290,7 +3371,7 @@ test "eliminateDeadCode: long integer operations optimization" {
     try std.testing.expect(changed);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    
+
     // Check that copy propagation successfully collapsed the move_wide
     var found_move = false;
     for (insts) |inst| {
@@ -3308,9 +3389,9 @@ test "boundsCheckElimination: basic constant and redundancy elimination" {
     const translate = @import("translate");
 
     const insns = [_]instmod.Instruction{
-        .{ .const_ = .{ .value = 5, .dest = 0 } },      // size = 5 (v0)
+        .{ .const_ = .{ .value = 5, .dest = 0 } }, // size = 5 (v0)
         .{ .new_array = .{ .dest = 1, .size = 0, .type_idx = 0 } }, // array (v1)
-        .{ .const_ = .{ .value = 2, .dest = 2 } },      // index = 2 (v2)
+        .{ .const_ = .{ .value = 2, .dest = 2 } }, // index = 2 (v2)
         .{ .aget = .{ .dest_or_src = 3, .array = 1, .index = 2 } }, // bounds_check, then aget
         .{ .aget = .{ .dest_or_src = 4, .array = 1, .index = 2 } }, // bounds_check (redundant!), then aget
         .return_void,
@@ -3378,4 +3459,3 @@ test "escapeAnalysis: basic stack allocation" {
     }
     try std.testing.expect(found_stack_alloc);
 }
-

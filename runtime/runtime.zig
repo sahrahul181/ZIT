@@ -48,20 +48,25 @@ pub const ImmixGC = struct {
     allocator: std.mem.Allocator,
     // Note: A true production GC manages OS mmap pages globally.
     // For now, we will simulate a global pool by tracking active blocks.
-    
+
     pub fn init(allocator: std.mem.Allocator) !ImmixGC {
         return .{
             .allocator = allocator,
         };
     }
-    
+
     pub fn deinit(self: *ImmixGC) void {
         _ = self;
     }
-    
+
     pub fn requestBlock(self: *ImmixGC) !*Block {
-        // Allocate a new block from the OS (via Zig allocator)
-        const mem = try self.allocator.alloc(u8, layout.BLOCK_SIZE);
+        // Allocate a new block from the OS (via Zig allocator).
+        // MUST be BLOCK_SIZE-aligned so that Block.lineIndex() (which uses
+        // `address & (BLOCK_SIZE-1)`) and Block.fromAddress() produce correct
+        // results.  Plain malloc() gives only 16-byte alignment, which breaks
+        // the hole-scan math and causes intermittent "Object too large for Immix
+        // block" panics when two threads race to fill their TLABs.
+        const mem = try self.allocator.alignedAlloc(u8, .fromByteUnits(layout.BLOCK_SIZE), layout.BLOCK_SIZE);
         const block = @as(*Block, @ptrCast(@alignCast(mem.ptr)));
         block.* = Block.init();
         return block;
@@ -85,12 +90,27 @@ pub fn deinitRuntime() void {
 
 pub fn gcAlloc(class_ptr: usize, size: usize) callconv(.c) *anyopaque {
     const current_thread = thread.getCurrent() orelse @panic("gcAlloc called without thread context");
-    
+
     if (global_gc) |*gc| {
         // Total size = ObjectHeader (16) + aligned instance size
         const aligned_size = std.mem.alignForward(usize, size, 8);
         const total_size = aligned_size + 16;
-        
+
+        // Large-object space: objects that don't fit within an Immix block's
+        // bump region are allocated directly from the OS allocator instead of
+        // panicking. (These are leaked for now — there is no GC sweep yet, same
+        // as Immix blocks.) The threshold is a conservative half-block.
+        if (total_size > layout.BLOCK_SIZE / 2) {
+            const mem = gc.allocator.alignedAlloc(u8, .@"16", total_size) catch @panic("OOM: large object");
+            const obj_ptr_int = @intFromPtr(mem.ptr);
+            const hdr = @as(*ObjectHeader, @ptrFromInt(obj_ptr_int));
+            hdr.class_ptr = class_ptr;
+            hdr.monitor = 0;
+            const obj_ptr = obj_ptr_int + 16;
+            @memset(@as([*]u8, @ptrFromInt(obj_ptr))[0..aligned_size], 0);
+            return @ptrFromInt(obj_ptr);
+        }
+
         var ptr = current_thread.tls.allocator.alloc(total_size);
         if (ptr == null) {
             // TLAB exhausted, request a new block from the global coordinator
@@ -99,30 +119,29 @@ pub fn gcAlloc(class_ptr: usize, size: usize) callconv(.c) *anyopaque {
             ptr = current_thread.tls.allocator.alloc(total_size);
             if (ptr == null) @panic("Object too large for Immix block");
         }
-        
+
         // Initialize header
         const obj_ptr_int = @intFromPtr(ptr.?);
         const hdr = @as(*ObjectHeader, @ptrFromInt(obj_ptr_int));
         hdr.class_ptr = class_ptr;
         hdr.monitor = 0;
-        
+
         // Zero body
         const obj_ptr = obj_ptr_int + 16;
         @memset(@as([*]u8, @ptrFromInt(obj_ptr))[0..aligned_size], 0);
-        
+
         return @ptrFromInt(obj_ptr);
     }
     @panic("Runtime not initialized");
 }
 
-
 // ── Wait/Notify Queues ────────────────────────────────────────────────────────
 pub var wait_queues: ?std.AutoHashMap(usize, std.ArrayList(*thread.JavaThread)) = null;
 pub var wait_queue_mutex: SpinLock = .{};
 
-
 // ── Thin-Lock Synchronization ───────────────────────────────────────────────
 pub fn monitorEnter(obj: *anyopaque) callconv(.c) void {
+    if (@intFromPtr(obj) == 0) return; // tolerate null lock object (no-op)
     const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
     const current = thread.getCurrent() orelse @panic("monitorEnter outside JavaThread");
     const thread_id = current.id;
@@ -147,6 +166,7 @@ pub fn monitorEnter(obj: *anyopaque) callconv(.c) void {
 }
 
 pub fn monitorExit(obj: *anyopaque) callconv(.c) void {
+    if (@intFromPtr(obj) == 0) return; // tolerate null (matches monitorEnter behaviour)
     const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
     const current = thread.getCurrent() orelse @panic("monitorExit outside JavaThread");
     const thread_id = current.id;
@@ -196,7 +216,7 @@ pub fn monitorWait(obj: *anyopaque) callconv(.c) void {
 
     // Re-acquire lock
     monitorEnter(obj);
-    
+
     // Restore recursion
     if (recursion > 0) {
         const new_val = @atomicLoad(usize, &header.monitor, .acquire) + (recursion << 32);
@@ -250,7 +270,6 @@ pub fn monitorNotifyAll(obj: *anyopaque) callconv(.c) void {
     }
 }
 
-
 // ── Concurrency & Atomic Operations ──────────────────────────────────────────
 pub fn atomicCAS(addr: *i32, expected: i32, new_val: i32) callconv(.c) bool {
     return @cmpxchgStrong(i32, addr, expected, new_val, .seq_cst, .seq_cst) == null;
@@ -258,6 +277,21 @@ pub fn atomicCAS(addr: *i32, expected: i32, new_val: i32) callconv(.c) bool {
 
 pub fn memoryBarrier() callconv(.c) void {
     asm volatile ("mfence");
+}
+
+const JitStringLayout = extern struct { value: [*]const u8, length: i32 };
+
+/// JIT helper: build a heap String object from a (value pointer, length) pair,
+/// matching the interpreter's const_string handling. The emitter resolves the
+/// string-pool entry at compile time (the bytes live in the stable DEX buffer)
+/// and passes value_ptr/length as immediates. Passing the raw pool index instead
+/// would look like a misaligned object pointer to consumers.
+pub fn gcNewString(value_ptr: usize, length: i32) callconv(.c) usize {
+    const obj = gcAlloc(0, 24);
+    const slay = @as(*JitStringLayout, @ptrCast(@alignCast(obj)));
+    slay.value = @ptrFromInt(value_ptr);
+    slay.length = length;
+    return @intFromPtr(obj);
 }
 
 /// JIT helper: allocate an array of `count` elements with the given element size
@@ -300,7 +334,7 @@ pub fn gcFillArrayData(array_ptr: usize, data_ptr: usize, elements: u32, width: 
 
 /// JIT helper: move exception from TLS
 pub fn gcGetAndClearException() callconv(.c) usize {
-    const th = thread.current_thread;
+    const th = thread.getCurrent();
     if (th) |t| {
         const ex = t.tls.exception;
         t.tls.exception = 0;
@@ -318,4 +352,8 @@ pub fn throwIndexOutOfBounds(index: i64, length: i64) callconv(.c) noreturn {
     std.process.exit(1);
 }
 
-
+pub fn throwNullPointerException() callconv(.c) noreturn {
+    std.debug.print("NullPointerException\n", .{});
+    jit_longjmp_if_guarded();
+    std.process.exit(1);
+}

@@ -2,6 +2,8 @@ const std = @import("std");
 const registry = @import("../../registry.zig");
 const runtime = @import("runtime");
 
+var next_thread_id: std.atomic.Value(usize) = std.atomic.Value(usize).init(1);
+
 fn init(args: [*]const u64, _: usize) callconv(.c) u64 {
     const this = args[0];
     const target = args[1];
@@ -23,7 +25,6 @@ fn start(args: [*]const u64, _: usize) callconv(.c) u64 {
             const obj = @as(*const @import("runtime").ObjectHeader, @ptrFromInt(@as(usize, target) - 16));
             const cd = @as(*const @import("class_loader").ClassData, @ptrFromInt(obj.class_ptr));
             const run_m = cd.findMethod("run", "V") orelse return;
-            
             const nat = @import("../../../native.zig");
             const interpreter = @import("interpreter");
             
@@ -35,12 +36,13 @@ fn start(args: [*]const u64, _: usize) callconv(.c) u64 {
             interp.native_lookup_fn = nat.lookupNativeMethod;
             const val_args = [_]u64{ target };
             _ = interp.invoke(run_m, &val_args) catch |err| {
-                std.debug.print("Thread exited with error: {s}\n", .{@errorName(err)});
+                std.debug.print("Thread {d} exited with error: {s}\n", .{ thread.id, @errorName(err) });
             };
         }
     }.run;
 
-    const jt = thread_mod.JavaThread.init(allocator, 0, run_trampoline) catch {
+    const tid = next_thread_id.fetchAdd(1, .monotonic);
+    const jt = thread_mod.JavaThread.init(allocator, tid, run_trampoline) catch {
         std.debug.panic("OutOfMemory during Thread.start", .{});
     };
     jt.java_thread_obj = th_obj_ptr;

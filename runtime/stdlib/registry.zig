@@ -7,11 +7,17 @@ pub const NativeMethodDef = struct {
     func_ptr: ?*const anyopaque,
 };
 
+pub const NativeFieldDef = struct {
+    name: []const u8,
+    signature: []const u8,
+};
+
 pub const NativeClassDef = struct {
     name: []const u8,
     super_name: ?[]const u8 = "java/lang/Object",
     instance_size: u32 = 16,
     methods: []const NativeMethodDef = &.{},
+    static_fields: []const NativeFieldDef = &.{},
 };
 
 pub const stdlib_classes = [_]NativeClassDef{

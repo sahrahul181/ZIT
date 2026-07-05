@@ -77,72 +77,218 @@ const Relocation = struct {
 fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachineProgram) !std.ArrayList(x86.PhysicalReg) {
     var used = std.AutoHashMap(x86.PhysicalReg, void).init(allocator);
     defer used.deinit();
-    
+
     for (program.blocks.items) |block| {
         for (block.instructions.items) |inst| {
             const checkOp = struct {
                 fn run(u: *std.AutoHashMap(x86.PhysicalReg, void), op: x86.Operand) !void {
-                    if (op == .reg) {
-                        const r = op.reg;
-                        const is_callee = switch (r) {
-                            .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15,
-                            .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 => true,
-                            else => false,
-                        };
-                        if (is_callee) {
-                            try u.put(r, {});
-                        }
+                    switch (op) {
+                        .reg => |r| {
+                            const is_callee = switch (r) {
+                                .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15, .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 => true,
+                                else => false,
+                            };
+                            if (is_callee) {
+                                try u.put(r, {});
+                            }
+                        },
+                        .mem => |m| {
+                            switch (m.base) {
+                                .reg => |br| try run(u, .{ .reg = br }),
+                                else => {},
+                            }
+                            if (m.index) |idx| {
+                                switch (idx) {
+                                    .reg => |irg| try run(u, .{ .reg = irg }),
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
                     }
                 }
             }.run;
 
             switch (inst) {
-                .mov => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .bounds_check => |v| { try checkOp(&used, v.index); try checkOp(&used, v.array); },
-                .add => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .sub => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .imul => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .idiv => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.rem); try checkOp(&used, v.src); },
-                .irem => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.rem); try checkOp(&used, v.src); },
-                .neg => |v| { try checkOp(&used, v.dest); },
-                .and_op => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .or_op => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .xor_op => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .shl => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .shr => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .ushr => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cmp => |v| { try checkOp(&used, v.left); try checkOp(&used, v.right); },
-                .test_op => |v| { try checkOp(&used, v.left); try checkOp(&used, v.right); },
-                .addss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .subss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .mulss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .divss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .movss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .addsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .subsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .mulsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .divsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .movsd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .ret => |v| { if (v) |op| try checkOp(&used, op); },
-                .call => |v| { if (v.dest) |op| try checkOp(&used, op); },
-                .monitor_enter => |v| { try checkOp(&used, v.src); },
-                .monitor_exit => |v| { try checkOp(&used, v.src); },
-                .not => |v| { try checkOp(&used, v.dest); },
-                .negss => |v| { try checkOp(&used, v.dest); },
-                .negsd => |v| { try checkOp(&used, v.dest); },
-                .movsxd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .movsx8 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .movsx16 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .movzx16 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cvtsi2ss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cvtsi2sd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cvttss2si => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cvttsd2si => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cvtss2sd => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cvtsd2ss => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .frem32 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .frem64 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
-                .cmp3 => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.left); try checkOp(&used, v.right); },
+                .mov => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .bounds_check => |v| {
+                    try checkOp(&used, v.index);
+                    try checkOp(&used, v.array);
+                },
+                .add => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .sub => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .imul => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .idiv => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.rem);
+                    try checkOp(&used, v.src);
+                },
+                .irem => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.rem);
+                    try checkOp(&used, v.src);
+                },
+                .neg => |v| {
+                    try checkOp(&used, v.dest);
+                },
+                .and_op => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .or_op => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .xor_op => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .shl => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .shr => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .ushr => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cmp => |v| {
+                    try checkOp(&used, v.left);
+                    try checkOp(&used, v.right);
+                },
+                .test_op => |v| {
+                    try checkOp(&used, v.left);
+                    try checkOp(&used, v.right);
+                },
+                .addss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .subss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .mulss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .divss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .movss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .addsd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .subsd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .mulsd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .divsd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .movsd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .ret => |v| {
+                    if (v) |op| try checkOp(&used, op);
+                },
+                .call => |v| {
+                    if (v.dest) |op| try checkOp(&used, op);
+                },
+                .monitor_enter => |v| {
+                    try checkOp(&used, v.src);
+                },
+                .monitor_exit => |v| {
+                    try checkOp(&used, v.src);
+                },
+                .not => |v| {
+                    try checkOp(&used, v.dest);
+                },
+                .negss => |v| {
+                    try checkOp(&used, v.dest);
+                },
+                .negsd => |v| {
+                    try checkOp(&used, v.dest);
+                },
+                .movsxd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .movsx8 => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .movsx16 => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .movzx16 => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cvtsi2ss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cvtsi2sd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cvttss2si => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cvttsd2si => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cvtss2sd => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cvtsd2ss => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .frem32 => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .frem64 => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.src);
+                },
+                .cmp3 => |v| {
+                    try checkOp(&used, v.dest);
+                    try checkOp(&used, v.left);
+                    try checkOp(&used, v.right);
+                },
                 else => {},
             }
         }
@@ -374,7 +520,7 @@ pub fn emitProgram(
                     }
                     return;
                 }
-                
+
                 if (mem.disp == 0 and base != 5) {
                     try c.append(makeModRM(0b00, reg_field, @as(u3, @truncate(base))));
                 } else if (mem.disp >= -128 and mem.disp <= 127) {
@@ -397,7 +543,7 @@ pub fn emitProgram(
                     else => unreachable,
                 };
                 const sib = (scale_bits << 6) | (@as(u8, @truncate(idx)) << 3) | @as(u8, @truncate(base));
-                
+
                 if (mem.disp == 0 and base != 5) {
                     try c.append(makeModRM(0b00, reg_field, 4));
                     try c.append(sib);
@@ -416,20 +562,38 @@ pub fn emitProgram(
         }
     }.run;
 
+    // The safepoint page is allocated once (during initSafepointSubsystem, before
+    // any JIT compilation) and its address never changes — only its page
+    // *protection* is toggled by the GC. So bake the page address in as an
+    // immediate and poll it with a single dependent load, rather than chasing the
+    // global pointer through two extra loads on every backward branch. This is a
+    // hot-path optimization: the old 3-load poll roughly doubled tight-loop cost.
+    const sp_page_addr: u64 = blk: {
+        const sp = @import("safepoint");
+        const p: usize = @intFromPtr(sp.safepoint_page);
+        break :blk @intCast(p);
+    };
     const emitSafepointCheck = struct {
-        fn run(c: *CodeWriter) !void {
-            // MOV RAX, &safepoint_page
+        fn run(c: *CodeWriter, page_addr: u64) !void {
+            if (page_addr == 0) {
+                // Page not yet allocated at emit time (e.g. unit tests without the
+                // safepoint subsystem): fall back to the pointer-chasing form so we
+                // still poll the correct location once it is set.
+                try c.appendSlice(&[_]u8{ 0x48, 0xB8 });
+                var addr_bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &addr_bytes, @intFromPtr(&@import("safepoint").safepoint_page), .little);
+                try c.appendSlice(&addr_bytes);
+                try c.appendSlice(&[_]u8{ 0x48, 0x8B, 0x00 }); // MOV RAX, [RAX]
+                try c.appendSlice(&[_]u8{ 0x8A, 0x00 });       // MOV AL, [RAX]
+                return;
+            }
+            // MOV RAX, page_addr (imm64)
             try c.appendSlice(&[_]u8{ 0x48, 0xB8 });
             var addr_bytes: [8]u8 = undefined;
-            const sp_addr = @intFromPtr(&@import("safepoint").safepoint_page);
-            std.mem.writeInt(u64, &addr_bytes, sp_addr, .little);
+            std.mem.writeInt(u64, &addr_bytes, page_addr, .little);
             try c.appendSlice(&addr_bytes);
-
-            // MOV RAX, [RAX]  — load the page pointer out of the global
-            try c.appendSlice(&[_]u8{ 0x48, 0x8B, 0x00 });
-
-            // MOV AL, [RAX]  — the dummy read of the page itself; traps (access
-            // violation → VEH) when the GC has protected the page for a safepoint
+            // MOV AL, [RAX] — the dummy page read; traps via VEH when the GC has
+            // protected the page for a stop-the-world safepoint.
             try c.appendSlice(&[_]u8{ 0x8A, 0x00 });
         }
     }.run;
@@ -461,7 +625,7 @@ pub fn emitProgram(
             try gpr_saved.append(allocator, r);
         }
     }
-    
+
     // Establish RBP frame pointer
     try code.append(0x55); // push rbp
     try code.appendSlice(&[_]u8{ 0x48, 0x89, 0xE5 }); // mov rbp, rsp
@@ -494,36 +658,57 @@ pub fn emitProgram(
 
     // Safepoint poll at method entry
     if (dex != null) {
-        try emitSafepointCheck(&code);
+        try emitSafepointCheck(&code, sp_page_addr);
     }
+
+    // Collect loop back-edges (target block id <= source block id) so we can poll
+    // the GC safepoint only on *outer* loops. Polling every innermost iteration
+    // roughly doubles tight-loop cost; an outer-loop poll still lets the GC stop
+    // threads within a bounded window. A back-edge is "inner" (skip) when its loop
+    // range is strictly contained in another back-edge's range.
+    const BackEdge = struct { target: usize, source: usize };
+    var back_edges = std.ArrayList(BackEdge).empty;
+    defer back_edges.deinit(allocator);
+    for (program.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const target: ?usize = switch (inst) {
+                .jmp, .je, .jne, .jl, .jge, .jg, .jle, .jz, .jnz => |t| t,
+                else => null,
+            };
+            if (target) |t| {
+                if (t <= block.id) try back_edges.append(allocator, .{ .target = t, .source = block.id });
+            }
+        }
+    }
+    const shouldPoll = struct {
+        fn f(edges: []const BackEdge, target: usize, source: usize) bool {
+            // Poll unless some OTHER back-edge strictly contains this one's range
+            // [target, source] (i.e. this is a nested/inner loop).
+            for (edges) |e| {
+                if (e.target == target and e.source == source) continue;
+                if (e.target <= target and e.source >= source) return false;
+            }
+            return true;
+        }
+    }.f;
 
     // Pass 1: Emit instructions and record label offsets and relocation sites.
     for (program.blocks.items) |block| {
         try block_offsets.put(block.id, code.items.len);
 
         for (block.instructions.items) |inst| {
-            const check_backward_safepoint = struct {
-                fn run(c: *CodeWriter, inst_val: x86.Inst, block_id: usize, has_dex: bool) !void {
-                    const target: ?usize = switch (inst_val) {
-                        .jmp => |t| t,
-                        .je => |t| t,
-                        .jne => |t| t,
-                        .jl => |t| t,
-                        .jge => |t| t,
-                        .jg => |t| t,
-                        .jle => |t| t,
-                        .jz => |t| t,
-                        .jnz => |t| t,
-                        else => null,
-                    };
-                    if (has_dex and target != null) {
-                        if (target.? <= block_id) {
-                            try emitSafepointCheck(c);
-                        }
+            // GC safepoint on outer-loop back-edges only (see back_edges above).
+            if (dex != null) {
+                const bt: ?usize = switch (inst) {
+                    .jmp, .je, .jne, .jl, .jge, .jg, .jle, .jz, .jnz => |t| t,
+                    else => null,
+                };
+                if (bt) |t| {
+                    if (t <= block.id and shouldPoll(back_edges.items, t, block.id)) {
+                        try emitSafepointCheck(&code, sp_page_addr);
                     }
                 }
-            }.run;
-            try check_backward_safepoint(&code, inst, block.id, dex != null);
+            }
 
             switch (inst) {
                 // ---- Data movement ----
@@ -755,7 +940,7 @@ pub fn emitProgram(
                             try code.appendSlice(&bytes);
                         }
                     } else {
-                        std.debug.print("mov: unsupported dest={s} src={s}\n", .{@tagName(v.dest), @tagName(v.src)});
+                        std.debug.print("mov: unsupported dest={s} src={s}\n", .{ @tagName(v.dest), @tagName(v.src) });
                         return EmitterError.UnsupportedOperandCombination;
                     }
                 },
@@ -866,7 +1051,7 @@ pub fn emitProgram(
                             try code.appendSlice(&bytes);
                         }
                     } else {
-                        std.debug.print("sub: unsupported operands dest={s} src={s}\n", .{@tagName(v.dest), @tagName(v.src)});
+                        std.debug.print("sub: unsupported operands dest={s} src={s}\n", .{ @tagName(v.dest), @tagName(v.src) });
                         return EmitterError.UnsupportedOperandCombination;
                     }
                 },
@@ -1342,15 +1527,14 @@ pub fn emitProgram(
                     }
                 },
 
-
                 // ---- Shifts ----
                 // Immediate count â†’ C1 /r ib.  Register count must be in CL â†’ D3 /r,
                 // so the register form materializes MOV rcx, count first.  The RA pass
                 // keeps RCX out of the general pool via the shift-count reservation.
                 .shl, .shr, .ushr => {
                     const parts = switch (inst) {
-                        .shl => .{ inst.shl.dest, inst.shl.src, @as(u3, 4) },  // /4 SHL
-                        .shr => .{ inst.shr.dest, inst.shr.src, @as(u3, 7) },  // /7 SAR
+                        .shl => .{ inst.shl.dest, inst.shl.src, @as(u3, 4) }, // /4 SHL
+                        .shr => .{ inst.shr.dest, inst.shr.src, @as(u3, 7) }, // /7 SAR
                         .ushr => .{ inst.ushr.dest, inst.ushr.src, @as(u3, 5) }, // /5 SHR
                         else => unreachable,
                     };
@@ -1477,43 +1661,65 @@ pub fn emitProgram(
                         try emitSubRsp(&code, 16);
                         // movsd [rsp], xmm0 -> F2 0F 11 /r (mod=00 rm=100 SIB rsp)
                         try code.append(0xF2);
-                        try code.append(0x0F); try code.append(0x11);
+                        try code.append(0x0F);
+                        try code.append(0x11);
                         try code.append(makeModRM(0b00, 0, 4));
                         try code.append(0x24);
                     }
 
                     // movaps/movsd xmm0, dest    (copy dividend)
                     try code.append(pfx);
-                    { const rex = makeRex(false, scratch, d); if (rex != 0x40) try code.append(rex); }
-                    try code.append(0x0F); try code.append(0x10);
+                    {
+                        const rex = makeRex(false, scratch, d);
+                        if (rex != 0x40) try code.append(rex);
+                    }
+                    try code.append(0x0F);
+                    try code.append(0x10);
                     try code.append(makeModRM(0b11, scratch, @as(u3, @truncate(d))));
                     // divss/divsd xmm0, src
                     try code.append(pfx);
-                    { const rex = makeRex(false, scratch, s); if (rex != 0x40) try code.append(rex); }
-                    try code.append(0x0F); try code.append(0x5E);
+                    {
+                        const rex = makeRex(false, scratch, s);
+                        if (rex != 0x40) try code.append(rex);
+                    }
+                    try code.append(0x0F);
+                    try code.append(0x5E);
                     try code.append(makeModRM(0b11, scratch, @as(u3, @truncate(s))));
                     // roundss/roundsd xmm0, xmm0, 3 (truncate toward zero) -> 66 0F 3A 0A/0B /r ib
                     try code.append(0x66);
-                    { const rex = makeRex(false, scratch, scratch); if (rex != 0x40) try code.append(rex); }
-                    try code.append(0x0F); try code.append(0x3A);
+                    {
+                        const rex = makeRex(false, scratch, scratch);
+                        if (rex != 0x40) try code.append(rex);
+                    }
+                    try code.append(0x0F);
+                    try code.append(0x3A);
                     try code.append(if (is64) @as(u8, 0x0B) else @as(u8, 0x0A));
                     try code.append(makeModRM(0b11, scratch, scratch));
                     try code.append(0x03); // round-toward-zero
                     // mulss/mulsd xmm0, src
                     try code.append(pfx);
-                    { const rex = makeRex(false, scratch, s); if (rex != 0x40) try code.append(rex); }
-                    try code.append(0x0F); try code.append(0x59);
+                    {
+                        const rex = makeRex(false, scratch, s);
+                        if (rex != 0x40) try code.append(rex);
+                    }
+                    try code.append(0x0F);
+                    try code.append(0x59);
                     try code.append(makeModRM(0b11, scratch, @as(u3, @truncate(s))));
                     // subss/subsd dest, xmm0    (dest -= trunc(dest/src)*src)
                     try code.append(pfx);
-                    { const rex = makeRex(false, d, scratch); if (rex != 0x40) try code.append(rex); }
-                    try code.append(0x0F); try code.append(0x5C);
+                    {
+                        const rex = makeRex(false, d, scratch);
+                        if (rex != 0x40) try code.append(rex);
+                    }
+                    try code.append(0x0F);
+                    try code.append(0x5C);
                     try code.append(makeModRM(0b11, @as(u3, @truncate(d)), scratch));
 
                     if (!xmm0_is_operand) {
                         // movsd xmm0, [rsp] -> F2 0F 10 /r
                         try code.append(0xF2);
-                        try code.append(0x0F); try code.append(0x10);
+                        try code.append(0x0F);
+                        try code.append(0x10);
                         try code.append(makeModRM(0b00, 0, 4));
                         try code.append(0x24);
                         try emitAddRsp(&code, 16);
@@ -1709,13 +1915,26 @@ pub fn emitProgram(
                                     try code.append(makeModRM(0b11, @as(u3, @truncate(s)), 0));
                                 }
                             }
+                        } else if (op == .stack) {
+                            const offset = op.stack;
+                            try code.append(makeRex(true, 0, 5)); // RBP is 5, dest RAX is 0
+                            try code.append(0x8B); // MOV rax, [rbp - offset]
+                            if (offset >= -128 and offset <= 127) {
+                                try code.append(makeModRM(0b01, 0, 5));
+                                try code.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                            } else {
+                                try code.append(makeModRM(0b10, 0, 5));
+                                var offset_bytes: [4]u8 = undefined;
+                                std.mem.writeInt(i32, &offset_bytes, -offset, .little);
+                                try code.appendSlice(&offset_bytes);
+                            }
                         }
                     }
                     // Restore local variable space
                     if (local_space > 0) {
                         try emitAddRsp(&code, local_space);
                     }
-                    
+
                     // Restore callee-saved XMMs
                     if (xmm_space > 0) {
                         for (xmm_saved.items, 0..) |r, idx| {
@@ -1855,6 +2074,11 @@ pub fn emitProgram(
                                 .ic_index = ic_idx,
                             });
 
+                            // Guard against a null resolved target (unresolved method):
+                            // test r11,r11; jz +3 skips the `call r11` so we degrade to
+                            // a no-op instead of executing at address 0.
+                            try code.appendSlice(&[_]u8{ 0x4D, 0x85, 0xDB }); // test r11, r11
+                            try code.appendSlice(&[_]u8{ 0x74, 0x03 }); // jz +3 (over call r11)
                             // Call target
                             try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 }); // call r11
 
@@ -1866,9 +2090,28 @@ pub fn emitProgram(
                             for (patch_bytes, 0..) |pb, i| {
                                 code.buf.items[jmp_done_idx + i] = pb;
                             }
-
                         } else {
                             // --- Monomorphic Cache: Virtual Call ---
+                            // 0. Null check on receiver (rcx)
+                            // test rcx, rcx -> 48 85 C9
+                            try code.appendSlice(&[_]u8{ 0x48, 0x85, 0xC9 });
+                            // jnz over the null error path (skip next 20 bytes: 48 c7 c0 addr (10) + and rsp -16 (4) + sub rsp 32 (4) + call rax (2))
+                            // jnz -> 75 14
+                            try code.appendSlice(&[_]u8{ 0x75, 0x14 });
+
+                            // Null Pointer Exception path:
+                            // mov rax, &throwNullPointerException
+                            try code.appendSlice(&[_]u8{ 0x48, 0xB8 });
+                            var npe_bytes: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &npe_bytes, @intFromPtr(&runtime.throwNullPointerException), .little);
+                            try code.appendSlice(&npe_bytes);
+                            // and rsp, -16
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xE4, 0xF0 });
+                            // sub rsp, 32
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 });
+                            // call rax
+                            try code.appendSlice(&[_]u8{ 0xFF, 0xD0 });
+
                             // 1. Load receiver class_ptr: mov rax, [rcx - 16] -> 48 8B 41 F0
                             try code.appendSlice(&[_]u8{ 0x48, 0x8B, 0x41, 0xF0 });
 
@@ -1884,9 +2127,10 @@ pub fn emitProgram(
                                 .ic_index = ic_idx,
                             });
 
-                            // 3. jne cache_miss (rel8 offset is 15 bytes: 7 bytes for mov r11, [rip+disp32], 3 bytes for call r11, 5 bytes for jmp done)
-                            // jne -> 75 0F
-                            try code.appendSlice(&[_]u8{ 0x75, 0x0F });
+                            // 3. jne cache_miss. Must skip: mov r11 (7) + test r11 (3)
+                            //    + jz (2) + call r11 (3) + jmp done (5) = 20 bytes (0x14).
+                            // jne -> 75 14
+                            try code.appendSlice(&[_]u8{ 0x75, 0x14 });
 
                             // 4. Load cached_target into r11: mov r11, [rip + disp32] -> 4C 8B 1D <disp32>
                             try code.appendSlice(&[_]u8{ 0x4C, 0x8B, 0x1D });
@@ -1898,6 +2142,13 @@ pub fn emitProgram(
                                 .next_inst_offset = code.items.len,
                                 .ic_index = ic_idx,
                             });
+
+                            // 4b. Guard against a null/stale cached_target (e.g. a
+                            //     zero-initialized IC matched a receiver whose class
+                            //     pointer is also 0). test r11,r11; jz cache_miss.
+                            //     jz must skip call r11 (3) + jmp done (5) = 8 (0x08).
+                            try code.appendSlice(&[_]u8{ 0x4D, 0x85, 0xDB }); // test r11, r11
+                            try code.appendSlice(&[_]u8{ 0x74, 0x08 }); // jz cache_miss
 
                             // 5. call r11 -> 41 FF D3
                             try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 });
@@ -1991,6 +2242,9 @@ pub fn emitProgram(
                                 .ic_index = ic_idx,
                             });
 
+                            // Guard against a null resolved target (see static path).
+                            try code.appendSlice(&[_]u8{ 0x4D, 0x85, 0xDB }); // test r11, r11
+                            try code.appendSlice(&[_]u8{ 0x74, 0x03 }); // jz +3 (over call r11)
                             // Call target
                             try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 }); // call r11
 
@@ -2052,14 +2306,19 @@ pub fn emitProgram(
                         }
                     }
 
+                    // MOV RAX, &monitorEnter
                     try code.append(0x48);
                     try code.append(0xB8);
-                    var addr_bytes: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &addr_bytes, @intFromPtr(&runtime.monitorEnter), .little);
-                    try code.appendSlice(&addr_bytes);
-
+                    var me_addr: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &me_addr, @intFromPtr(&runtime.monitorEnter), .little);
+                    try code.appendSlice(&me_addr);
+                    // sub rsp, 32  (Windows x64 shadow space)
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 });
+                    // CALL RAX
                     try code.append(0xFF);
                     try code.append(0xD0);
+                    // add rsp, 32
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x20 });
                 },
                 .monitor_exit => |v| {
                     if (v.src == .reg) {
@@ -2084,14 +2343,19 @@ pub fn emitProgram(
                         }
                     }
 
+                    // MOV RAX, &monitorExit
                     try code.append(0x48);
                     try code.append(0xB8);
-                    var addr_bytes: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &addr_bytes, @intFromPtr(&runtime.monitorExit), .little);
-                    try code.appendSlice(&addr_bytes);
-
+                    var mex_addr: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &mex_addr, @intFromPtr(&runtime.monitorExit), .little);
+                    try code.appendSlice(&mex_addr);
+                    // sub rsp, 32  (Windows x64 shadow space)
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 });
+                    // CALL RAX
                     try code.append(0xFF);
                     try code.append(0xD0);
+                    // add rsp, 32
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x20 });
                 },
                 .alloc_arr => |v| {
                     // Determine element size from type_names at JIT-compile time
@@ -2244,18 +2508,30 @@ pub fn emitProgram(
                         // 6. lea rax, [rbp - (v.stack_offset + v.size - 16)] (object reference)
                         try emitLeaStackToReg(&code, 0, v.stack_offset + @as(i32, @intCast(v.size)), 16);
                     } else {
-                        // Determine object size: 8 bytes per field (conservative estimate)
+                        // Resolve the class so the object carries a real class_ptr in
+                        // its header (needed for virtual dispatch) and is allocated at
+                        // the class's true instance_size. Falling back to class_ptr=0
+                        // / fields*8 left objects unclassed and under-allocated (e.g.
+                        // StringBuilder's 4KB native layout), which corrupted the heap
+                        // and broke virtual method resolution on the result.
+                        var class_ptr: usize = 0;
                         var obj_size: usize = 8;
                         if (registry != null and dex != null and v.type_idx < dex.?.type_names.len) {
                             const tname = dex.?.type_names[v.type_idx];
                             if (registry.?.get(tname)) |cd| {
-                                obj_size = cd.instance_fields.len * 8;
+                                class_ptr = @intFromPtr(cd);
+                                obj_size = cd.instance_size;
+                                if (obj_size == 0) obj_size = cd.instance_fields.len * 8;
                                 if (obj_size == 0) obj_size = 8;
                             }
                         }
 
-                        // MOV RCX, 0 (class_ptr: no metadata yet)
-                        try code.appendSlice(&[_]u8{ 0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0 });
+                        // MOV RCX, class_ptr
+                        try code.append(0x48);
+                        try code.append(0xB9);
+                        var class_bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &class_bytes, class_ptr, .little);
+                        try code.appendSlice(&class_bytes);
 
                         // MOV RDX, obj_size
                         try code.append(0x48);
@@ -2298,6 +2574,62 @@ pub fn emitProgram(
                         }
                     }
                 },
+                .new_string => |v| {
+                    // Resolve the string-pool entry now (bytes live in the stable DEX
+                    // buffer) and pass gcNewString(value_ptr, length) -> String in RAX.
+                    var value_ptr: usize = 0;
+                    var str_len: i32 = 0;
+                    if (dex) |d| {
+                        if (v.str_idx < d.string_pool.len) {
+                            const s = d.string_pool[v.str_idx];
+                            value_ptr = @intFromPtr(s.ptr);
+                            str_len = @intCast(s.len);
+                        }
+                    }
+                    // Shadow space for the callee (Windows x64).
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 }); // sub rsp, 0x20
+                    // MOV RCX, value_ptr
+                    try code.append(0x48);
+                    try code.append(0xB9);
+                    var vp_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &vp_bytes, value_ptr, .little);
+                    try code.appendSlice(&vp_bytes);
+                    // MOV EDX, length (zero/sign fits in 32; length is non-negative)
+                    try code.append(0xBA);
+                    var idx_bytes: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &idx_bytes, str_len, .little);
+                    try code.appendSlice(&idx_bytes);
+                    // MOV RAX, &gcNewString ; CALL RAX
+                    try code.append(0x48);
+                    try code.append(0xB8);
+                    var fn_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcNewString), .little);
+                    try code.appendSlice(&fn_bytes);
+                    try code.appendSlice(&[_]u8{ 0xFF, 0xD0 }); // call rax
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x20 }); // add rsp, 0x20
+                    // MOV dest, RAX
+                    if (v.dest == .reg) {
+                        const d = regCode(v.dest.reg);
+                        if (d != 0) {
+                            try code.append(makeRex(true, 0, d));
+                            try code.append(0x89);
+                            try code.append(makeModRM(0b11, 0, @as(u3, @truncate(d))));
+                        }
+                    } else if (v.dest == .stack) {
+                        const off2 = v.dest.stack;
+                        try code.append(makeRex(true, 0, 5));
+                        try code.append(0x89);
+                        if (off2 >= -128 and off2 <= 127) {
+                            try code.append(makeModRM(0b01, 0, 5));
+                            try code.append(@as(u8, @bitCast(@as(i8, @truncate(-off2)))));
+                        } else {
+                            try code.append(makeModRM(0b10, 0, 5));
+                            var off_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &off_bytes, -off2, .little);
+                            try code.appendSlice(&off_bytes);
+                        }
+                    }
+                },
                 .instance_of => |v| {
                     if (v.obj == .reg) {
                         const s = regCode(v.obj.reg);
@@ -2311,16 +2643,19 @@ pub fn emitProgram(
                         try code.append(0x8B);
                         try emitMemModRM(&code, 1, .{ .base = .{ .stack = 0 }, .disp = -v.obj.stack });
                     }
-                    try code.append(0x48); try code.append(0xBA);
+                    try code.append(0x48);
+                    try code.append(0xBA);
                     var idx_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &idx_bytes, v.type_idx, .little);
                     try code.appendSlice(&idx_bytes);
 
-                    try code.append(0x48); try code.append(0xB8);
+                    try code.append(0x48);
+                    try code.append(0xB8);
                     var fn_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcInstanceOf), .little);
                     try code.appendSlice(&fn_bytes);
-                    try code.append(0xFF); try code.append(0xD0);
+                    try code.append(0xFF);
+                    try code.append(0xD0);
 
                     if (v.dest == .reg) {
                         const d = regCode(v.dest.reg);
@@ -2336,11 +2671,13 @@ pub fn emitProgram(
                     }
                 },
                 .move_exception => |v| {
-                    try code.append(0x48); try code.append(0xB8);
+                    try code.append(0x48);
+                    try code.append(0xB8);
                     var fn_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcGetAndClearException), .little);
                     try code.appendSlice(&fn_bytes);
-                    try code.append(0xFF); try code.append(0xD0);
+                    try code.append(0xFF);
+                    try code.append(0xD0);
 
                     if (v.dest == .reg) {
                         const d = regCode(v.dest.reg);
@@ -2369,26 +2706,31 @@ pub fn emitProgram(
                         try emitMemModRM(&code, 1, .{ .base = .{ .stack = 0 }, .disp = -v.array.stack });
                     }
                     // RDX: data_ptr
-                    try code.append(0x48); try code.append(0xBA);
+                    try code.append(0x48);
+                    try code.append(0xBA);
                     var ptr_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &ptr_bytes, v.data_ptr, .little);
                     try code.appendSlice(&ptr_bytes);
                     // R8: data_len
-                    try code.append(0x49); try code.append(0xB8);
+                    try code.append(0x49);
+                    try code.append(0xB8);
                     var len_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &len_bytes, v.data_len, .little);
                     try code.appendSlice(&len_bytes);
                     // R9: elem_width
-                    try code.append(0x49); try code.append(0xB9);
+                    try code.append(0x49);
+                    try code.append(0xB9);
                     var wid_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &wid_bytes, v.elem_width, .little);
                     try code.appendSlice(&wid_bytes);
 
-                    try code.append(0x48); try code.append(0xB8);
+                    try code.append(0x48);
+                    try code.append(0xB8);
                     var fn_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcFillArrayData), .little);
                     try code.appendSlice(&fn_bytes);
-                    try code.append(0xFF); try code.append(0xD0);
+                    try code.append(0xFF);
+                    try code.append(0xD0);
                 },
                 .filled_new_array => |v| {
                     var elem_size: usize = 4;
@@ -2406,25 +2748,31 @@ pub fn emitProgram(
                         }
                     }
                     var active_args: u32 = 0;
-                    for (v.args) |a| if (a != null) { active_args += 1; };
+                    for (v.args) |a| if (a != null) {
+                        active_args += 1;
+                    };
 
                     // RCX: size
-                    try code.append(0x48); try code.append(0xB9);
+                    try code.append(0x48);
+                    try code.append(0xB9);
                     var sz_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &sz_bytes, active_args, .little);
                     try code.appendSlice(&sz_bytes);
 
                     // RDX: elem_size
-                    try code.append(0x48); try code.append(0xBA);
+                    try code.append(0x48);
+                    try code.append(0xBA);
                     var esz_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &esz_bytes, elem_size, .little);
                     try code.appendSlice(&esz_bytes);
 
-                    try code.append(0x48); try code.append(0xB8);
+                    try code.append(0x48);
+                    try code.append(0xB8);
                     var fn_bytes: [8]u8 = undefined;
                     std.mem.writeInt(u64, &fn_bytes, @intFromPtr(&runtime.gcAllocArray), .little);
                     try code.appendSlice(&fn_bytes);
-                    try code.append(0xFF); try code.append(0xD0);
+                    try code.append(0xFF);
+                    try code.append(0xD0);
 
                     // Move RAX to dest (array ref)
                     if (v.dest == .reg) {
@@ -2443,7 +2791,9 @@ pub fn emitProgram(
                     // For each arg, MOV it into [RAX + 16 + i*elem_size]
                     // Wait, RAX is the array ptr. If we overwrote RAX, we can't use it!
                     // Let's store RAX to R11.
-                    try code.append(0x49); try code.append(0x89); try code.append(0xC3); // MOV R11, RAX
+                    try code.append(0x49);
+                    try code.append(0x89);
+                    try code.append(0xC3); // MOV R11, RAX
 
                     for (v.args, 0..) |arg, i| {
                         if (arg) |a| {
@@ -2460,7 +2810,7 @@ pub fn emitProgram(
                                 try emitMemModRM(&code, 2, .{ .base = .{ .stack = 0 }, .disp = -a.stack });
                             }
                             // MOV [R11 + offset], R10
-                    // MOV [R11 + offset], R10
+                            // MOV [R11 + offset], R10
                             try code.append(makeRexSib(true, 2, 3, 0)); // R10 = 2, R11 = 3
                             try code.append(0x89);
                             try emitMemModRM(&code, 2, .{ .base = .{ .reg = .r11 }, .disp = offset });
@@ -2705,7 +3055,7 @@ pub fn emitProgram(
                 else => {
                     std.debug.print("Unsupported instruction: {s}\n", .{@tagName(inst)});
                     return EmitterError.UnsupportedInstruction;
-                }
+                },
             }
         }
     }
@@ -2718,10 +3068,10 @@ pub fn emitProgram(
         };
         const end_offset = reloc.patch_offset + 4;
         const rel32 = @as(i32, @intCast(target_offset)) - @as(i32, @intCast(end_offset));
-        
+
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(i32, &bytes, rel32, .little);
-        
+
         for (bytes, 0..) |b, i| {
             code.buf.items[reloc.patch_offset + i] = b;
         }
@@ -2766,13 +3116,13 @@ pub fn emitProgram(
             while (i < padding) : (i += 1) {
                 try code.append(0);
             }
-            
+
             gc_map_offset = @intCast(code.items.len);
             const size = local_gc_builder.serializedSize();
             const old_len = code.items.len;
             try code.buf.resize(allocator, old_len + size);
             code.updateItems();
-            
+
             _ = local_gc_builder.serialize(code.items[old_len .. old_len + size]);
         }
 
@@ -2819,11 +3169,15 @@ test "emitter: basic arithmetic and moves to machine bytes" {
     // RET          -> C3
     const expected = [_]u8{
         0x55,
-        0x48, 0x89, 0xE5,
+        0x48,
+        0x89,
+        0xE5,
         0x53, // push rbx
         0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
-        0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x01, 0xD8,
+        0x48, 0xB8, 0x2A, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x48, 0x01,
+        0xD8,
         0x48, 0x83, 0xC4, 0x08, // add rsp, 8
         0x5B, // pop rbx
         0x5D,
@@ -2868,13 +3222,41 @@ test "emitter: callee-saved registers and register-8 immediate load encoding" {
     // ret            -> C3
     const expected = [_]u8{
         0x55,
-        0x48, 0x89, 0xE5,
-        0x41, 0x57,
-        0x48, 0x83, 0xEC, 0x08,
-        0x49, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x49, 0xBF, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x83, 0xC4, 0x08,
-        0x41, 0x5F,
+        0x48,
+        0x89,
+        0xE5,
+        0x41,
+        0x57,
+        0x48,
+        0x83,
+        0xEC,
+        0x08,
+        0x49,
+        0xB8,
+        0x02,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x49,
+        0xBF,
+        0x0A,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x48,
+        0x83,
+        0xC4,
+        0x08,
+        0x41,
+        0x5F,
         0x5D,
         0xC3,
     };

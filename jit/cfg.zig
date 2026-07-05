@@ -60,6 +60,7 @@ pub const CFG = struct {
     allocator: std.mem.Allocator,
     /// ID of the entry block (always 0 for DEX methods)
     entry_block_id: usize = 0,
+    osr_loop_block_id: ?usize = null,
 
     pub fn deinit(self: *CFG) void {
         for (self.blocks.items) |*block| {
@@ -342,13 +343,14 @@ pub const CFG = struct {
 
             for (block.phi_functions.items) |phi_node| {
                 const reg = phi_node.original_reg;
+                const ver = phi_node.ssa_version orelse continue;
 
                 const args = try self.allocator.alloc(ir.PhiArg, phi_node.incoming.len);
                 @memcpy(args, phi_node.incoming);
 
                 try new_insts.append(self.allocator, .{
                     .phi = .{
-                        .dest = .{ .reg = reg, .version = phi_node.ssa_version.? },
+                        .dest = .{ .reg = reg, .version = ver },
                         .args = args,
                     },
                 });

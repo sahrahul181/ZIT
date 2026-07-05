@@ -201,7 +201,13 @@ pub fn translateCFGWithMethod(
                         .invoke = .{
                             .dest = null,
                             .method_idx = v.method_idx,
-                            .is_static = (v.kind == .static),
+                            // static, direct (constructors / private), and super are all
+                            // statically bound: resolve via the declaring class, not the
+                            // receiver's vtable. Dispatching a constructor (<init>) through
+                            // the vtable fails (constructors aren't vtable entries) and
+                            // crashed the `new X().method()` chain. Only `virtual` and
+                            // `interface` use receiver-based dispatch.
+                            .is_static = (v.kind == .static or v.kind == .direct or v.kind == .super),
                             .args = ir_args,
                             .is_self_call = v.is_self_call or (if (current_method_idx) |cm_idx| (v.method_idx == cm_idx) else false),
                         },
