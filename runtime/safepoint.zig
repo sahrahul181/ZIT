@@ -32,7 +32,15 @@ var gc_coordinator_cond: std.Io.Condition = .init;
 /// Called exactly once during VM startup.
 pub fn initSafepointSubsystem() void {
     if (builtin.os.tag == .windows) {
-        const ptr = VirtualAlloc(null, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+        var ptr: ?*anyopaque = null;
+        var attempt_addr: usize = 0x10000000;
+        while (attempt_addr < 0x7F000000) : (attempt_addr += 0x10000000) {
+            ptr = VirtualAlloc(@as(?*anyopaque, @ptrFromInt(attempt_addr)), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+            if (ptr != null) break;
+        }
+        if (ptr == null) {
+            ptr = VirtualAlloc(null, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+        }
         if (ptr == null) @panic("Failed to allocate safepoint page");
         safepoint_page = @as(*volatile u8, @ptrCast(ptr));
 

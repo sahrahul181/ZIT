@@ -153,7 +153,7 @@ pub fn monitorEnter(obj: *anyopaque) callconv(.c) void {
             if (@cmpxchgWeak(usize, &header.monitor, 0, thread_id << 1, .release, .monotonic) == null) {
                 return;
             }
-        } else if ((current_val >> 1) == thread_id) {
+        } else if (((current_val >> 1) & 0x7FFFFFFF) == thread_id) {
             // Reentrant lock
             const new_val = current_val + (1 << 32);
             @atomicStore(usize, &header.monitor, new_val, .release);
@@ -172,7 +172,7 @@ pub fn monitorExit(obj: *anyopaque) callconv(.c) void {
     const thread_id = current.id;
 
     const current_val = @atomicLoad(usize, &header.monitor, .acquire);
-    if ((current_val >> 1) == thread_id) {
+    if (((current_val >> 1) & 0x7FFFFFFF) == thread_id) {
         const recursion = current_val >> 32;
         if (recursion > 0) {
             @atomicStore(usize, &header.monitor, current_val - (1 << 32), .release);
@@ -191,7 +191,7 @@ pub fn monitorWait(obj: *anyopaque) callconv(.c) void {
     const obj_ptr = @intFromPtr(obj);
 
     const current_val = @atomicLoad(usize, &header.monitor, .acquire);
-    if ((current_val >> 1) != thread_id) {
+    if (((current_val >> 1) & 0x7FFFFFFF) != thread_id) {
         @panic("IllegalMonitorStateException: wait called without monitor");
     }
 
@@ -231,7 +231,7 @@ pub fn monitorNotify(obj: *anyopaque) callconv(.c) void {
     const obj_ptr = @intFromPtr(obj);
 
     const current_val = @atomicLoad(usize, &header.monitor, .acquire);
-    if ((current_val >> 1) != thread_id) {
+    if (((current_val >> 1) & 0x7FFFFFFF) != thread_id) {
         @panic("IllegalMonitorStateException: notify called without monitor");
     }
 
@@ -254,7 +254,7 @@ pub fn monitorNotifyAll(obj: *anyopaque) callconv(.c) void {
     const obj_ptr = @intFromPtr(obj);
 
     const current_val = @atomicLoad(usize, &header.monitor, .acquire);
-    if ((current_val >> 1) != thread_id) {
+    if (((current_val >> 1) & 0x7FFFFFFF) != thread_id) {
         @panic("IllegalMonitorStateException: notifyAll called without monitor");
     }
 

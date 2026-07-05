@@ -587,6 +587,16 @@ pub fn emitProgram(
                 try c.appendSlice(&[_]u8{ 0x8A, 0x00 });       // MOV AL, [RAX]
                 return;
             }
+            if (page_addr <= 0x7FFFFFFF) {
+                // Fast path: 32-bit absolute addressing
+                // CMP BYTE PTR [page_addr], 0
+                try c.appendSlice(&[_]u8{ 0x80, 0x3C, 0x25 });
+                var addr_bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &addr_bytes, @intCast(page_addr), .little);
+                try c.appendSlice(&addr_bytes);
+                try c.append(0x00);
+                return;
+            }
             // MOV RAX, page_addr (imm64)
             try c.appendSlice(&[_]u8{ 0x48, 0xB8 });
             var addr_bytes: [8]u8 = undefined;
@@ -654,11 +664,6 @@ pub fn emitProgram(
     }
     if (local_space > 0) {
         try emitSubRsp(&code, local_space);
-    }
-
-    // Safepoint poll at method entry
-    if (dex != null) {
-        try emitSafepointCheck(&code, sp_page_addr);
     }
 
     // Collect loop back-edges (target block id <= source block id) so we can poll

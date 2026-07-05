@@ -6,6 +6,7 @@ extern "kernel32" fn CreateFiber(dwStackSize: usize, lpStartAddress: *const fn (
 extern "kernel32" fn ConvertThreadToFiber(lpParameter: ?*anyopaque) callconv(.c) ?*anyopaque;
 extern "kernel32" fn SwitchToFiber(lpFiber: *anyopaque) callconv(.c) void;
 extern "kernel32" fn DeleteFiber(lpFiber: *anyopaque) callconv(.c) void;
+extern "kernel32" fn ConvertFiberToThread() callconv(.c) i32;
 
 // ── Virtual Thread State ───────────────────────────────────────────────────────
 
@@ -68,13 +69,18 @@ pub const JavaThread = struct {
 
     pub fn yield(self: *JavaThread) void {
         self.state.store(.runnable, .release);
-        std.Thread.yield() catch {};
+        if (global_worker_pool) |pool| {
+            pool.submit(self) catch {};
+        }
+        if (getCurrentWorker()) |w| {
+            SwitchToFiber(w.primary_fiber.?);
+        }
     }
 
     pub fn park(self: *JavaThread) void {
         self.state.store(.parked, .release);
-        while (self.state.load(.acquire) == .parked) {
-            std.Thread.yield() catch {};
+        if (getCurrentWorker()) |w| {
+            SwitchToFiber(w.primary_fiber.?);
         }
     }
 
@@ -311,6 +317,7 @@ fn workerLoop(worker: *Worker) void {
             std.Thread.yield() catch {};
         }
     }
+    _ = ConvertFiberToThread();
 }
 
 
