@@ -732,6 +732,11 @@ test "JIT: monitor-enter and monitor-exit execution correctness" {
 
     @memcpy(exec_page, code_bytes);
 
+    var dummy_thread: runtime.thread.JavaThread = undefined;
+    dummy_thread.id = 1;
+    runtime.thread.current_thread = &dummy_thread;
+    defer runtime.thread.current_thread = null;
+
     const JITMonitorFn = *const fn (*anyopaque) callconv(.c) void;
     const func = @as(JITMonitorFn, @ptrCast(exec_page.ptr));
 

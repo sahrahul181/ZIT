@@ -1611,6 +1611,7 @@ pub fn optimize(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
         if (try globalValueNumbering(allocator, cfg)) local_changed = true;
         if (try copyPropagateAndFold(allocator, cfg)) local_changed = true;
         if (try globalRegisterCoalescing(allocator, cfg)) local_changed = true;
+        if (try boundsCheckElimination(allocator, cfg)) local_changed = true;
         if (try eliminateDeadCode(allocator, cfg)) local_changed = true;
         if (!local_changed) break;
         changed = true;
@@ -2344,6 +2345,10 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                     if (v.src) |s| try markAlive(allocator, &alive_vars, &worklist, s);
                 },
                 .throw_op => |v| try markAlive(allocator, &alive_vars, &worklist, v.src),
+                .bounds_check => |v| {
+                    try markAlive(allocator, &alive_vars, &worklist, v.array);
+                    try markAlive(allocator, &alive_vars, &worklist, v.index);
+                },
 
                 // Control Flow must be kept alive to maintain CFG structure
                 .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le => |v| {
@@ -2433,7 +2438,7 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
 
             // Is it inherently alive?
             switch (inst) {
-                .iput, .sput, .aput, .ret, .throw_op, .goto, .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le, .if_eqz, .if_nez, .if_ltz, .if_gez, .if_gtz, .if_lez, .switch_op => {
+                .bounds_check, .iput, .sput, .aput, .ret, .throw_op, .goto, .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le, .if_eqz, .if_nez, .if_ltz, .if_gez, .if_gtz, .if_lez, .switch_op => {
                     keep = true;
                 },
                 .invoke => |v| {
@@ -2488,6 +2493,77 @@ pub fn eliminateDeadCode(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
 
     return changed;
 }
+
+/// Bounds Check Elimination (BCE) Pass.
+pub fn boundsCheckElimination(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
+    var changed = false;
+
+    // We will track the constant definitions first
+    var constants = std.AutoHashMap(ir.SSAVar, i32).init(allocator);
+    defer constants.deinit();
+
+    var array_sizes = std.AutoHashMap(ir.SSAVar, ir.SSAVar).init(allocator);
+    defer array_sizes.deinit();
+
+    for (cfg.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst) {
+                .const_int => |v| {
+                    try constants.put(v.dest, v.val);
+                },
+                .new_array => |v| {
+                    try array_sizes.put(v.dest, v.size);
+                },
+                else => {},
+            }
+        }
+    }
+
+    const CheckedPair = struct { array: ir.SSAVar, index: ir.SSAVar };
+    for (cfg.blocks.items) |*block| {
+        var checked_pairs = std.AutoHashMap(CheckedPair, void).init(allocator);
+        defer checked_pairs.deinit();
+
+        var new_insts = std.ArrayList(ir.IRInst).empty;
+        for (block.instructions.items) |inst| {
+            var keep = true;
+            if (inst == .bounds_check) {
+                const bc = inst.bounds_check;
+                
+                // 1. Redundant check elimination
+                const pair = CheckedPair{ .array = bc.array, .index = bc.index };
+                if (checked_pairs.contains(pair)) {
+                    keep = false;
+                    changed = true;
+                } else {
+                    // 2. Constant bounds check elimination
+                    if (array_sizes.get(bc.array)) |size_var| {
+                        if (constants.get(size_var)) |size_val| {
+                            if (constants.get(bc.index)) |idx_val| {
+                                if (idx_val >= 0 and idx_val < size_val) {
+                                    keep = false;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if (keep) {
+                        try checked_pairs.put(pair, {});
+                    }
+                }
+            }
+
+            if (keep) {
+                try new_insts.append(allocator, inst);
+            }
+        }
+        block.instructions.deinit(allocator);
+        block.instructions = new_insts;
+    }
+
+    return changed;
+}
+
 
 test "eliminateDeadCode: basic dead code elimination" {
     const a = std.testing.allocator;
@@ -3100,3 +3176,49 @@ test "eliminateDeadCode: long integer operations optimization" {
     }
     try std.testing.expect(!found_move);
 }
+
+test "boundsCheckElimination: basic constant and redundancy elimination" {
+    const a = std.testing.allocator;
+    const instmod = @import("instruction");
+    const translate = @import("translate");
+
+    const insns = [_]instmod.Instruction{
+        .{ .const_ = .{ .value = 5, .dest = 0 } },      // size = 5 (v0)
+        .{ .new_array = .{ .dest = 1, .size = 0, .type_idx = 0 } }, // array (v1)
+        .{ .const_ = .{ .value = 2, .dest = 2 } },      // index = 2 (v2)
+        .{ .aget = .{ .dest_or_src = 3, .array = 1, .index = 2 } }, // bounds_check, then aget
+        .{ .aget = .{ .dest_or_src = 4, .array = 1, .index = 2 } }, // bounds_check (redundant!), then aget
+        .return_void,
+    };
+
+    var cfg = try cfgmod.buildCFG(a, &insns);
+    defer cfg.deinit();
+
+    try translate.translateCFG(a, &cfg, &insns);
+
+    // Initial check: block should have 2 bounds_check instructions
+    {
+        const insts = cfg.blocks.items[0].instructions.items;
+        var bc_count: usize = 0;
+        for (insts) |inst| {
+            if (inst == .bounds_check) bc_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), bc_count);
+    }
+
+    // Run bounds check elimination
+    const changed = try boundsCheckElimination(a, &cfg);
+    try std.testing.expect(changed);
+
+    // After BCE: both bounds checks should be eliminated!
+    // One because it is constant (2 < 5), the other because it is redundant!
+    {
+        const insts = cfg.blocks.items[0].instructions.items;
+        var bc_count: usize = 0;
+        for (insts) |inst| {
+            if (inst == .bounds_check) bc_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 0), bc_count);
+    }
+}
+

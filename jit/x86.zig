@@ -185,6 +185,7 @@ pub const Inst = union(enum) {
     // ---- Array element access stubs ----
     arr_load:  struct { dest: Operand, array: Operand, index: Operand },
     arr_store: struct { src:  Operand, array: Operand, index: Operand },
+    bounds_check: struct { index: Operand, array: Operand },
 
     // ---- Returns & Exceptions ----
     ret:        ?Operand,
@@ -286,6 +287,7 @@ pub const Inst = union(enum) {
                 if (v) |op| { try writer.writeAll("RET "); try op.format(writer); } else try writer.writeAll("RET");
             },
             .throw_stub => |v| { try writer.writeAll("THROW "); try v.src.format(writer); },
+            .bounds_check => |v| { try writer.writeAll("BOUNDS_CHECK idx="); try v.index.format(writer); try writer.writeAll(" arr="); try v.array.format(writer); },
         }
     }
 };
@@ -302,6 +304,7 @@ pub const MachineBlock = struct {
 pub const MachineProgram = struct {
     blocks: std.ArrayList(MachineBlock),
     allocator: std.mem.Allocator,
+    stack_space: i32 = 0,
 
     pub fn deinit(self: *MachineProgram) void {
         for (self.blocks.items) |*b| b.instructions.deinit(self.allocator);

@@ -24,6 +24,7 @@ pub const FieldInfo = struct {
 
 pub const DexMethod = struct {
     name: []const u8,
+    method_idx: u32,
     registers_size: u16,
     ins_size: u16,
     outs_size: u16,
@@ -436,7 +437,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !DexFile {
             const access_flags = readUleb128(bytes, &cursor);
             const code_off: usize = readUleb128(bytes, &cursor);
             if (code_off > 0) {
-                methods.appendAssumeCapacity(readMethod(arena, bytes, method_items[method_idx], access_flags, code_off));
+                methods.appendAssumeCapacity(readMethod(arena, bytes, method_items[method_idx], method_idx, access_flags, code_off));
             }
         }
 
@@ -446,7 +447,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !DexFile {
             const access_flags = readUleb128(bytes, &cursor);
             const code_off: usize = readUleb128(bytes, &cursor);
             if (code_off > 0) {
-                methods.appendAssumeCapacity(readMethod(arena, bytes, method_items[virtual_method_idx], access_flags, code_off));
+                methods.appendAssumeCapacity(readMethod(arena, bytes, method_items[virtual_method_idx], virtual_method_idx, access_flags, code_off));
             }
         }
 
@@ -539,10 +540,11 @@ fn readTries(
     return tries;
 }
 
-fn readMethod(arena: std.mem.Allocator, bytes: []const u8, info: MethodInfo, access_flags: u32, code_off: usize) DexMethod {
+fn readMethod(arena: std.mem.Allocator, bytes: []const u8, info: MethodInfo, method_idx: u32, access_flags: u32, code_off: usize) DexMethod {
     const name = std.fmt.allocPrint(arena, "{s}->{s}", .{ info.class_name, info.method_name }) catch info.method_name;
     return .{
         .name = name,
+        .method_idx = method_idx,
         .registers_size = u16At(bytes, code_off),
         .ins_size = u16At(bytes, code_off + 2),
         .outs_size = u16At(bytes, code_off + 4),

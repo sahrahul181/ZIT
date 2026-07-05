@@ -1,3 +1,4 @@
+pub fn translateCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG, dalvik_insts: []const instmod.Instruction) !void { return translateCFGWithMethod(allocator, cfg, dalvik_insts, null); }
 const std = @import("std");
 const instmod = @import("instruction");
 const ir = @import("ir");
@@ -10,10 +11,11 @@ inline fn ssa(reg: u16) ir.SSAVar {
 
 /// Translates raw Dalvik instructions into the 3-Address Code IR.
 /// Populates the `instructions` array for every block in the CFG.
-pub fn translateCFG(
+pub fn translateCFGWithMethod(
     allocator: std.mem.Allocator,
     cfg: *cfgmod.CFG,
     dalvik_insts: []const instmod.Instruction,
+    current_method_idx: ?u32,
 ) !void {
     // We need a quick way to resolve Dalvik branch offsets to Block IDs.
     // We can reuse the `start_to_id` map concept from the CFG builder.
@@ -164,11 +166,13 @@ pub fn translateCFG(
                 .if_lez => |v| .{ .if_lez = .{ .src = ssa(v.src), .target_block_id = resolveBlockId(&start_to_id, inst_idx, v.offset) } },
 
                 // --- Array Access (aget/aput) ---
-                .aget, .aget_wide, .aget_object, .aget_boolean, .aget_byte, .aget_char, .aget_short => |v| .{
-                    .aget = .{ .dest_or_src = ssa(v.dest_or_src), .array = ssa(v.array), .index = ssa(v.index) }
+                .aget, .aget_wide, .aget_object, .aget_boolean, .aget_byte, .aget_char, .aget_short => |v| blk: {
+                    try block.instructions.append(allocator, .{ .bounds_check = .{ .index = ssa(v.index), .array = ssa(v.array) } });
+                    break :blk .{ .aget = .{ .dest_or_src = ssa(v.dest_or_src), .array = ssa(v.array), .index = ssa(v.index) } };
                 },
-                .aput, .aput_wide, .aput_object, .aput_boolean, .aput_byte, .aput_char, .aput_short => |v| .{
-                    .aput = .{ .dest_or_src = ssa(v.dest_or_src), .array = ssa(v.array), .index = ssa(v.index) }
+                .aput, .aput_wide, .aput_object, .aput_boolean, .aput_byte, .aput_char, .aput_short => |v| blk: {
+                    try block.instructions.append(allocator, .{ .bounds_check = .{ .index = ssa(v.index), .array = ssa(v.array) } });
+                    break :blk .{ .aput = .{ .dest_or_src = ssa(v.dest_or_src), .array = ssa(v.array), .index = ssa(v.index) } };
                 },
 
                 // --- Instance Fields (iget/iput) ---
@@ -199,7 +203,7 @@ pub fn translateCFG(
                             .method_idx = v.method_idx,
                             .is_static = (v.kind == .static),
                             .args = ir_args,
-                            .is_self_call = v.is_self_call,
+                            .is_self_call = v.is_self_call or (if (current_method_idx) |cm_idx| (v.method_idx == cm_idx) else false),
                         },
                     };
                 },
@@ -500,13 +504,15 @@ test "translateCFG: field and array accesses" {
     try translateCFG(a, &cfg, &insns);
 
     const insts = cfg.blocks.items[0].instructions.items;
-    try std.testing.expectEqual(@as(usize, 7), insts.len);
-    try std.testing.expect(insts[0] == .aget);
-    try std.testing.expect(insts[1] == .aput);
-    try std.testing.expect(insts[2] == .iget);
-    try std.testing.expect(insts[3] == .iput);
-    try std.testing.expect(insts[4] == .sget);
-    try std.testing.expect(insts[5] == .sput);
+    try std.testing.expectEqual(@as(usize, 9), insts.len);
+    try std.testing.expect(insts[0] == .bounds_check);
+    try std.testing.expect(insts[1] == .aget);
+    try std.testing.expect(insts[2] == .bounds_check);
+    try std.testing.expect(insts[3] == .aput);
+    try std.testing.expect(insts[4] == .iget);
+    try std.testing.expect(insts[5] == .iput);
+    try std.testing.expect(insts[6] == .sget);
+    try std.testing.expect(insts[7] == .sput);
 }
 
 test "translateCFG: unary math and conversions" {

@@ -365,7 +365,7 @@ fn jitCompileFn(method_ptr: usize, registry_ptr: usize, dex_ptr: usize) callconv
     var cfg = cfgmod.buildCFG(gpa, insns) catch return 0;
     defer cfg.deinit();
 
-    translate.translateCFG(gpa, &cfg, insns) catch return 0;
+    translate.translateCFGWithMethod(gpa, &cfg, insns, method.method_idx) catch return 0;
     buildSSA(gpa, &cfg, method.registers_size) catch return 0;
     _ = opt.optimize(gpa, &cfg) catch return 0;
     dessa.eliminatePhis(gpa, &cfg) catch return 0;

@@ -21,6 +21,8 @@ pub const ThreadLocalStorage = struct {
     exception: usize = 0,   // pending Throwable reference (0 = none)
     result:    u64   = 0,   // return value from native call
     allocator: gc.immix.allocator.MutatorAllocator = undefined, // Lock-free Immix allocation
+    jmp_env:   [32]u64 = [_]u64{0} ** 32, // saved jump buffer for JIT exception recovery
+    has_jmp_env: bool = false,
 };
 
 // ── JavaThread (Virtual Fiber) ────────────────────────────────────────────────
@@ -71,10 +73,25 @@ pub const JavaThread = struct {
         SwitchToFiber(w.primary_fiber.?);
     }
 
+    pub fn park(self: *JavaThread) void {
+        self.state.store(.parked, .release);
+        const w = current_worker orelse @panic("Park outside of worker thread");
+        SwitchToFiber(w.primary_fiber.?);
+    }
+
+    pub fn unpark(self: *JavaThread) void {
+        if (self.state.cmpxchgStrong(.parked, .runnable, .release, .monotonic) == null) {
+            if (global_worker_pool) |pool| {
+                pool.submit(self) catch @panic("Failed to submit unparked JavaThread");
+            }
+        }
+    }
+
     pub fn deinit(self: *JavaThread, allocator: std.mem.Allocator) void {
         allocator.destroy(self);
     }
 };
+
 
 fn dummyBlockSupplier() ?*gc.immix.layout.Block {
     return null;

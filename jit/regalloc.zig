@@ -530,6 +530,10 @@ pub fn allocateRegisters(
                 .throw_stub => |v| {
                     try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
+                .bounds_check => |v| {
+                    try helper.process(&interval_map, v.index, global_inst_idx, false, .gpr);
+                    try helper.process(&interval_map, v.array, global_inst_idx, false, .gpr);
+                },
                 .monitor_enter => |v| {
                     try helper.process(&interval_map, v.src, global_inst_idx, false, .gpr);
                 },
@@ -842,6 +846,10 @@ pub fn allocateRegisters(
                         try collectDefsAndUses(l, v.right, false);
                         try collectDefsAndUses(l, v.dest, true);
                     },
+                    .bounds_check => |v| {
+                        try collectDefsAndUses(l, v.index, false);
+                        try collectDefsAndUses(l, v.array, false);
+                    },
                     else => {},
                 }
                 temp_idx += 1;
@@ -1045,6 +1053,31 @@ pub fn allocateRegisters(
         try allocation_results.put(interval.vreg, interval);
     }
 
+    var used_callee = std.AutoHashMap(x86.PhysicalReg, void).init(allocator);
+    defer used_callee.deinit();
+    var used_iter = allocation_results.valueIterator();
+    while (used_iter.next()) |interval| {
+        if (interval.reg) |r| {
+            const is_callee = switch (r) {
+                .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15,
+                .xmm6, .xmm7, .xmm8, .xmm9, .xmm10, .xmm11, .xmm12, .xmm13, .xmm14, .xmm15 => true,
+                else => false,
+            };
+            if (is_callee) try used_callee.put(r, {});
+        }
+    }
+    var gpr_space: i32 = 0;
+    var xmm_space: i32 = 0;
+    var u_iter = used_callee.keyIterator();
+    while (u_iter.next()) |r| {
+        if (std.mem.startsWith(u8, r.*.name(), "xmm")) {
+            xmm_space += 16;
+        } else {
+            gpr_space += 8;
+        }
+    }
+    const save_space = gpr_space + xmm_space;
+
     // Now rewrite all instructions in the program using the allocation results.
     var rewrite_inst_idx: usize = 0;
     for (program.blocks.items) |*block| {
@@ -1052,15 +1085,20 @@ pub fn allocateRegisters(
         errdefer rewritten_insts.deinit(allocator);
 
         for (block.instructions.items) |inst| {
+            const RewriteContext = struct {
+                results: *const std.AutoHashMap(ir.SSAVar, LiveInterval),
+                save_space: i32,
+            };
+            const rw_ctx = RewriteContext{ .results = &allocation_results, .save_space = save_space };
             const rewriteOp = struct {
-                fn run(results: *const std.AutoHashMap(ir.SSAVar, LiveInterval), op: x86.Operand) x86.Operand {
+                fn run(ctx: RewriteContext, op: x86.Operand) x86.Operand {
                     switch (op) {
                         .vreg => |v| {
-                            if (results.get(v)) |alloc_res| {
+                            if (ctx.results.get(v)) |alloc_res| {
                                 if (alloc_res.reg) |r| {
                                     return .{ .reg = r };
                                 } else if (alloc_res.stack_offset) |offset| {
-                                    return .{ .stack = offset };
+                                    return .{ .stack = offset + ctx.save_space };
                                 }
                             }
                             return op;
@@ -1069,7 +1107,7 @@ pub fn allocateRegisters(
                             var new_base = m.base;
                             switch (m.base) {
                                 .vreg => |bv| {
-                                    const rw = run(results, .{ .vreg = bv });
+                                    const rw = run(ctx, .{ .vreg = bv });
                                     switch (rw) {
                                         .reg => |r| new_base = .{ .reg = r },
                                         .stack => |s| new_base = .{ .stack = s },
@@ -1082,7 +1120,7 @@ pub fn allocateRegisters(
                             if (m.index) |idx| {
                                 switch (idx) {
                                     .vreg => |iv| {
-                                        const rw = run(results, .{ .vreg = iv });
+                                        const rw = run(ctx, .{ .vreg = iv });
                                         switch (rw) {
                                             .reg => |r| new_index = .{ .reg = r },
                                             .stack => |s| new_index = .{ .stack = s },
@@ -1108,112 +1146,112 @@ pub fn allocateRegisters(
 
             switch (new_inst) {
                 .mov => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .add => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .sub => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .imul => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .and_op => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .or_op => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .xor_op => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .shl => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .shr => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .ushr => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .addss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .subss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .mulss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .divss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .movss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .addsd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .subsd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .mulsd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .divsd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .movsd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .idiv => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.rem = rewriteOp.run(&allocation_results, v.rem);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.rem = rewriteOp.run(rw_ctx, v.rem);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .irem => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.rem = rewriteOp.run(&allocation_results, v.rem);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.rem = rewriteOp.run(rw_ctx, v.rem);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .neg => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                 },
                 .cmp => |*v| {
-                    v.left = rewriteOp.run(&allocation_results, v.left);
-                    v.right = rewriteOp.run(&allocation_results, v.right);
+                    v.left = rewriteOp.run(rw_ctx, v.left);
+                    v.right = rewriteOp.run(rw_ctx, v.right);
                 },
                 .test_op => |*v| {
-                    v.left = rewriteOp.run(&allocation_results, v.left);
-                    v.right = rewriteOp.run(&allocation_results, v.right);
+                    v.left = rewriteOp.run(rw_ctx, v.left);
+                    v.right = rewriteOp.run(rw_ctx, v.right);
                 },
                 .switch_stub => |*v| {
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .call => |*v| {
                     if (v.dest) |*d| {
-                        d.* = rewriteOp.run(&allocation_results, d.*);
+                        d.* = rewriteOp.run(rw_ctx, d.*);
                     }
                     var gc_info = x86.GcCallSiteInfo{ .stack_refs = 0, .reg_refs = 0 };
                     var iter = allocation_results.valueIterator();
@@ -1235,121 +1273,125 @@ pub fn allocateRegisters(
                     v.gc_info = gc_info;
                 },
                 .alloc_obj => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                 },
                 .alloc_arr => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.size = rewriteOp.run(&allocation_results, v.size);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.size = rewriteOp.run(rw_ctx, v.size);
                 },
                 .instance_of => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.obj = rewriteOp.run(&allocation_results, v.obj);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.obj = rewriteOp.run(rw_ctx, v.obj);
                 },
                 .filled_new_array => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                     for (&v.args) |*a| {
-                        if (a.*) |*arg| arg.* = rewriteOp.run(&allocation_results, arg.*);
+                        if (a.*) |*arg| arg.* = rewriteOp.run(rw_ctx, arg.*);
                     }
                 },
                 .fill_array_data => |*v| {
-                    v.array = rewriteOp.run(&allocation_results, v.array);
+                    v.array = rewriteOp.run(rw_ctx, v.array);
                 },
                 .move_exception => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                 },
                 .field_load => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    if (v.obj) |*o| o.* = rewriteOp.run(&allocation_results, o.*);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    if (v.obj) |*o| o.* = rewriteOp.run(rw_ctx, o.*);
                 },
                 .field_store => |*v| {
-                    v.src = rewriteOp.run(&allocation_results, v.src);
-                    if (v.obj) |*o| o.* = rewriteOp.run(&allocation_results, o.*);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
+                    if (v.obj) |*o| o.* = rewriteOp.run(rw_ctx, o.*);
                 },
                 .arr_load => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.array = rewriteOp.run(&allocation_results, v.array);
-                    v.index = rewriteOp.run(&allocation_results, v.index);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.array = rewriteOp.run(rw_ctx, v.array);
+                    v.index = rewriteOp.run(rw_ctx, v.index);
                 },
                 .arr_store => |*v| {
-                    v.src = rewriteOp.run(&allocation_results, v.src);
-                    v.array = rewriteOp.run(&allocation_results, v.array);
-                    v.index = rewriteOp.run(&allocation_results, v.index);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
+                    v.array = rewriteOp.run(rw_ctx, v.array);
+                    v.index = rewriteOp.run(rw_ctx, v.index);
                 },
                 .ret => |*v| {
                     if (v.*) |*op| {
-                        op.* = rewriteOp.run(&allocation_results, op.*);
+                        op.* = rewriteOp.run(rw_ctx, op.*);
                     }
                 },
                 .throw_stub => |*v| {
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
+                },
+                .bounds_check => |*v| {
+                    v.index = rewriteOp.run(rw_ctx, v.index);
+                    v.array = rewriteOp.run(rw_ctx, v.array);
                 },
                 .monitor_enter => |*v| {
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .monitor_exit => |*v| {
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .not => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                 },
                 .negss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                 },
                 .negsd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
                 },
                 .movsxd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .movsx8 => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .movsx16 => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .movzx16 => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cvtsi2ss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cvtsi2sd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cvttss2si => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cvttsd2si => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cvtss2sd => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cvtsd2ss => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .frem32 => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .frem64 => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.src = rewriteOp.run(&allocation_results, v.src);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.src = rewriteOp.run(rw_ctx, v.src);
                 },
                 .cmp3 => |*v| {
-                    v.dest = rewriteOp.run(&allocation_results, v.dest);
-                    v.left = rewriteOp.run(&allocation_results, v.left);
-                    v.right = rewriteOp.run(&allocation_results, v.right);
+                    v.dest = rewriteOp.run(rw_ctx, v.dest);
+                    v.left = rewriteOp.run(rw_ctx, v.left);
+                    v.right = rewriteOp.run(rw_ctx, v.right);
                 },
                 .jmp, .je, .jne, .jl, .jle, .jg, .jge, .jz, .jnz => {},
             }
@@ -1408,6 +1450,8 @@ pub fn allocateRegisters(
         block.instructions.deinit(allocator);
         block.instructions = rewritten_insts;
     }
+    
+    program.stack_space = next_stack_offset;
 }
 
 // ── Unit Tests ──────────────────────────────────────────────────────────────

@@ -4,6 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
+
+    const jit_guard_lib = b.addLibrary(.{
+        .name = "jit_guard",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    jit_guard_lib.root_module.addCSourceFile(.{ .file = b.path("runtime/jit_guard.c") });
+    jit_guard_lib.root_module.link_libc = true;
     const mod = b.addModule("ZIT", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -201,6 +211,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const cl_test = b.addTest(.{ .root_module = class_loader_mod });
+    cl_test.root_module.linkLibrary(jit_guard_lib);
     test_step.dependOn(&b.addRunArtifact(cl_test).step);
 
     const safepoint_mod = b.addModule("safepoint", .{
@@ -229,6 +240,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const rt_test = b.addTest(.{ .root_module = test_runtime_mod });
+    rt_test.root_module.linkLibrary(jit_guard_lib);
     test_step.dependOn(&b.addRunArtifact(rt_test).step);
 
 
@@ -296,6 +308,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const interp_test = b.addTest(.{ .root_module = test_interpreter_mod });
+    interp_test.root_module.linkLibrary(jit_guard_lib);
     test_step.dependOn(&b.addRunArtifact(interp_test).step);
 
     const native_mod = b.addModule("native", .{
@@ -314,6 +327,7 @@ pub fn build(b: *std.Build) void {
     native_mod.link_libc = true;
     const native_test = b.addTest(.{ .root_module = native_mod });
     native_test.root_module.link_libc = true;
+    native_test.root_module.linkLibrary(jit_guard_lib);
     test_step.dependOn(&b.addRunArtifact(native_test).step);
 
 
@@ -351,6 +365,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const exec_mem_mod_test = b.addTest(.{ .root_module = exec_mem_mod });
+    exec_mem_mod_test.root_module.linkLibrary(jit_guard_lib);
     test_step.dependOn(&b.addRunArtifact(exec_mem_mod_test).step);
 
 
@@ -387,6 +402,7 @@ pub fn build(b: *std.Build) void {
     dex_dbg.root_module.addIncludePath(b.path("nanopb"));
     dex_dbg.root_module.addCSourceFile(.{ .file = b.path("nanopb/pb_decode.c") });
     dex_dbg.root_module.addCSourceFile(.{ .file = b.path("nanopb/metadata_decoder.c") });
+    dex_dbg.root_module.linkLibrary(jit_guard_lib);
     dex_dbg.root_module.link_libc = true;
     b.installArtifact(dex_dbg);
 }

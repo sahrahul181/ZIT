@@ -27,6 +27,19 @@ fn println(args: [*]const u64, _: usize) callconv(.c) u64 {
     return 0;
 }
 
+fn printlnInt(args: [*]const u64, _: usize) callconv(.c) u64 {
+    const val = @as(i32, @bitCast(@as(u32, @truncate(args[1]))));
+    _ = printf("%d\n", @as(c_int, val));
+    return 0;
+}
+
+fn printlnLong(args: [*]const u64, _: usize) callconv(.c) u64 {
+    const val = @as(i64, @bitCast(args[1]));
+    _ = printf("%lld\n", @as(c_longlong, val));
+    return 0;
+}
+
+
 fn print(args: [*]const u64, _: usize) callconv(.c) u64 {
     const str_obj = args[1];
     if (str_obj == 0) {
@@ -144,6 +157,8 @@ pub const class_def = registry.NativeClassDef{
     .methods = &.{
         .{ .name = "print", .signature = "VL", .is_static = false, .func_ptr = &print },
         .{ .name = "println", .signature = "VL", .is_static = false, .func_ptr = &println },
+        .{ .name = "println", .signature = "VI", .is_static = false, .func_ptr = &printlnInt },
+        .{ .name = "println", .signature = "VJ", .is_static = false, .func_ptr = &printlnLong },
         .{ .name = "printf", .signature = "LLL", .is_static = false, .func_ptr = &printf_native },
     },
 };

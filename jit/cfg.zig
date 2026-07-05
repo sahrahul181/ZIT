@@ -547,6 +547,10 @@ pub const CFG = struct {
                     renameUse(stacks, &v.index);
                     renameUse(stacks, &v.dest_or_src);
                 },
+                .bounds_check => |*v| {
+                    renameUse(stacks, &v.array);
+                    renameUse(stacks, &v.index);
+                },
 
                 // Control Flow
                 .goto => {},

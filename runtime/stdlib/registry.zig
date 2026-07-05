@@ -22,5 +22,6 @@ pub const stdlib_classes = [_]NativeClassDef{
     @import("java/lang/Integer.zig").class_def,
     @import("java/lang/Double.zig").class_def,
     @import("java/lang/Thread.zig").class_def,
+    @import("java/lang/StringBuilder.zig").class_def,
     @import("java/io/PrintStream.zig").class_def,
 };

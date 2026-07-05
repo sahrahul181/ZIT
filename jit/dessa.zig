@@ -278,6 +278,18 @@ pub fn propagateCopies(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !bool {
                         changed = true;
                     }
                 },
+                .bounds_check => |*v| {
+                    const rep_a = resolve(replacements, v.array);
+                    const rep_i = resolve(replacements, v.index);
+                    if (rep_a.reg != v.array.reg or rep_a.version != v.array.version) {
+                        v.array = rep_a;
+                        changed = true;
+                    }
+                    if (rep_i.reg != v.index.reg or rep_i.version != v.index.version) {
+                        v.index = rep_i;
+                        changed = true;
+                    }
+                },
                 .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le => |*v| {
                     const rep_l = resolve(replacements, v.left);
                     const rep_r = resolve(replacements, v.right);

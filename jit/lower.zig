@@ -536,13 +536,16 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                     try mi.append(allocator, .{ .field_store = .{ .src = opReg(v.dest_or_src), .obj = null, .field_idx = v.field_idx } });
                 },
 
+                .bounds_check => |v| {
+                    try mi.append(allocator, .{ .bounds_check = .{ .index = opReg(v.index), .array = opReg(v.array) } });
+                },
                 // ── Array Element Access (Lowered to hardware SIB memory addressing) ──
                 .aget => |v| {
                     const mem_op = x86.Operand{ .mem = .{
                         .base = .{ .vreg = v.array },
                         .index = .{ .vreg = v.index },
                         .scale = 4,
-                        .disp = 16,
+                        .disp = 8,
                     } };
                     try mi.append(allocator, .{ .mov = .{ .dest = opReg(v.dest_or_src), .src = mem_op } });
                 },
@@ -551,7 +554,7 @@ pub fn lowerCFG(allocator: std.mem.Allocator, cfg: *cfgmod.CFG) !x86.MachineProg
                         .base = .{ .vreg = v.array },
                         .index = .{ .vreg = v.index },
                         .scale = 4,
-                        .disp = 16,
+                        .disp = 8,
                     } };
                     try mi.append(allocator, .{ .mov = .{ .dest = mem_op, .src = opReg(v.dest_or_src) } });
                 },

@@ -115,44 +115,141 @@ pub fn gcAlloc(class_ptr: usize, size: usize) callconv(.c) *anyopaque {
     @panic("Runtime not initialized");
 }
 
+
+// ── Wait/Notify Queues ────────────────────────────────────────────────────────
+pub var wait_queues: ?std.AutoHashMap(usize, std.ArrayList(*thread.JavaThread)) = null;
+pub var wait_queue_mutex: SpinLock = .{};
+
+
 // ── Thin-Lock Synchronization ───────────────────────────────────────────────
 pub fn monitorEnter(obj: *anyopaque) callconv(.c) void {
     const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
-    const thread_id = @as(usize, @intCast(std.Thread.getCurrentId()));
+    const current = thread.getCurrent() orelse @panic("monitorEnter outside JavaThread");
+    const thread_id = current.id;
 
     while (true) {
-        const current = @atomicLoad(usize, &header.monitor, .acquire);
-        if (current == 0) {
+        const current_val = @atomicLoad(usize, &header.monitor, .acquire);
+        if (current_val == 0) {
             // Unlocked: attempt CAS to acquire thin lock
             if (@cmpxchgWeak(usize, &header.monitor, 0, thread_id << 1, .release, .monotonic) == null) {
                 return;
             }
-        } else if ((current >> 1) == thread_id) {
+        } else if ((current_val >> 1) == thread_id) {
             // Reentrant lock
-            const new_val = current + (1 << 32);
+            const new_val = current_val + (1 << 32);
             @atomicStore(usize, &header.monitor, new_val, .release);
             return;
         } else {
             // Contested lock: spin-wait or yield thread
-            std.Thread.yield() catch {};
+            current.yield();
         }
     }
 }
 
 pub fn monitorExit(obj: *anyopaque) callconv(.c) void {
     const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
-    const thread_id = @as(usize, @intCast(std.Thread.getCurrentId()));
+    const current = thread.getCurrent() orelse @panic("monitorExit outside JavaThread");
+    const thread_id = current.id;
 
-    const current = @atomicLoad(usize, &header.monitor, .acquire);
-    if ((current >> 1) == thread_id) {
-        const recursion = current >> 32;
+    const current_val = @atomicLoad(usize, &header.monitor, .acquire);
+    if ((current_val >> 1) == thread_id) {
+        const recursion = current_val >> 32;
         if (recursion > 0) {
-            @atomicStore(usize, &header.monitor, current - (1 << 32), .release);
+            @atomicStore(usize, &header.monitor, current_val - (1 << 32), .release);
         } else {
             @atomicStore(usize, &header.monitor, 0, .release);
         }
+    } else {
+        @panic("IllegalMonitorStateException");
     }
 }
+
+pub fn monitorWait(obj: *anyopaque) callconv(.c) void {
+    const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
+    const current = thread.getCurrent() orelse @panic("monitorWait outside JavaThread");
+    const thread_id = current.id;
+    const obj_ptr = @intFromPtr(obj);
+
+    const current_val = @atomicLoad(usize, &header.monitor, .acquire);
+    if ((current_val >> 1) != thread_id) {
+        @panic("IllegalMonitorStateException: wait called without monitor");
+    }
+
+    // Add to wait queue
+    wait_queue_mutex.lock();
+    if (wait_queues == null) {
+        wait_queues = std.AutoHashMap(usize, std.ArrayList(*thread.JavaThread)).init(global_gc.?.allocator);
+    }
+    const gop = wait_queues.?.getOrPut(obj_ptr) catch @panic("OOM in wait queue");
+    if (!gop.found_existing) {
+        gop.value_ptr.* = std.ArrayList(*thread.JavaThread).empty;
+    }
+    gop.value_ptr.append(global_gc.?.allocator, current) catch @panic("OOM in wait queue");
+    wait_queue_mutex.unlock();
+
+    // Release lock completely (record recursion count)
+    const recursion = current_val >> 32;
+    @atomicStore(usize, &header.monitor, 0, .release);
+
+    // Park fiber
+    current.park();
+
+    // Re-acquire lock
+    monitorEnter(obj);
+    
+    // Restore recursion
+    if (recursion > 0) {
+        const new_val = @atomicLoad(usize, &header.monitor, .acquire) + (recursion << 32);
+        @atomicStore(usize, &header.monitor, new_val, .release);
+    }
+}
+
+pub fn monitorNotify(obj: *anyopaque) callconv(.c) void {
+    const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
+    const current = thread.getCurrent() orelse return;
+    const thread_id = current.id;
+    const obj_ptr = @intFromPtr(obj);
+
+    const current_val = @atomicLoad(usize, &header.monitor, .acquire);
+    if ((current_val >> 1) != thread_id) {
+        @panic("IllegalMonitorStateException: notify called without monitor");
+    }
+
+    wait_queue_mutex.lock();
+    defer wait_queue_mutex.unlock();
+    if (wait_queues) |*wq| {
+        if (wq.getPtr(obj_ptr)) |list| {
+            if (list.items.len > 0) {
+                const target = list.orderedRemove(0);
+                target.unpark();
+            }
+        }
+    }
+}
+
+pub fn monitorNotifyAll(obj: *anyopaque) callconv(.c) void {
+    const header = @as(*ObjectHeader, @ptrFromInt(@intFromPtr(obj) - @sizeOf(ObjectHeader)));
+    const current = thread.getCurrent() orelse return;
+    const thread_id = current.id;
+    const obj_ptr = @intFromPtr(obj);
+
+    const current_val = @atomicLoad(usize, &header.monitor, .acquire);
+    if ((current_val >> 1) != thread_id) {
+        @panic("IllegalMonitorStateException: notifyAll called without monitor");
+    }
+
+    wait_queue_mutex.lock();
+    defer wait_queue_mutex.unlock();
+    if (wait_queues) |*wq| {
+        if (wq.getPtr(obj_ptr)) |list| {
+            for (list.items) |target| {
+                target.unpark();
+            }
+            list.clearRetainingCapacity();
+        }
+    }
+}
+
 
 // ── Concurrency & Atomic Operations ──────────────────────────────────────────
 pub fn atomicCAS(addr: *i32, expected: i32, new_val: i32) callconv(.c) bool {
@@ -211,4 +308,14 @@ pub fn gcGetAndClearException() callconv(.c) usize {
     }
     return 0;
 }
+/// C guard helper — calls longjmp back into jit_guarded_call if a guard is active.
+extern fn jit_longjmp_if_guarded() callconv(.c) void;
+
+pub fn throwIndexOutOfBounds(index: i64, length: i64) callconv(.c) noreturn {
+    std.debug.print("ArrayIndexOutOfBoundsException: Index {d} out of bounds for length {d}\n", .{ index, length });
+    // If the interpreter set up a setjmp guard (via jit_guarded_call), unwind to it.
+    jit_longjmp_if_guarded(); // never returns when a guard is active
+    std.process.exit(1);
+}
+
 

@@ -98,6 +98,7 @@ fn getUsedCalleeSavedRegs(allocator: std.mem.Allocator, program: *x86.MachinePro
 
             switch (inst) {
                 .mov => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
+                .bounds_check => |v| { try checkOp(&used, v.index); try checkOp(&used, v.array); },
                 .add => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .sub => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
                 .imul => |v| { try checkOp(&used, v.dest); try checkOp(&used, v.src); },
@@ -169,6 +170,23 @@ pub fn emitProgram(
 
     var raw_relocations = std.ArrayList(Relocation).empty;
     defer raw_relocations.deinit(allocator);
+
+    const LatePatchType = enum {
+        class_ptr,
+        target_ptr,
+    };
+
+    const LatePatch = struct {
+        patch_type: LatePatchType,
+        inst_offset: usize,
+        next_inst_offset: usize,
+        ic_index: usize,
+    };
+
+    var late_patches = std.ArrayList(LatePatch).empty;
+    defer late_patches.deinit(allocator);
+
+    var num_inline_caches: usize = 0;
 
     const CodeWriter = struct {
         buf: *std.ArrayList(u8),
@@ -460,6 +478,18 @@ pub fn emitProgram(
         for (xmm_saved.items, 0..) |r, idx| {
             try emitSaveXmm(&code, r, @as(i32, @intCast(idx)) * 16);
         }
+    }
+
+    // Allocate local variable space (aligned)
+    const gpr_space = @as(i32, @intCast(gpr_saved.items.len)) * 8;
+    const save_space = gpr_space + xmm_space;
+    var local_space = program.stack_space - 8;
+    if (local_space < 0) local_space = 0;
+    if (@mod(save_space + local_space, 16) != 0) {
+        local_space += 16 - @mod(save_space + local_space, 16);
+    }
+    if (local_space > 0) {
+        try emitSubRsp(&code, local_space);
     }
 
     // Safepoint poll at method entry
@@ -1681,6 +1711,11 @@ pub fn emitProgram(
                             }
                         }
                     }
+                    // Restore local variable space
+                    if (local_space > 0) {
+                        try emitAddRsp(&code, local_space);
+                    }
+                    
                     // Restore callee-saved XMMs
                     if (xmm_space > 0) {
                         for (xmm_saved.items, 0..) |r, idx| {
@@ -1717,66 +1752,257 @@ pub fn emitProgram(
                         std.mem.writeInt(i32, &disp_bytes, rel32, .little);
                         try code.appendSlice(&disp_bytes);
                     } else {
-                        // 1. Save XMM0..XMM3 (64 bytes)
-                        try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x40 }); // sub rsp, 64
-                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x04, 0x24 }); // movq [rsp], xmm0
-                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x4C, 0x24, 0x08 }); // movq [rsp+8], xmm1
-                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x54, 0x24, 0x10 }); // movq [rsp+16], xmm2
-                        try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x5C, 0x24, 0x18 }); // movq [rsp+24], xmm3
+                        const ic_idx = num_inline_caches;
+                        num_inline_caches += 1;
 
-                        // 2. Push GPRs: RCX, RDX, R8, R9 (32 bytes)
-                        try code.appendSlice(&[_]u8{ 0x51, 0x52, 0x41, 0x50, 0x41, 0x51 });
-
-                        // 3. Set up arguments for resolveMethodVirtual
                         if (v.is_static) {
+                            // --- Monomorphic Cache: Static Call ---
+                            // 1. Load cached_target into r11 (RIP-relative)
+                            // mov r11, [rip + disp32] -> 4C 8B 1D <disp32>
+                            try code.appendSlice(&[_]u8{ 0x4C, 0x8B, 0x1D });
+                            const target_patch_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                            try late_patches.append(allocator, .{
+                                .patch_type = .target_ptr,
+                                .inst_offset = target_patch_idx,
+                                .next_inst_offset = code.items.len,
+                                .ic_index = ic_idx,
+                            });
+
+                            // 2. Test r11, r11 -> 4D 85 DB
+                            try code.appendSlice(&[_]u8{ 0x4D, 0x85, 0xDB });
+
+                            // 3. jz cache_miss (rel8 offset is 8 bytes: 3 bytes for call r11, 5 bytes for jmp done)
+                            // jz -> 74 08
+                            try code.appendSlice(&[_]u8{ 0x74, 0x08 });
+
+                            // 4. call r11 -> 41 FF D3
+                            try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 });
+
+                            // 5. jmp done -> E9 <disp32>
+                            try code.append(0xE9);
+                            const jmp_done_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+
+                            // --- Cache Miss / Slow Path ---
+                            // Original slow path setup and call
+                            // 1. Save XMMs (64 bytes)
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x40 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x04, 0x24 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x4C, 0x24, 0x08 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x54, 0x24, 0x10 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x5C, 0x24, 0x18 });
+
+                            // 2. Push GPRs
+                            try code.appendSlice(&[_]u8{ 0x51, 0x52, 0x41, 0x50, 0x41, 0x51 });
+
+                            // 3. Setup args
                             try code.appendSlice(&[_]u8{ 0x48, 0x31, 0xC9 }); // xor rcx, rcx
+
+                            // RDX = method_idx
+                            try code.appendSlice(&[_]u8{ 0x48, 0xC7, 0xC2 });
+                            var mi_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &mi_bytes, @intCast(v.method_idx), .little);
+                            try code.appendSlice(&mi_bytes);
+
+                            // R8 = dex_ptr
+                            try code.appendSlice(&[_]u8{ 0x49, 0xB8 });
+                            var dex_bytes: [8]u8 = undefined;
+                            const dex_addr = if (dex) |d| @intFromPtr(d) else 0;
+                            std.mem.writeInt(u64, &dex_bytes, dex_addr, .little);
+                            try code.appendSlice(&dex_bytes);
+
+                            // R9 = registry_ptr
+                            try code.appendSlice(&[_]u8{ 0x49, 0xB9 });
+                            var reg_bytes: [8]u8 = undefined;
+                            const reg_addr = if (registry) |r| @intFromPtr(r) else 0;
+                            std.mem.writeInt(u64, &reg_bytes, reg_addr, .little);
+                            try code.appendSlice(&reg_bytes);
+
+                            // Call resolveMethodVirtual
+                            try code.appendSlice(&[_]u8{ 0x48, 0xB8 });
+                            var fn_bytes: [8]u8 = undefined;
+                            const fn_addr = @intFromPtr(&@import("class_loader").resolveMethodVirtual);
+                            std.mem.writeInt(u64, &fn_bytes, fn_addr, .little);
+                            try code.appendSlice(&fn_bytes);
+
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 });
+                            try code.appendSlice(&[_]u8{ 0xFF, 0xD0 });
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x20 });
+
+                            // Save result in R11
+                            try code.appendSlice(&[_]u8{ 0x49, 0x89, 0xC3 });
+
+                            // Restore GPRs
+                            try code.appendSlice(&[_]u8{ 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59 });
+
+                            // Restore XMMs
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x04, 0x24 });
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x4C, 0x24, 0x08 });
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x54, 0x24, 0x10 });
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x5C, 0x24, 0x18 });
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x40 });
+
+                            // Update inline cache with resolved target
+                            // mov [rip + disp32], r11 -> 4C 89 1D <disp32>
+                            try code.appendSlice(&[_]u8{ 0x4C, 0x89, 0x1D });
+                            const target_update_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                            try late_patches.append(allocator, .{
+                                .patch_type = .target_ptr,
+                                .inst_offset = target_update_idx,
+                                .next_inst_offset = code.items.len,
+                                .ic_index = ic_idx,
+                            });
+
+                            // Call target
+                            try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 }); // call r11
+
+                            // Patch jmp_done inline!
+                            const done_offset = code.items.len;
+                            const rel32 = @as(i32, @intCast(done_offset - (jmp_done_idx + 4)));
+                            var patch_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &patch_bytes, rel32, .little);
+                            for (patch_bytes, 0..) |pb, i| {
+                                code.buf.items[jmp_done_idx + i] = pb;
+                            }
+
                         } else {
-                            try code.appendSlice(&[_]u8{ 0x48, 0x8B, 0x4C, 0x24, 0x18 }); // mov rcx, [rsp+24]
+                            // --- Monomorphic Cache: Virtual Call ---
+                            // 1. Load receiver class_ptr: mov rax, [rcx - 16] -> 48 8B 41 F0
+                            try code.appendSlice(&[_]u8{ 0x48, 0x8B, 0x41, 0xF0 });
+
+                            // 2. Compare rax with cached_class (RIP-relative)
+                            // cmp rax, [rip + disp32] -> 48 3B 05 <disp32>
+                            try code.appendSlice(&[_]u8{ 0x48, 0x3B, 0x05 });
+                            const class_patch_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                            try late_patches.append(allocator, .{
+                                .patch_type = .class_ptr,
+                                .inst_offset = class_patch_idx,
+                                .next_inst_offset = code.items.len,
+                                .ic_index = ic_idx,
+                            });
+
+                            // 3. jne cache_miss (rel8 offset is 15 bytes: 7 bytes for mov r11, [rip+disp32], 3 bytes for call r11, 5 bytes for jmp done)
+                            // jne -> 75 0F
+                            try code.appendSlice(&[_]u8{ 0x75, 0x0F });
+
+                            // 4. Load cached_target into r11: mov r11, [rip + disp32] -> 4C 8B 1D <disp32>
+                            try code.appendSlice(&[_]u8{ 0x4C, 0x8B, 0x1D });
+                            const target_patch_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                            try late_patches.append(allocator, .{
+                                .patch_type = .target_ptr,
+                                .inst_offset = target_patch_idx,
+                                .next_inst_offset = code.items.len,
+                                .ic_index = ic_idx,
+                            });
+
+                            // 5. call r11 -> 41 FF D3
+                            try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 });
+
+                            // 6. jmp done -> E9 <disp32>
+                            try code.append(0xE9);
+                            const jmp_done_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+
+                            // --- Cache Miss / Slow Path ---
+                            // 1. Save XMMs (64 bytes)
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x40 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x04, 0x24 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x4C, 0x24, 0x08 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x54, 0x24, 0x10 });
+                            try code.appendSlice(&[_]u8{ 0x66, 0x0F, 0xD6, 0x5C, 0x24, 0x18 });
+
+                            // 2. Push GPRs
+                            try code.appendSlice(&[_]u8{ 0x51, 0x52, 0x41, 0x50, 0x41, 0x51 });
+
+                            // 3. Setup args for resolveMethodVirtual: mov rcx, [rsp+24]
+                            try code.appendSlice(&[_]u8{ 0x48, 0x8B, 0x4C, 0x24, 0x18 });
+
+                            // RDX = method_idx
+                            try code.appendSlice(&[_]u8{ 0x48, 0xC7, 0xC2 });
+                            var mi_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &mi_bytes, @intCast(v.method_idx), .little);
+                            try code.appendSlice(&mi_bytes);
+
+                            // R8 = dex_ptr
+                            try code.appendSlice(&[_]u8{ 0x49, 0xB8 });
+                            var dex_bytes: [8]u8 = undefined;
+                            const dex_addr = if (dex) |d| @intFromPtr(d) else 0;
+                            std.mem.writeInt(u64, &dex_bytes, dex_addr, .little);
+                            try code.appendSlice(&dex_bytes);
+
+                            // R9 = registry_ptr
+                            try code.appendSlice(&[_]u8{ 0x49, 0xB9 });
+                            var reg_bytes: [8]u8 = undefined;
+                            const reg_addr = if (registry) |r| @intFromPtr(r) else 0;
+                            std.mem.writeInt(u64, &reg_bytes, reg_addr, .little);
+                            try code.appendSlice(&reg_bytes);
+
+                            // Call resolveMethodVirtual
+                            try code.appendSlice(&[_]u8{ 0x48, 0xB8 });
+                            var fn_bytes: [8]u8 = undefined;
+                            const fn_addr = @intFromPtr(&@import("class_loader").resolveMethodVirtual);
+                            std.mem.writeInt(u64, &fn_bytes, fn_addr, .little);
+                            try code.appendSlice(&fn_bytes);
+
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 });
+                            try code.appendSlice(&[_]u8{ 0xFF, 0xD0 });
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x20 });
+
+                            // Save result in R11
+                            try code.appendSlice(&[_]u8{ 0x49, 0x89, 0xC3 });
+
+                            // Restore GPRs
+                            try code.appendSlice(&[_]u8{ 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59 });
+
+                            // Restore XMMs
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x04, 0x24 });
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x4C, 0x24, 0x08 });
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x54, 0x24, 0x10 });
+                            try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x5C, 0x24, 0x18 });
+                            try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x40 });
+
+                            // Update inline cache: cached_class = [rcx - 16]
+                            // Load class pointer into rax: mov rax, [rcx - 16] -> 48 8B 41 F0
+                            try code.appendSlice(&[_]u8{ 0x48, 0x8B, 0x41, 0xF0 });
+
+                            // Store class pointer into cached_class: mov [rip + disp32], rax -> 48 89 05 <disp32>
+                            try code.appendSlice(&[_]u8{ 0x48, 0x89, 0x05 });
+                            const class_update_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                            try late_patches.append(allocator, .{
+                                .patch_type = .class_ptr,
+                                .inst_offset = class_update_idx,
+                                .next_inst_offset = code.items.len,
+                                .ic_index = ic_idx,
+                            });
+
+                            // Store r11 into cached_target: mov [rip + disp32], r11 -> 4C 89 1D <disp32>
+                            try code.appendSlice(&[_]u8{ 0x4C, 0x89, 0x1D });
+                            const target_update_idx = code.items.len;
+                            try code.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+                            try late_patches.append(allocator, .{
+                                .patch_type = .target_ptr,
+                                .inst_offset = target_update_idx,
+                                .next_inst_offset = code.items.len,
+                                .ic_index = ic_idx,
+                            });
+
+                            // Call target
+                            try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 }); // call r11
+
+                            // Patch jmp_done inline!
+                            const done_offset = code.items.len;
+                            const rel32 = @as(i32, @intCast(done_offset - (jmp_done_idx + 4)));
+                            var patch_bytes: [4]u8 = undefined;
+                            std.mem.writeInt(i32, &patch_bytes, rel32, .little);
+                            for (patch_bytes, 0..) |pb, i| {
+                                code.buf.items[jmp_done_idx + i] = pb;
+                            }
                         }
-
-                        // RDX = method_idx
-                        try code.appendSlice(&[_]u8{ 0x48, 0xC7, 0xC2 }); // mov rdx, imm32
-                        var mi_bytes: [4]u8 = undefined;
-                        std.mem.writeInt(i32, &mi_bytes, @intCast(v.method_idx), .little);
-                        try code.appendSlice(&mi_bytes);
-
-                        // R8 = dex_ptr
-                        try code.appendSlice(&[_]u8{ 0x49, 0xB8 }); // mov r8, imm64
-                        var dex_bytes: [8]u8 = undefined;
-                        const dex_addr = if (dex) |d| @intFromPtr(d) else 0;
-                        std.mem.writeInt(u64, &dex_bytes, dex_addr, .little);
-                        try code.appendSlice(&dex_bytes);
-
-                        // R9 = registry_ptr
-                        try code.appendSlice(&[_]u8{ 0x49, 0xB9 }); // mov r9, imm64
-                        var reg_bytes: [8]u8 = undefined;
-                        const reg_addr = if (registry) |r| @intFromPtr(r) else 0;
-                        std.mem.writeInt(u64, &reg_bytes, reg_addr, .little);
-                        try code.appendSlice(&reg_bytes);
-
-                        // Call resolveMethodVirtual
-                        try code.appendSlice(&[_]u8{ 0x48, 0xB8 }); // mov rax, imm64
-                        var fn_bytes: [8]u8 = undefined;
-                        const fn_addr = @intFromPtr(&@import("class_loader").resolveMethodVirtual);
-                        std.mem.writeInt(u64, &fn_bytes, fn_addr, .little);
-                        try code.appendSlice(&fn_bytes);
-                        try code.appendSlice(&[_]u8{ 0xFF, 0xD0 }); // call rax
-
-                        // Save result in R11
-                        try code.appendSlice(&[_]u8{ 0x49, 0x89, 0xC3 }); // mov r11, rax
-
-                        // Restore GPRs
-                        try code.appendSlice(&[_]u8{ 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59 }); // pop r9, r8, rdx, rcx
-
-                        // Restore XMMs
-                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x04, 0x24 }); // movq xmm0, [rsp]
-                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x4C, 0x24, 0x08 }); // movq xmm1, [rsp+8]
-                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x54, 0x24, 0x10 }); // movq xmm2, [rsp+16]
-                        try code.appendSlice(&[_]u8{ 0xF3, 0x0F, 0x7E, 0x5C, 0x24, 0x18 }); // movq xmm3, [rsp+24]
-                        try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xC4, 0x40 }); // add rsp, 64
-
-                        // Call target
-                        try code.appendSlice(&[_]u8{ 0x41, 0xFF, 0xD3 }); // call r11
                     }
 
                     if (v.dest) |dest| {
@@ -2150,7 +2376,7 @@ pub fn emitProgram(
 
                     for (v.args, 0..) |arg, i| {
                         if (arg) |a| {
-                            const offset = @as(i32, @intCast(16 + i * elem_size));
+                            const offset = @as(i32, @intCast(8 + i * elem_size));
                             // MOV R10, arg
                             if (a == .reg) {
                                 const s = regCode(a.reg);
@@ -2163,6 +2389,7 @@ pub fn emitProgram(
                                 try emitMemModRM(&code, 2, .{ .base = .{ .stack = 0 }, .disp = -a.stack });
                             }
                             // MOV [R11 + offset], R10
+                    // MOV [R11 + offset], R10
                             try code.append(makeRexSib(true, 2, 3, 0)); // R10 = 2, R11 = 3
                             try code.append(0x89);
                             try emitMemModRM(&code, 2, .{ .base = .{ .reg = .r11 }, .disp = offset });
@@ -2170,14 +2397,13 @@ pub fn emitProgram(
                     }
                 },
                 .field_load => |v| {
-                    // Helper closure: write dest from r10 (scratch)
                     if (v.obj) |obj_op| {
-                        var offset: i32 = 16;
+                        var offset: i32 = 0;
                         if (registry != null and dex != null) {
                             const fi = dex.?.field_items[v.field_idx];
                             if (registry.?.get(fi.class_name)) |cd| {
                                 if (cd.fieldOffset(fi.field_name)) |off| {
-                                    offset = 16 + @as(i32, @intCast(off));
+                                    offset = @as(i32, @intCast(off));
                                 }
                             }
                         }
@@ -2279,12 +2505,12 @@ pub fn emitProgram(
                         }
                     }
                     if (v.obj) |obj_op| {
-                        var offset: i32 = 16;
+                        var offset: i32 = 0;
                         if (registry != null and dex != null) {
                             const fi = dex.?.field_items[v.field_idx];
                             if (registry.?.get(fi.class_name)) |cd| {
                                 if (cd.fieldOffset(fi.field_name)) |off| {
-                                    offset = 16 + @as(i32, @intCast(off));
+                                    offset = @as(i32, @intCast(off));
                                 }
                             }
                         }
@@ -2316,6 +2542,95 @@ pub fn emitProgram(
                         try code.appendSlice(&[_]u8{ 0x4D, 0x89, 0x13 });
                     }
                 },
+                .bounds_check => |v| {
+                    const loadOperand = struct {
+                        fn f(cd: *CodeWriter, op: x86.Operand, reg: x86.PhysicalReg, is_32: bool) !x86.PhysicalReg {
+                            switch (op) {
+                                .reg => |r| return r,
+                                .stack => |offset| {
+                                    const d = regCode(reg);
+                                    const rex = makeRex(!is_32, d, 5); // RBP is 5
+                                    try cd.append(rex);
+                                    try cd.append(0x8B); // MOV r, r/m
+                                    if (offset >= -128 and offset <= 127) {
+                                        try cd.append(makeModRM(0b01, @as(u3, @truncate(d)), 5));
+                                        try cd.append(@as(u8, @bitCast(@as(i8, @truncate(-offset)))));
+                                    } else {
+                                        try cd.append(makeModRM(0b10, @as(u3, @truncate(d)), 5));
+                                        var bytes: [4]u8 = undefined;
+                                        std.mem.writeInt(i32, &bytes, -offset, .little);
+                                        try cd.appendSlice(&bytes);
+                                    }
+                                    return reg;
+                                },
+                                else => unreachable,
+                            }
+                        }
+                    }.f;
+
+                    const arr_reg = try loadOperand(&code, v.array, .r11, false);
+                    const idx_reg = try loadOperand(&code, v.index, .r10, true);
+
+                    // mov eax, [arr_reg + 0] (load length)
+                    const arr_code = regCode(arr_reg);
+                    const eax_code = regCode(.rax);
+                    const load_len_rex = makeRex(false, eax_code, arr_code);
+                    if (load_len_rex != 0x40) try code.append(load_len_rex);
+                    try code.append(0x8B);
+                    try code.append(makeModRM(0b01, @as(u3, @truncate(eax_code)), @as(u3, @truncate(arr_code))));
+                    try code.append(0);
+
+                    // cmp idx_reg, eax
+                    const idx_code = regCode(idx_reg);
+                    const cmp_rex = makeRex(false, eax_code, idx_code);
+                    if (cmp_rex != 0x40) try code.append(cmp_rex);
+                    try code.append(0x39);
+                    try code.append(makeModRM(0b11, @as(u3, @truncate(eax_code)), @as(u3, @truncate(idx_code))));
+
+                    // jb short (0x72) to safe path
+                    try code.append(0x72);
+                    const jb_patch_idx = code.items.len;
+                    try code.append(0); // placeholder
+
+                    const fail_start = code.items.len;
+
+                    // mov ecx, idx_reg
+                    if (idx_reg != .rcx) {
+                        const ecx_code = regCode(.rcx);
+                        const mov1_rex = makeRex(false, idx_code, ecx_code);
+                        if (mov1_rex != 0x40) try code.append(mov1_rex);
+                        try code.append(0x89);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(idx_code)), @as(u3, @truncate(ecx_code))));
+                    }
+
+                    // mov edx, eax
+                    {
+                        const edx_code = regCode(.rdx);
+                        const mov2_rex = makeRex(false, eax_code, edx_code);
+                        if (mov2_rex != 0x40) try code.append(mov2_rex);
+                        try code.append(0x89);
+                        try code.append(makeModRM(0b11, @as(u3, @truncate(eax_code)), @as(u3, @truncate(edx_code))));
+                    }
+
+                    // and rsp, -16
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xE4, 0xF0 });
+
+                    // sub rsp, 32
+                    try code.appendSlice(&[_]u8{ 0x48, 0x83, 0xEC, 0x20 });
+
+                    // mov rax, &throwIndexOutOfBounds
+                    try code.appendSlice(&[_]u8{ 0x48, 0xB8 });
+                    var addr_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &addr_bytes, @intFromPtr(&runtime.throwIndexOutOfBounds), .little);
+                    try code.appendSlice(&addr_bytes);
+
+                    // call rax
+                    try code.appendSlice(&[_]u8{ 0xFF, 0xD0 });
+
+                    const fail_end = code.items.len;
+                    const offset = fail_end - fail_start;
+                    code.items[jb_patch_idx] = @intCast(offset);
+                },
                 else => {
                     std.debug.print("Unsupported instruction: {s}\n", .{@tagName(inst)});
                     return EmitterError.UnsupportedInstruction;
@@ -2338,6 +2653,34 @@ pub fn emitProgram(
         
         for (bytes, 0..) |b, i| {
             code.buf.items[reloc.patch_offset + i] = b;
+        }
+    }
+
+    // --- Emit Inline Cache slots ---
+    if (num_inline_caches > 0) {
+        const ic_start_pos = code.items.len;
+        const aligned_ic_start = std.mem.alignForward(usize, ic_start_pos, 8);
+        var pad_i: usize = 0;
+        while (pad_i < (aligned_ic_start - ic_start_pos)) : (pad_i += 1) {
+            try code.append(0);
+        }
+        const ic_base = code.items.len;
+        for (0..num_inline_caches) |_| {
+            // 8 bytes for cached_class (0)
+            try code.appendSlice(&[_]u8{0} ** 8);
+            // 8 bytes for cached_target (0)
+            try code.appendSlice(&[_]u8{0} ** 8);
+        }
+
+        // --- Resolve Late Patches ---
+        for (late_patches.items) |lp| {
+            const slot_offset = ic_base + lp.ic_index * 16 + (if (lp.patch_type == .target_ptr) @as(usize, 8) else @as(usize, 0));
+            const rel32 = @as(i32, @intCast(slot_offset - lp.next_inst_offset));
+            var patch_bytes: [4]u8 = undefined;
+            std.mem.writeInt(i32, &patch_bytes, rel32, .little);
+            for (patch_bytes, 0..) |pb, i| {
+                code.buf.items[lp.inst_offset + i] = pb;
+            }
         }
     }
 
@@ -2407,8 +2750,10 @@ test "emitter: basic arithmetic and moves to machine bytes" {
         0x55,
         0x48, 0x89, 0xE5,
         0x53, // push rbx
+        0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
         0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x01, 0xD8,
+        0x48, 0x83, 0xC4, 0x08, // add rsp, 8
         0x5B, // pop rbx
         0x5D,
         0xC3,
@@ -2444,16 +2789,20 @@ test "emitter: callee-saved registers and register-8 immediate load encoding" {
 
     // Expected:
     // push r15       -> 41 57
+    // sub rsp, 8     -> 48 83 EC 08
     // mov r8, 2      -> 49 B8 02 00 00 00 00 00 00 00
     // mov r15, 10    -> 49 BF 0A 00 00 00 00 00 00 00
+    // add rsp, 8     -> 48 83 C4 08
     // pop r15        -> 41 5F
     // ret            -> C3
     const expected = [_]u8{
         0x55,
         0x48, 0x89, 0xE5,
         0x41, 0x57,
+        0x48, 0x83, 0xEC, 0x08,
         0x49, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x49, 0xBF, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x08,
         0x41, 0x5F,
         0x5D,
         0xC3,

@@ -173,6 +173,7 @@ pub const IRInst = union(enum) {
     sput: StaticFieldAccess,
     aget: ArrayAccess,
     aput: ArrayAccess,
+    bounds_check: struct { index: SSAVar, array: SSAVar },
 
     // Control Flow
     goto: struct { target_block_id: usize },
@@ -302,6 +303,7 @@ pub const IRInst = union(enum) {
             .sput => |v| try writer.print("@{d} = sput {f}", .{ v.field_idx, v.dest_or_src }),
             .aget => |v| try writer.print("{f} = aget {f}[{f}]", .{ v.dest_or_src, v.array, v.index }),
             .aput => |v| try writer.print("{f}[{f}] = aput {f}", .{ v.array, v.index, v.dest_or_src }),
+            .bounds_check => |v| try writer.print("bounds_check {f}, {f}", .{ v.index, v.array }),
 
             .goto => |v| try writer.print("goto bb{d}", .{v.target_block_id}),
 
